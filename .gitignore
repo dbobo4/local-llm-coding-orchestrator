@@ -1,0 +1,43 @@
+# Local machine configuration
+config/local.ps1
+
+# Generated benchmark output
+results/generated/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Local backups
+backups/
+
+# Models and runtime binaries must never be committed
+models/
+runtime/
+*.gguf
+*.bin
+*.safetensors
+
+# Local secrets / environment files
+.env
+.env.*
+!.env.example
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

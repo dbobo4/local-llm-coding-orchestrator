@@ -1,0 +1,9 @@
+﻿phase,name,effort,ctx,kv,ngram,pmin,median_decode_tps,median_acceptance,median_wall_seconds
+ngram,ngram_48_64_24,xhigh,24576,q8_0/q8_0,48/64/24,0.0,75.69,0.54788,16.136
+ngram,ngram_32_64_16,xhigh,24576,q8_0/q8_0,32/64/16,0.0,78.29,0.60036,15.63
+ngram,ngram_48_64_16,xhigh,24576,q8_0/q8_0,48/64/16,0.0,78.0,0.59786,15.695
+mtp_pmin,mtp2_pmin_0,xhigh,24576,q8_0/q8_0,32/64/16,0.0,80.61,0.60105,15.19
+mtp_pmin,mtp2_pmin_0.025,xhigh,24576,q8_0/q8_0,32/64/16,0.025,80.98,0.63076,15.118
+mtp_pmin,mtp2_pmin_0.05,xhigh,24576,q8_0/q8_0,32/64/16,0.05,78.02,0.59732,15.677
+effort_final,final_xhigh,xhigh,49152,q8_0/q8_0,32/64/16,0.025,78.42,0.60377,112.409
+effort_final,final_high,high,49152,q8_0/q8_0,32/64/16,0.025,79.42,0.5934,129.997

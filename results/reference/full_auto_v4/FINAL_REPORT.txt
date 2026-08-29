@@ -1,0 +1,22 @@
+Local Qwen Full-Auto Benchmark Harness v4.0-verification
+========================================================================
+
+BASELINE
+  synthetic median decode: 79.47 tok/s
+  agent success: 1/1
+
+SELECTED BEFORE EFFORT A/B
+  ngram winner: 32/64/16
+  draft p-min: 0.025
+  quality context: 49152
+  quality KV: q8_0/q8_0
+  optional max context: 65536 (q8_0/q5_0)
+
+FINAL XHIGH vs HIGH
+  xhigh | synthetic=78.42 tok/s | acceptance=0.60377 | agent_success=3/3 | agent_wall=112.409 s | agent_decode=83.37 tok/s | completion_tokens=6360 | requests=13
+  high  | synthetic=79.42 tok/s | acceptance=0.5934 | agent_success=3/3 | agent_wall=129.997 s | agent_decode=81.2 tok/s | completion_tokens=7786 | requests=13
+
+NOTE
+  Production start_qwen_server.ps1 was NOT modified.
+  q8/q5 is reported only as an optional extended-context candidate.
+  The automatically selected quality profile keeps q8/q8.

@@ -1,0 +1,25 @@
+Final p-min verification @ 49152 Q8/Q8 xhigh
+========================================================================
+
+p-min=0 | agent=5/5 | wall=131.537 s | completion=7040 | prompt=38076 | requests=12 | agent_decode=75.46 tok/s | synth_decode=74.14 tok/s
+p-min=0.025 | agent=5/5 | wall=80.029 s | completion=4263 | prompt=29937 | requests=8 | agent_decode=81.43 tok/s | synth_decode=77.55 tok/s
+p-min=0.05 | agent=5/5 | wall=97.736 s | completion=5278 | prompt=36643 | requests=12 | agent_decode=82.83 tok/s | synth_decode=79.14 tok/s
+
+DECISION
+{
+  "status": "winner",
+  "selection_rule": "Require 5/5 agent success, then minimize median real-agent wall time.",
+  "winner": {
+    "p_min": 0.025,
+    "all_agent_runs_passed": true,
+    "agent_success": "5/5",
+    "agent_wall_s_median": 80.029,
+    "agent_decode_tps_median": 81.43,
+    "agent_acceptance_median": 0.5283,
+    "agent_completion_tokens_median": 4263,
+    "agent_prompt_tokens_median": 29937,
+    "agent_requests_median": 8,
+    "synthetic_decode_tps_median": 77.55,
+    "synthetic_acceptance_median": 0.57289
+  }
+}
