@@ -46,6 +46,11 @@ ModelPath
 QwenUserRoot
 OrchestrationRoot
 ModelAlias
+AlgorithmModelAlias
+TestModelAlias
+PromptReasoningEffort
+AlgorithmReasoningEffort
+TestReasoningEffort
 ServerHost
 ServerPort
 ```
@@ -451,11 +456,52 @@ The reference environment was validated against Qwen Code 0.22.2.
 
 ## Reasoning mode
 
-The reference configuration uses:
+The reference configuration uses role-specific logical model/provider profiles:
 
 ```text
-reasoningEffort = xhigh
+PROMPT
+  ModelAlias = qwen3.8-27b-local
+  PromptReasoningEffort = xhigh
+
+ALGORITHM
+  AlgorithmModelAlias = qwen3.8-27b-algorithm
+  AlgorithmReasoningEffort = xhigh
+
+TEST
+  TestModelAlias = qwen3.8-27b-test
+  TestReasoningEffort = medium
 ```
+
+Each custom agent selects its logical provider through the `model:` field in its Markdown frontmatter.
+
+For example:
+
+```yaml
+# algorithm-agent.md
+model: qwen3.8-27b-algorithm
+```
+
+```yaml
+# test-agent.md
+model: qwen3.8-27b-test
+```
+
+The installer creates corresponding provider entries in `settings.json`. A role provider contains both the Qwen Code-side reasoning value and the explicit request-body override:
+
+```json
+"generationConfig": {
+  "reasoning": {
+    "effort": "medium"
+  },
+  "extra_body": {
+    "reasoning_effort": "medium"
+  }
+}
+```
+
+For the local OpenAI-compatible provider, `extra_body.reasoning_effort` is the explicit wire-level value sent to `llama.cpp`.
+
+All role providers point to the same local endpoint. Only one physical GGUF is loaded.
 
 The corresponding `llama-server` configuration enables reasoning with:
 
@@ -466,7 +512,9 @@ The corresponding `llama-server` configuration enables reasoning with:
 --reasoning-preserve
 ```
 
-The production wrapper keeps this reasoning configuration fixed for the reference setup.
+The server-level `xhigh` setting is the fallback/default. PROMPT and ALGORITHM currently use `xhigh` requests; TEST overrides the server default with `medium`.
+
+The repository reference runtime remains Qwen Code 0.22.2. The role-specific provider/reasoning configuration was additionally validated in the production environment with Qwen Code 0.22.3; this does not by itself constitute a complete migration of the repository runtime-patch baseline to 0.22.3.
 
 ## Updating Qwen Code
 

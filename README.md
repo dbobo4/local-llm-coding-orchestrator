@@ -474,7 +474,7 @@ The installer:
 - installs the ALGORITHM and TEST agent definitions;
 - installs the complete orchestration runtime: dispatcher, maintenance, memory protocol/store, project identity/registry, and workflow-state modules;
 - installs the managed lifecycle and maintenance hooks;
-- configures the local OpenAI-compatible provider and reference reasoning settings;
+- configures three role-specific logical OpenAI-compatible providers for PROMPT, ALGORITHM, and TEST, including their reasoning profiles;
 - preserves unrelated existing providers, environment settings, permission deny rules, UI/settings fields, and third-party hooks;
 - backs up existing managed files and `settings.json` before replacement;
 - uses millisecond-resolution backup directory names;
@@ -568,7 +568,7 @@ Ngram:
 Reasoning:
   on
 
-Reasoning effort:
+Server default reasoning effort:
   xhigh
 
 Reasoning budget:
@@ -579,6 +579,49 @@ Reasoning preserve:
 ```
 
 These settings were selected through the benchmark suite included in this repository. They are a validated reference configuration for the tested machine, not a universal optimum.
+
+### Role-specific model and reasoning routing
+
+The reference setup still loads only one physical GGUF model into one `llama-server` process. Qwen Code exposes that same server through three logical model/provider identities:
+
+```text
+qwen3.8-27b-local      -> PROMPT     -> xhigh
+qwen3.8-27b-algorithm  -> ALGORITHM  -> xhigh
+qwen3.8-27b-test       -> TEST       -> medium
+```
+
+All three providers use the same OpenAI-compatible base URL and the same physical model.
+
+The agent frontmatter selects the logical provider:
+
+```yaml
+# algorithm-agent.md
+model: qwen3.8-27b-algorithm
+```
+
+```yaml
+# test-agent.md
+model: qwen3.8-27b-test
+```
+
+The corresponding provider entry in `settings.json` controls the reasoning profile. For example, the TEST role uses:
+
+```json
+"generationConfig": {
+  "reasoning": {
+    "effort": "medium"
+  },
+  "extra_body": {
+    "reasoning_effort": "medium"
+  }
+}
+```
+
+`generationConfig.reasoning.effort` represents the Qwen Code-side reasoning configuration. The explicit `extra_body.reasoning_effort` field is the wire-level override sent through the OpenAI-compatible request to `llama.cpp`.
+
+The server-level `--reasoning-effort xhigh` remains the reference fallback/default. Role-specific requests can override that default without loading another GGUF or another inference server.
+
+The repository's original validated runtime baseline remains Qwen Code 0.22.2. The role-specific model-provider routing and request-level reasoning configuration described above were additionally validated in the production environment with Qwen Code 0.22.3. This update does not redefine the repository-wide runtime patch baseline or its recorded 0.22.2 patched hashes.
 
 ## Qwen Code compatibility layer
 
@@ -764,7 +807,11 @@ high
   completion tokens:  7786
 ```
 
-`xhigh` was retained because both configurations completed successfully while `xhigh` produced lower end-to-end wall time.
+`xhigh` was retained as the server-wide reference default because both configurations completed successfully while `xhigh` produced lower end-to-end wall time.
+
+The current orchestration additionally uses role-specific request-level reasoning. In the validated reference policy, PROMPT and ALGORITHM remain at `xhigh`, while TEST uses `medium`.
+
+The observed v3 to v4 orchestration benchmark reduced cumulative tokens from `339536` to `234973`, a reduction of `104563` tokens, or approximately `30.8%`, while final independent verification still passed.
 
 ### Final p-min verification
 

@@ -9,6 +9,22 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
+# Backward-compatible defaults for local.ps1 files created before
+# role-specific model aliases were introduced.
+if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
+    $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
+}
+
+if ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) {
+    $TestModelAlias = "qwen3.8-27b-test"
+}
+
+$ServerModelAliases = @(
+    $ModelAlias
+    $AlgorithmModelAlias
+    $TestModelAlias
+) -join ","
+
 $ServerExe = $LlamaServerExe
 
 if (-not (Test-Path $ServerExe -PathType Leaf)) {
@@ -23,7 +39,7 @@ Write-Host "========================================"
 Write-Host " Local Qwen Server"
 Write-Host "========================================"
 Write-Host "Model:   Qwen3.8-27B UD-Q3_K_XL + MTP2 + ngram-mod"
-Write-Host "Alias:   $ModelAlias"
+Write-Host "Aliases: $ServerModelAliases"
 Write-Host "Context: 49152"
 Write-Host "Reason:  xhigh"
 Write-Host "API:     http://${ServerHost}:${ServerPort}/v1"
@@ -32,7 +48,7 @@ Write-Host ""
 
 & $ServerExe `
     --model $ModelPath `
-    --alias $ModelAlias `
+    --alias $ServerModelAliases `
     --host $ServerHost `
     --port $ServerPort `
     --ctx-size 49152 `

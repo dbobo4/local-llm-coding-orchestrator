@@ -14,6 +14,34 @@ if (-not (Test-Path $SettingsTemplatePath -PathType Leaf)) {
 
 . $ConfigPath
 
+# Backward-compatible defaults for local.ps1 files created before
+# role-specific model routing was introduced.
+if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
+    $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
+}
+if ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) {
+    $TestModelAlias = "qwen3.8-27b-test"
+}
+if ([string]::IsNullOrWhiteSpace([string]$PromptReasoningEffort)) {
+    $PromptReasoningEffort = "xhigh"
+}
+if ([string]::IsNullOrWhiteSpace([string]$AlgorithmReasoningEffort)) {
+    $AlgorithmReasoningEffort = "xhigh"
+}
+if ([string]::IsNullOrWhiteSpace([string]$TestReasoningEffort)) {
+    $TestReasoningEffort = "medium"
+}
+
+$configuredAliases = @(
+    $ModelAlias,
+    $AlgorithmModelAlias,
+    $TestModelAlias
+)
+
+if (@($configuredAliases | Select-Object -Unique).Count -ne 3) {
+    throw "Model aliases for PROMPT, ALGORITHM, and TEST must be unique."
+}
+
 $SourceQwenMd = Join-Path $RepoRoot "orchestration\QWEN.md"
 $SourceAlgorithmAgent = Join-Path $RepoRoot "orchestration\agents\algorithm-agent.md"
 $SourceTestAgent = Join-Path $RepoRoot "orchestration\agents\test-agent.md"
@@ -80,6 +108,44 @@ foreach ($entry in $Targets.GetEnumerator()) {
     Copy-Item $entry.Key $entry.Value -Force
 }
 
+function Set-AgentModelFrontmatter {
+    param(
+        [string]$Path,
+        [string]$ModelAlias
+    )
+
+    $content = [IO.File]::ReadAllText($Path)
+    $matches = [regex]::Matches(
+        $content,
+        '(?m)^model:\s*[^\r\n]+$'
+    )
+
+    if ($matches.Count -ne 1) {
+        throw "Expected exactly one model frontmatter entry in: $Path"
+    }
+
+    $content = [regex]::Replace(
+        $content,
+        '(?m)^model:\s*[^\r\n]+$',
+        "model: $ModelAlias",
+        1
+    )
+
+    [IO.File]::WriteAllText(
+        $Path,
+        $content,
+        (New-Object Text.UTF8Encoding($false))
+    )
+}
+
+Set-AgentModelFrontmatter `
+    -Path $Targets[$SourceAlgorithmAgent] `
+    -ModelAlias $AlgorithmModelAlias
+
+Set-AgentModelFrontmatter `
+    -Path $Targets[$SourceTestAgent] `
+    -ModelAlias $TestModelAlias
+
 $template = Get-Content $SettingsTemplatePath -Raw | ConvertFrom-Json
 
 $dispatcherPath = Join-Path $OrchestrationRoot "hook_dispatcher.py"
@@ -111,10 +177,72 @@ foreach ($eventGroup in $template.hooks.PreToolUse) {
     }
 }
 
-$template.modelProviders.openai[0].id = $ModelAlias
-$template.modelProviders.openai[0].name = "$ModelAlias Local"
-$template.modelProviders.openai[0].baseUrl = "http://${ServerHost}:${ServerPort}/v1"
+$promptProvider = @(
+    $template.modelProviders.openai |
+        Where-Object { $_.id -eq "qwen3.8-27b-local" }
+) | Select-Object -First 1
+
+$algorithmProvider = @(
+    $template.modelProviders.openai |
+        Where-Object { $_.id -eq "qwen3.8-27b-algorithm" }
+) | Select-Object -First 1
+
+$testProvider = @(
+    $template.modelProviders.openai |
+        Where-Object { $_.id -eq "qwen3.8-27b-test" }
+) | Select-Object -First 1
+
+if ($null -eq $promptProvider -or
+    $null -eq $algorithmProvider -or
+    $null -eq $testProvider) {
+    throw "Settings template is missing one or more role-specific providers."
+}
+
+function Set-RoleProvider {
+    param(
+        $Provider,
+        [string]$Id,
+        [string]$Name,
+        [string]$ReasoningEffort
+    )
+
+    $Provider.id = $Id
+    $Provider.name = $Name
+    $Provider.baseUrl = "http://${ServerHost}:${ServerPort}/v1"
+
+    $Provider.generationConfig.reasoning.effort = $ReasoningEffort
+    $Provider.generationConfig.extra_body.reasoning_effort = $ReasoningEffort
+}
+
+Set-RoleProvider `
+    -Provider $promptProvider `
+    -Id $ModelAlias `
+    -Name "$ModelAlias Local" `
+    -ReasoningEffort $PromptReasoningEffort
+
+Set-RoleProvider `
+    -Provider $algorithmProvider `
+    -Id $AlgorithmModelAlias `
+    -Name "$AlgorithmModelAlias Algorithm" `
+    -ReasoningEffort $AlgorithmReasoningEffort
+
+Set-RoleProvider `
+    -Provider $testProvider `
+    -Id $TestModelAlias `
+    -Name "$TestModelAlias Test" `
+    -ReasoningEffort $TestReasoningEffort
+
 $template.model.name = $ModelAlias
+$template.model.reasoningEffort = $PromptReasoningEffort
+
+$managedProviderIds = @(
+    "qwen3.8-27b-local",
+    "qwen3.8-27b-algorithm",
+    "qwen3.8-27b-test",
+    $ModelAlias,
+    $AlgorithmModelAlias,
+    $TestModelAlias
+) | Select-Object -Unique
 
 function Ensure-ObjectProperty($Object, [string]$Name) {
     $property = $Object.PSObject.Properties[$Name]
@@ -129,14 +257,25 @@ function Ensure-ObjectProperty($Object, [string]$Name) {
 if (Test-Path $SettingsPath -PathType Leaf) {
     $settings = Get-Content $SettingsPath -Raw | ConvertFrom-Json
 
-    # Preserve other providers; replace only the provider managed by this project.
+    # Preserve unrelated providers; replace only providers managed by this project.
     $modelProviders = Ensure-ObjectProperty $settings "modelProviders"
     $existingOpenAI = @()
     if ($null -ne $modelProviders.PSObject.Properties["openai"]) {
         $existingOpenAI = @($modelProviders.openai)
     }
-    $openAIProviders = @($existingOpenAI | Where-Object { $_.id -ne $ModelAlias }) + @($template.modelProviders.openai[0])
-    $modelProviders | Add-Member -NotePropertyName "openai" -NotePropertyValue @($openAIProviders) -Force
+
+    $preservedOpenAI = @(
+        $existingOpenAI |
+            Where-Object { $managedProviderIds -notcontains $_.id }
+    )
+
+    $openAIProviders = @($preservedOpenAI) + @($template.modelProviders.openai)
+
+    $modelProviders |
+        Add-Member `
+            -NotePropertyName "openai" `
+            -NotePropertyValue @($openAIProviders) `
+            -Force
 
     # Preserve unrelated environment variables.
     $envSettings = Ensure-ObjectProperty $settings "env"
@@ -213,13 +352,77 @@ if ($verify.model.name -ne $ModelAlias) {
     throw "Installation verification failed: model alias"
 }
 
-if ($verify.model.reasoningEffort -ne "xhigh") {
-    throw "Installation verification failed: reasoning effort"
+if ($verify.model.reasoningEffort -ne $PromptReasoningEffort) {
+    throw "Installation verification failed: parent reasoning effort"
 }
 
-$verifyProvider = @($verify.modelProviders.openai | Where-Object { $_.id -eq $ModelAlias }) | Select-Object -First 1
-if ($null -eq $verifyProvider -or $verifyProvider.generationConfig.contextWindowSize -ne 49152) {
-    throw "Installation verification failed: context window"
+$expectedRoleProviders = @(
+    [pscustomobject]@{
+        Id = $ModelAlias
+        Effort = $PromptReasoningEffort
+        Role = "PROMPT"
+    },
+    [pscustomobject]@{
+        Id = $AlgorithmModelAlias
+        Effort = $AlgorithmReasoningEffort
+        Role = "ALGORITHM"
+    },
+    [pscustomobject]@{
+        Id = $TestModelAlias
+        Effort = $TestReasoningEffort
+        Role = "TEST"
+    }
+)
+
+foreach ($expected in $expectedRoleProviders) {
+    $matches = @(
+        $verify.modelProviders.openai |
+            Where-Object { $_.id -eq $expected.Id }
+    )
+
+    if ($matches.Count -ne 1) {
+        throw (
+            "Installation verification failed: expected exactly one " +
+            "$($expected.Role) provider '$($expected.Id)'"
+        )
+    }
+
+    $provider = $matches[0]
+
+    if ($provider.generationConfig.contextWindowSize -ne 49152) {
+        throw "Installation verification failed: $($expected.Role) context window"
+    }
+
+    if ($provider.generationConfig.reasoning.effort -ne $expected.Effort) {
+        throw "Installation verification failed: $($expected.Role) internal reasoning effort"
+    }
+
+    if ($provider.generationConfig.extra_body.reasoning_effort -ne $expected.Effort) {
+        throw "Installation verification failed: $($expected.Role) wire reasoning effort"
+    }
+}
+
+$installedAlgorithmAgent = [IO.File]::ReadAllText(
+    $Targets[$SourceAlgorithmAgent]
+)
+$installedTestAgent = [IO.File]::ReadAllText(
+    $Targets[$SourceTestAgent]
+)
+
+$algorithmPattern = '(?m)^model:\s*' +
+    [regex]::Escape($AlgorithmModelAlias) +
+    '\s*$'
+
+$testPattern = '(?m)^model:\s*' +
+    [regex]::Escape($TestModelAlias) +
+    '\s*$'
+
+if (-not [regex]::IsMatch($installedAlgorithmAgent,$algorithmPattern)) {
+    throw "Installation verification failed: ALGORITHM agent model routing"
+}
+
+if (-not [regex]::IsMatch($installedTestAgent,$testPattern)) {
+    throw "Installation verification failed: TEST agent model routing"
 }
 
 if ($verify.hooks.SessionEnd[0].hooks.Count -ne 2) {

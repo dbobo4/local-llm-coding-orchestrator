@@ -11,5 +11,11 @@ $QwenCodeCli = Join-Path $QwenCodeRoot "bin\qwen.cmd"
 $LlamaServerExe = Join-Path $LlamaCppRoot "llama-server.exe"
 
 $ModelAlias = "qwen3.8-27b-local"
+$AlgorithmModelAlias = "qwen3.8-27b-algorithm"
+$TestModelAlias = "qwen3.8-27b-test"
+
+$PromptReasoningEffort = "xhigh"
+$AlgorithmReasoningEffort = "xhigh"
+$TestReasoningEffort = "medium"
 $ServerHost = "127.0.0.1"
 $ServerPort = 8080

@@ -612,6 +612,57 @@ These checks intentionally distinguish interactive production behavior from head
 
 ## Inference architecture
 
+The production design uses one physical GGUF, one `llama-server` process, and three logical Qwen Code model/provider identities:
+
+```text
+PROMPT
+  -> qwen3.8-27b-local
+  -> xhigh
+
+ALGORITHM
+  -> qwen3.8-27b-algorithm
+  -> xhigh
+
+TEST
+  -> qwen3.8-27b-test
+  -> medium
+```
+
+The three logical model IDs do not represent three separately loaded neural networks. They all target the same OpenAI-compatible `llama.cpp` endpoint and the same loaded GGUF.
+
+Routing is split across two configuration layers:
+
+```text
+agent frontmatter
+    model: <logical model id>
+            |
+            v
+Qwen Code settings.json provider
+    generationConfig.reasoning.effort
+    generationConfig.extra_body.reasoning_effort
+            |
+            v
+llama.cpp OpenAI-compatible request
+```
+
+For example:
+
+```text
+test-agent.md
+    model: qwen3.8-27b-test
+
+settings.json
+    qwen3.8-27b-test
+    -> reasoning.effort = medium
+    -> extra_body.reasoning_effort = medium
+```
+
+The explicit `extra_body.reasoning_effort` value is used as the wire-level reasoning override for the local OpenAI-compatible provider.
+
+The repository-wide runtime compatibility baseline remains Qwen Code 0.22.2. The role-specific provider routing and request-level reasoning behavior were additionally validated on the production Qwen Code 0.22.3 runtime. The existing 0.22.2 runtime-patch hashes and compatibility statements therefore remain historical reference data rather than being silently relabeled as 0.22.3 results.
+
+`llama-server` is started with all three aliases advertised together. The server's `--reasoning-effort xhigh` remains the fallback/default; the role-specific provider request can override it.
+
 The reference server configuration uses one model instance and one concurrent inference slot:
 
 ```text
@@ -628,7 +679,7 @@ threads-batch = 20
 threads-draft = 20
 threads-draft-batch = 20
 reasoning = on
-reasoning effort = xhigh
+server default reasoning effort = xhigh
 reasoning budget = -1
 reasoning preserve = enabled
 ```

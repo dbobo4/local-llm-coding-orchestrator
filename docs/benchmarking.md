@@ -251,9 +251,41 @@ high
   requests:           13
 ```
 
-`xhigh` was retained.
+`xhigh` was retained as the server-wide reference default.
 
 The choice was based on successful completion and lower end-to-end wall time, not on the reasoning-effort label itself.
+
+This comparison predates the role-specific reasoning policy and should not be interpreted as requiring every orchestration role to use `xhigh`.
+
+## Role-specific reasoning end-to-end comparison
+
+The later orchestration configuration kept PROMPT and ALGORITHM at `xhigh` while reducing TEST to `medium`:
+
+```text
+PROMPT     -> xhigh
+ALGORITHM  -> xhigh
+TEST       -> medium
+```
+
+The roles still used the same physical Qwen3.8-27B GGUF and the same `llama.cpp` process. The difference was request-level provider configuration, not a model reload.
+
+Observed v3 to v4 workflow comparison:
+
+```text
+uniform-xhigh orchestration:
+  cumulative tokens: 339536
+
+role-specific orchestration:
+  cumulative tokens: 234973
+
+reduction:
+  104563 tokens
+  approximately 30.8%
+```
+
+Independent final TEST verification remained `PASS`.
+
+This result is an orchestration-level token comparison. It does not replace the earlier isolated inference tuning results and should not be interpreted as a direct raw tok/s comparison.
 
 ## Final p-min comparison
 
@@ -440,8 +472,13 @@ Ngram:
 Reasoning:
   on
 
-Reasoning effort:
+Server default reasoning effort:
   xhigh
+
+Role-specific request policy:
+  PROMPT     xhigh
+  ALGORITHM  xhigh
+  TEST       medium
 
 Reasoning budget:
   -1

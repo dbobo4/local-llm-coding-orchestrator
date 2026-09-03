@@ -9,12 +9,33 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
+# Backward-compatible defaults for local.ps1 files created before
+# role-specific model aliases were introduced.
+if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
+    $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
+}
+
+if ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) {
+    $TestModelAlias = "qwen3.8-27b-test"
+}
+
+$ExpectedModels = @(
+    $ModelAlias
+    $AlgorithmModelAlias
+    $TestModelAlias
+)
+
+if (@($ExpectedModels | Select-Object -Unique).Count -ne 3) {
+    throw "PROMPT, ALGORITHM, and TEST model aliases must be unique."
+}
+
+$ExpectedModelSummary = $ExpectedModels -join ", "
+
 $StartScript = Join-Path $PSScriptRoot "start_qwen_server.ps1"
 $LogRoot = Join-Path $QwenRoot "logs"
 
 $HostAddress = $ServerHost
 $Port = [int]$ServerPort
-$ExpectedModel = $ModelAlias
 $ApiUrl = "http://${HostAddress}:${Port}/v1/models"
 
 $StartupTimeoutSeconds = 120
@@ -69,17 +90,32 @@ function Get-QwenApiState {
         }
 
         $models = @($response.data)
+        $advertisedModels = @()
 
         foreach ($model in $models) {
-            if (
-                $null -ne $model.id -and
-                [string]$model.id -eq $ExpectedModel
-            ) {
-                return "ready"
+            if ($null -ne $model.id) {
+                $advertisedModels += [string]$model.id
+            }
+
+            foreach ($alias in @($model.aliases)) {
+                if ($null -ne $alias) {
+                    $advertisedModels += [string]$alias
+                }
             }
         }
 
-        return "wrong_model"
+        $advertisedModels = @(
+            $advertisedModels |
+                Select-Object -Unique
+        )
+
+        foreach ($expectedModel in $ExpectedModels) {
+            if ($advertisedModels -notcontains $expectedModel) {
+                return "wrong_model"
+            }
+        }
+
+        return "ready"
     }
     catch {
         return "unreachable"
@@ -99,8 +135,8 @@ $portListening = Test-PortListening `
 
 if ($portListening) {
     throw (
-        "Port $Port is already in use, but the expected model " +
-        "'$ExpectedModel' is not available at $ApiUrl. " +
+        "Port $Port is already in use, but the required models " +
+        "'$ExpectedModelSummary' are not available at $ApiUrl. " +
         "Refusing to start a second server."
     )
 }
@@ -153,8 +189,8 @@ while ((Get-Date) -lt $deadline) {
 
     if ($state -eq "wrong_model") {
         throw (
-            "A server responded at $ApiUrl, but model " +
-            "'$ExpectedModel' was not advertised. " +
+            "A server responded at $ApiUrl, but required models " +
+            "'$ExpectedModelSummary' were not all advertised. " +
             "Refusing to continue."
         )
     }
@@ -164,6 +200,6 @@ while ((Get-Date) -lt $deadline) {
 
 throw (
     "Timed out after $StartupTimeoutSeconds seconds waiting for " +
-    "'$ExpectedModel' at $ApiUrl. " +
+    "required models '$ExpectedModelSummary' at $ApiUrl. " +
     "Check: $stdoutLog and $stderrLog"
 )
