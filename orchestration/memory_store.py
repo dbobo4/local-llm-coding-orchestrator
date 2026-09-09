@@ -22,11 +22,7 @@ AgentRole = Literal[
 ]
 
 
-MAX_MEMORY_CHARS = 24_000
-MAX_JOURNAL_CHARS = 32_000
 MAX_MISUNDERSTANDINGS_CHARS = 20_000
-MAX_CROSS_PROJECT_MEMORY_CHARS = 20_000
-JOURNAL_ROTATE_BYTES = 512 * 1024
 
 
 INITIAL_MEMORY_CONTENT = """# Durable project memory
@@ -50,18 +46,6 @@ Do not store:
 - information already obvious from the repository.
 """
 
-
-INITIAL_JOURNAL_CONTENT = """# Project journal
-
-Keep short chronological entries for meaningful completed actions, decisions, failures, or state changes.
-
-Each entry should be concise and explain:
-- what materially happened,
-- why it mattered,
-- any durable consequence.
-
-Do not log every tool call or microscopic action.
-"""
 
 
 INITIAL_MISUNDERSTANDINGS_CONTENT = """# Misunderstandings
@@ -235,67 +219,6 @@ def _append_entry(
         )
 
 
-def _rotate_journal_if_needed(
-    path: Path,
-) -> None:
-    if not path.exists():
-        return
-
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return
-
-    if size <= JOURNAL_ROTATE_BYTES:
-        return
-
-    archive_root = (
-        path.parent
-        / "archive"
-    )
-
-    archive_root.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y%m%dT%H%M%SZ"
-    )
-
-    archive_path = (
-        archive_root
-        / f"{path.stem}_{timestamp}{path.suffix}"
-    )
-
-    counter = 1
-
-    while archive_path.exists():
-        archive_path = (
-            archive_root
-            / (
-                f"{path.stem}_"
-                f"{timestamp}_"
-                f"{counter}"
-                f"{path.suffix}"
-            )
-        )
-
-        counter += 1
-
-    os.replace(
-        path,
-        archive_path,
-    )
-
-    _ensure_file(
-        path,
-        INITIAL_JOURNAL_CONTENT,
-    )
-
-
 def _agent_root(
     identity: ProjectIdentity,
     agent: AgentRole,
@@ -330,19 +253,6 @@ def get_memory_path(
             agent,
         )
         / "memory.md"
-    )
-
-
-def get_journal_path(
-    identity: ProjectIdentity,
-    agent: AgentRole,
-) -> Path:
-    return (
-        _agent_root(
-            identity,
-            agent,
-        )
-        / "journal.md"
     )
 
 
@@ -387,13 +297,6 @@ def initialize_memory_structure(
             INITIAL_MEMORY_CONTENT,
         )
 
-        _ensure_file(
-            get_journal_path(
-                identity,
-                agent,
-            ),
-            INITIAL_JOURNAL_CONTENT,
-        )
 
     _ensure_file(
         get_misunderstandings_path(
@@ -416,32 +319,15 @@ def read_memory(
         identity
     )
 
-    return _read_bounded(
-        get_memory_path(
-            identity,
-            agent,
-        ),
-        MAX_MEMORY_CHARS,
+    path = get_memory_path(
+        identity,
+        agent,
     )
 
-
-def read_journal(
-    identity: ProjectIdentity,
-    agent: AgentRole,
-) -> str:
-    initialize_memory_structure(
-        identity
+    return path.read_text(
+        encoding="utf-8",
+        errors="replace",
     )
-
-    return _read_bounded(
-        get_journal_path(
-            identity,
-            agent,
-        ),
-        MAX_JOURNAL_CHARS,
-        prefer_tail=True,
-    )
-
 
 def read_misunderstandings(
     identity: ProjectIdentity,
@@ -469,11 +355,10 @@ def read_cross_project_memory() -> str:
         INITIAL_CROSS_PROJECT_MEMORY_CONTENT,
     )
 
-    return _read_bounded(
-        path,
-        MAX_CROSS_PROJECT_MEMORY_CHARS,
+    return path.read_text(
+        encoding="utf-8",
+        errors="replace",
     )
-
 
 def replace_memory(
     identity: ProjectIdentity,
@@ -521,31 +406,6 @@ def replace_cross_project_memory(
     _atomic_write(
         path,
         normalized,
-    )
-
-
-def append_journal(
-    identity: ProjectIdentity,
-    agent: AgentRole,
-    entry: str,
-) -> None:
-    initialize_memory_structure(
-        identity
-    )
-
-    path = get_journal_path(
-        identity,
-        agent,
-    )
-
-    _rotate_journal_if_needed(
-        path
-    )
-
-    _append_entry(
-        path,
-        entry,
-        timestamp=True,
     )
 
 

@@ -16,13 +16,10 @@ from memory_protocol import (
 )
 from memory_store import (
     INITIAL_CROSS_PROJECT_MEMORY_CONTENT,
-    INITIAL_JOURNAL_CONTENT,
     INITIAL_MEMORY_CONTENT,
     INITIAL_MISUNDERSTANDINGS_CONTENT,
-    append_journal,
     initialize_memory_structure,
     read_cross_project_memory,
-    read_journal,
     read_memory,
     read_misunderstandings,
 )
@@ -40,12 +37,14 @@ from workflow_state import (
     equivalent_failure_limit_reached,
     get_active_state,
     get_agent_state,
+    has_prior_closed_turn,
     increment_stop_block_count,
     mark_algorithm_completed,
     mark_algorithm_started,
     mark_contract_ready,
     mark_final_test_started,
     mark_misunderstandings_read,
+    mark_prompt_memory_written,
     mark_turn_closed,
     mark_verification_blocked,
     mark_verification_pass,
@@ -62,21 +61,11 @@ ERROR_LOG_ROOT = ORCHESTRATION_ROOT / "logs"
 ERROR_LOG_PATH = ERROR_LOG_ROOT / "hook_errors.log"
 
 # Keep injected Qwen hook context compact.
-MAX_AGENT_CONTEXT_CHARS = 3_000
 
 # Fresh PROMPT_AGENT session context.
-MAX_SHARED_PROJECT_CONTEXT_CHARS = 700
-MAX_PROMPT_SESSION_JOURNAL_CONTEXT_CHARS = 500
-MAX_PROMPT_SESSION_ALGORITHM_JOURNAL_CONTEXT_CHARS = 550
-MAX_PROMPT_SESSION_TEST_JOURNAL_CONTEXT_CHARS = 650
-MAX_CROSS_PROJECT_CONTEXT_CHARS = 100
 
 # Compact subagent context.
-MAX_PROMPT_JOURNAL_CONTEXT_CHARS = 350
-MAX_ROLE_MEMORY_CONTEXT_CHARS = 350
-MAX_ROLE_JOURNAL_CONTEXT_CHARS = 250
 
-MAX_JOURNAL_ENTRY_CHARS = 4_000
 MAX_FAILURE_SUMMARY_CHARS = 3_000
 MAX_AUTO_MISUNDERSTANDING_CHARS = 1_200
 
@@ -201,32 +190,6 @@ def _truncate(
     )
 
 
-def _truncate_tail(
-    text: str,
-    max_chars: int,
-) -> str:
-    text = _normalize_text(
-        text
-    )
-
-    if len(text) <= max_chars:
-        return text
-
-    marker = (
-        "[... older journal context omitted ...]\n\n"
-    )
-
-    keep = max(
-        0,
-        max_chars - len(marker),
-    )
-
-    return (
-        marker
-        + text[-keep:]
-    )
-
-
 def _is_default_memory(
     content: str,
 ) -> bool:
@@ -234,17 +197,6 @@ def _is_default_memory(
         _normalize_text(content)
         == _normalize_text(
             INITIAL_MEMORY_CONTENT
-        )
-    )
-
-
-def _is_default_journal(
-    content: str,
-) -> bool:
-    return (
-        _normalize_text(content)
-        == _normalize_text(
-            INITIAL_JOURNAL_CONTENT
         )
     )
 
@@ -465,127 +417,52 @@ def _get_subagent_state(
     )
 
 
-def _append_context_part(
-    parts: list[str],
-    heading: str,
-    content: str,
-    *,
-    max_chars: int,
-    tail: bool = False,
-) -> None:
-    if not content:
-        return
-
-    if tail:
-        rendered = _truncate_tail(
-            content,
-            max_chars,
-        )
-    else:
-        rendered = _truncate(
-            content,
-            max_chars,
-        )
-
-    parts.append(
-        heading
-        + rendered
-    )
-
-
 def _build_agent_memory_context(
     identity: ProjectIdentity,
     agent: str,
+    *,
+    include_cross_project: bool = False,
 ) -> str:
-    shared_project_memory = read_memory(
-        identity,
-        "prompt_agent",
-    )
-
-    prompt_journal = read_journal(
-        identity,
-        "prompt_agent",
-    )
-
-    cross_project_memory = (
-        read_cross_project_memory()
-    )
-
     parts: list[str] = []
 
-    if (
-        shared_project_memory
-        and not _is_default_memory(
-            shared_project_memory
-        )
-    ):
-        _append_context_part(
-            parts,
-            "Shared durable project memory:\n",
-            shared_project_memory,
-            max_chars=(
-                MAX_SHARED_PROJECT_CONTEXT_CHARS
-            ),
-        )
-
     if agent == "prompt_agent":
-        algorithm_journal = read_journal(
+        prompt_memory = read_memory(
             identity,
-            "algorithm_agent",
-        )
-
-        test_journal = read_journal(
-            identity,
-            "test_agent",
+            "prompt_agent",
         )
 
         if (
-            prompt_journal
-            and not _is_default_journal(
-                prompt_journal
+            prompt_memory
+            and not _is_default_memory(
+                prompt_memory
             )
         ):
-            _append_context_part(
-                parts,
-                "Recent PROMPT_AGENT project journal:\n",
-                prompt_journal,
-                max_chars=(
-                    MAX_PROMPT_SESSION_JOURNAL_CONTEXT_CHARS
-                ),
-                tail=True,
+            parts.append(
+                "Durable PROMPT/project memory:\n"
+                + _normalize_text(
+                    prompt_memory
+                )
             )
 
-        if (
-            algorithm_journal
-            and not _is_default_journal(
-                algorithm_journal
-            )
-        ):
-            _append_context_part(
-                parts,
-                "Recent ALGORITHM_AGENT implementation journal:\n",
-                algorithm_journal,
-                max_chars=(
-                    MAX_PROMPT_SESSION_ALGORITHM_JOURNAL_CONTEXT_CHARS
-                ),
-                tail=True,
+        if include_cross_project:
+            cross_project_memory = (
+                read_cross_project_memory()
             )
 
-        if (
-            test_journal
-            and not _is_default_journal(
-                test_journal
-            )
-        ):
-            _append_context_part(
-                parts,
-                "Recent TEST_AGENT verification journal:\n",
-                test_journal,
-                max_chars=(
-                    MAX_PROMPT_SESSION_TEST_JOURNAL_CONTEXT_CHARS
-                ),
-                tail=True,
-            )
+            if (
+                cross_project_memory
+                and not _is_default_cross_project_memory(
+                    cross_project_memory
+                )
+            ):
+                parts.append(
+                    "Cross-project memory for initial session synthesis only. "
+                    "Use only genuinely relevant lessons and do not forward "
+                    "this memory wholesale to specialists:\n"
+                    + _normalize_text(
+                        cross_project_memory
+                    )
+                )
 
     else:
         role_memory = read_memory(
@@ -593,105 +470,20 @@ def _build_agent_memory_context(
             agent,
         )
 
-        role_journal = read_journal(
-            identity,
-            agent,
-        )
-
-        if (
-            prompt_journal
-            and not _is_default_journal(
-                prompt_journal
-            )
-        ):
-            _append_context_part(
-                parts,
-                "Recent PROMPT_AGENT project context:\n",
-                prompt_journal,
-                max_chars=(
-                    MAX_PROMPT_JOURNAL_CONTEXT_CHARS
-                ),
-                tail=True,
-            )
-
         if (
             role_memory
             and not _is_default_memory(
                 role_memory
             )
         ):
-            _append_context_part(
-                parts,
-                "Role-specific durable memory:\n",
-                role_memory,
-                max_chars=(
-                    MAX_ROLE_MEMORY_CONTEXT_CHARS
-                ),
+            parts.append(
+                "Role-specific durable memory:\n"
+                + _normalize_text(
+                    role_memory
+                )
             )
 
-        if (
-            role_journal
-            and not _is_default_journal(
-                role_journal
-            )
-        ):
-            _append_context_part(
-                parts,
-                "Recent role-specific journal:\n",
-                role_journal,
-                max_chars=(
-                    MAX_ROLE_JOURNAL_CONTEXT_CHARS
-                ),
-                tail=True,
-            )
-
-    if (
-        cross_project_memory
-        and not _is_default_cross_project_memory(
-            cross_project_memory
-        )
-    ):
-        _append_context_part(
-            parts,
-            "Relevant cross-project memory:\n",
-            cross_project_memory,
-            max_chars=(
-                MAX_CROSS_PROJECT_CONTEXT_CHARS
-            ),
-        )
-
-    if not parts:
-        return ""
-
-    return _truncate(
-        "\n\n".join(
-            parts
-        ),
-        MAX_AGENT_CONTEXT_CHARS,
-    )
-
-
-def _append_agent_result_to_journal(
-    identity: ProjectIdentity,
-    agent: str,
-    message: str | None,
-) -> None:
-    normalized = _normalize_text(
-        message
-    )
-
-    if not normalized:
-        return
-
-    append_journal(
-        identity,
-        agent,
-        _truncate(
-            normalized,
-            MAX_JOURNAL_ENTRY_CHARS,
-        ),
-    )
-
+    return "\n\n".join(parts)
 
 def _process_subagent_message(
     identity: ProjectIdentity,
@@ -783,6 +575,7 @@ def _handle_session_start(
     context = _build_agent_memory_context(
         identity,
         "prompt_agent",
+        include_cross_project=True,
     )
 
     if not context:
@@ -973,30 +766,22 @@ def _handle_test_start(
     if state.verification_after_implementation:
         if state.algorithm_completed:
             phase_context = (
-                "Perform final independent verification of "
-                "the completed repository changes. Reconstruct "
-                "the relevant acceptance criteria from the task "
-                "contract and actual repository state. Return "
-                "PASS, FAIL, or BLOCKED."
+                "Final independent verification after implementation. "
+                "Do not modify repository files. Return PASS, FAIL, "
+                "or BLOCKED."
             )
 
         else:
             phase_context = (
-                "Implementation has been selected in this "
-                "workflow but is not recorded as complete. "
-                "Do not claim PASS for a repository state that "
-                "may still be changing. If a stable completed "
-                "implementation cannot be verified, return "
-                "BLOCKED."
+                "Implementation is not recorded as complete. "
+                "Do not modify repository files; return BLOCKED "
+                "unless a stable completed state can be verified."
             )
 
     else:
         phase_context = (
-            "This is a verification-only audit. Do not modify "
-            "persistent repository content. PASS, FAIL, and "
-            "BLOCKED are all valid terminal audit results. "
-            "A FAIL does not imply that you should implement "
-            "a fix."
+            "Verification-only audit. Do not modify repository "
+            "files. Return PASS, FAIL, or BLOCKED."
         )
 
     memory_context = _build_agent_memory_context(
@@ -1016,10 +801,7 @@ def _handle_test_start(
     _write_json(
         _additional_context_output(
             "SubagentStart",
-            _truncate(
-                context,
-                MAX_AGENT_CONTEXT_CHARS,
-            ),
+            context,
         )
     )
 
@@ -1121,12 +903,6 @@ def _handle_algorithm_stop(
         )
     )
 
-    _append_agent_result_to_journal(
-        identity,
-        "algorithm_agent",
-        clean_message,
-    )
-
     mark_algorithm_completed(
         state
     )
@@ -1177,12 +953,6 @@ def _handle_missing_test_status(
     mark_verification_blocked(
         state,
         summary,
-    )
-
-    _append_agent_result_to_journal(
-        identity,
-        "test_agent",
-        clean_message or summary,
     )
 
     _unregister_subagent(
@@ -1242,12 +1012,6 @@ def _handle_test_stop(
             "test_agent",
             message,
         )
-    )
-
-    _append_agent_result_to_journal(
-        identity,
-        "test_agent",
-        clean_message,
     )
 
     if status == "PASS":
@@ -1484,19 +1248,6 @@ def _handle_stop(
     )
 
     if can_finish:
-        last_message = payload.get(
-            "last_assistant_message"
-        )
-
-        if isinstance(
-            last_message,
-            str,
-        ):
-            _append_agent_result_to_journal(
-                identity,
-                "prompt_agent",
-                last_message,
-            )
 
         mark_turn_closed(
             state
@@ -1530,6 +1281,198 @@ def _handle_stop(
     )
 
 
+
+def _handle_prompt_memory_pre_tool_use(
+    payload: dict[str, Any],
+    identity: ProjectIdentity,
+) -> None:
+    """
+    Consume PROMPT-owned durable-memory metadata carried inside an
+    Agent tool prompt, persist it as Pxxx memory, then remove the
+    metadata before the specialist sees the prompt.
+
+    Invalid memory metadata is silently discarded. The Agent call
+    itself is never blocked because of a memory-protocol failure.
+    """
+
+    tool_name = str(
+        payload.get("tool_name")
+        or ""
+    ).strip().lower()
+
+    if tool_name not in {
+        "agent",
+        "task",
+    }:
+        _write_json(
+            {
+                "continue": True,
+            }
+        )
+        return
+
+    tool_input = payload.get(
+        "tool_input"
+    )
+
+    if not isinstance(
+        tool_input,
+        dict,
+    ):
+        _write_json(
+            {
+                "continue": True,
+            }
+        )
+        return
+
+    prompt = tool_input.get(
+        "prompt"
+    )
+
+    if not isinstance(
+        prompt,
+        str,
+    ):
+        _write_json(
+            {
+                "continue": True,
+            }
+        )
+        return
+
+    # Detect exact and plausibly malformed PROMPT-memory tags
+    # case-insensitively. Only an exact carrier may cause a write,
+    # but suspicious carrier-like metadata must never reach a specialist.
+    carrier_marker_pattern = re.compile(
+        r"<\s*/?\s*PROM[A-Z0-9_-]{0,24}MEMORY\s*>",
+        flags=re.IGNORECASE,
+    )
+
+    if carrier_marker_pattern.search(prompt) is None:
+        _write_json(
+            {
+                "continue": True,
+            }
+        )
+        return
+
+    carrier_pattern = re.compile(
+        r"<PROMPT_MEMORY>\s*(.*?)\s*</PROMPT_MEMORY>",
+        flags=(
+            re.IGNORECASE
+            | re.DOTALL
+        ),
+    )
+
+    matches = list(
+        carrier_pattern.finditer(
+            prompt
+        )
+    )
+
+    # Exactly one complete carrier may cause a memory write.
+    # Zero/multiple/malformed carriers are rejected silently.
+    if len(matches) == 1:
+        body = (
+            matches[0]
+            .group(1)
+            .strip()
+        )
+
+        if body:
+            session_id = _get_required_string(
+                payload,
+                "session_id",
+            )
+
+            state = (
+                get_active_state(
+                    session_id
+                )
+                if session_id is not None
+                else None
+            )
+
+            write_allowed = (
+                state is not None
+                and has_prior_closed_turn(
+                    state
+                )
+                and not state.prompt_memory_written
+            )
+
+            if write_allowed:
+                wrapped_memory_message = (
+                    "<ORCHESTRATION_MEMORY>\n"
+                    + body
+                    + "\n</ORCHESTRATION_MEMORY>"
+                )
+
+                memory_before = read_memory(
+                    identity,
+                    "prompt_agent",
+                )
+
+                process_agent_memory_message(
+                    identity,
+                    "prompt_agent",
+                    wrapped_memory_message,
+                )
+
+                memory_after = read_memory(
+                    identity,
+                    "prompt_agent",
+                )
+
+                if memory_after != memory_before:
+                    mark_prompt_memory_written(
+                        state
+                    )
+
+    # Always remove complete carrier blocks before the specialist
+    # receives the Agent prompt, even when the memory update was invalid.
+    clean_prompt = carrier_pattern.sub(
+        "",
+        prompt,
+    )
+
+    # The carrier contract requires metadata to be appended at the end.
+    # After removing valid complete carriers, any remaining PROM...MEMORY
+    # marker is malformed/orphaned metadata. Truncate from its first
+    # occurrence rather than leaking it to the specialist.
+    suspicious_tail = carrier_marker_pattern.search(
+        clean_prompt
+    )
+
+    if suspicious_tail is not None:
+        clean_prompt = clean_prompt[
+            : suspicious_tail.start()
+        ]
+
+    clean_prompt = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        clean_prompt,
+    ).strip()
+
+    updated_input = dict(
+        tool_input
+    )
+    updated_input["prompt"] = (
+        clean_prompt
+    )
+
+    _write_json(
+        {
+            "continue": True,
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "tool_input": updated_input,
+            },
+        }
+    )
+
 def _dispatch(
     payload: dict[str, Any],
 ) -> None:
@@ -1559,6 +1502,13 @@ def _dispatch(
 
     if event_name == "UserPromptSubmit":
         _handle_user_prompt_submit(
+            payload,
+            identity,
+        )
+        return
+
+    if event_name == "PreToolUse":
+        _handle_prompt_memory_pre_tool_use(
             payload,
             identity,
         )
@@ -1610,7 +1560,14 @@ def main() -> None:
             error,
         )
 
-        if event_name in {
+        if event_name == "PreToolUse":
+            _write_json(
+                {
+                    "continue": True,
+                }
+            )
+
+        elif event_name in {
             "SubagentStop",
             "Stop",
         }:
@@ -1622,7 +1579,8 @@ def main() -> None:
                         "an internal error and failed open. "
                         "Orchestration reliability for this "
                         "event is reduced; inspect "
-                        f"{ERROR_LOG_PATH}."
+                        "C:\\Users\\User\\.qwen\\orchestration"
+                        "\\logs\\hook_errors.log."
                     ),
                 }
             )

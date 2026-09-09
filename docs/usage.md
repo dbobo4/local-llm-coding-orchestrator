@@ -206,94 +206,58 @@ Because `run_shell_command` can technically modify files, TEST is not capability
 
 ## Memory and project continuity
 
-The orchestrator automatically maintains project-aware state outside the model context window.
+The orchestrator maintains bounded project-aware state outside the active model context.
 
-You normally do not need to manually manage the memory files during ordinary use.
+Ordinary use does not require manually editing memory files.
 
 ### Project identity
 
-Each project receives a stable project identity.
+Each project receives a stable identity that survives sessions while keeping unrelated workspaces isolated. Global `~/.qwen/settings.json` is not a project marker.
 
-The identity is designed to remain stable across processes/sessions while keeping unrelated projects isolated.
+### Durable memory
 
-Global Qwen configuration such as:
-
-```text
-~/.qwen/settings.json
-```
-
-is intentionally **not** treated as a project marker.
-
-Run Qwen Code from the intended project/workspace directory so project-local context can be resolved correctly.
-
-### Shared durable memory
-
-The shared durable project memory is logically stored as:
+The current system uses compact stable-ID facts rather than role journals:
 
 ```text
-prompt_agent/memory.md
+Pxxx  PROMPT / project
+Axxx  ALGORITHM-private
+Txxx  TEST-private
+Cxxx  cross-project
 ```
 
-Despite the directory name, this is the **shared project store**, not PROMPT-private memory.
-
-### ALGORITHM-private memory
-
-```text
-algorithm_agent/memory.md
-```
-
-is private durable memory for ALGORITHM.
-
-### TEST-private memory
-
-```text
-test_agent/memory.md
-```
-
-is private durable memory for TEST.
-
-### Role journals
-
-Recent role journals are maintained separately from durable memory.
-
-They are used for recent handoff/coordination context rather than automatically becoming permanent project knowledge.
+Durable memory is for stable decisions, constraints, invariants, and consequences?not recent command history.
 
 ### Workflow state
 
-Workflow state is also separate from durable memory.
-
-It tracks bounded orchestration mechanics such as coordination/delegation state and anti-loop information.
+Workflow mechanics such as delegation, verification, fix cycles, stop blocks, and per-turn memory-write state are stored separately and are not durable knowledge.
 
 ### Cross-project memory
 
-Cross-project memory is optional and controlled.
-
-Project-specific memory is isolated by default; unrelated projects are not globally mixed together.
-
+Cross-project memory is considered only at `SessionStart` for PROMPT synthesis. It is never injected wholesale into ALGORITHM or TEST.
 ## What each role receives
 
-The dispatcher injects context according to the receiving role.
+The dispatcher minimizes specialist context.
 
 ```text
 PROMPT
-  shared project memory
-  + recent role journals needed for coordination
+  compact P/project memory
+  + controlled C/cross-project memory at SessionStart only
 
 ALGORITHM
-  shared project memory
-  + recent PROMPT context
-  + ALGORITHM-private memory
-  + ALGORITHM journal
+  small task-specific PROMPT delta
+  + ALGORITHM-private A memory
 
 TEST
-  shared project memory
-  + recent PROMPT context
-  + TEST-private memory
-  + TEST journal
+  small verification-specific PROMPT delta
+  + TEST-private T memory
+  + limited objective implementation facts
 ```
 
-A specialized role does not automatically receive the other specialized role's private durable memory.
+ALGORITHM does not receive PROMPT/project memory wholesale.
 
+TEST does not inherit ALGORITHM rationale, verdict-like claims, or ALGORITHM-private memory. It independently chooses what to inspect and what checks are sufficient.
+
+Prompt-memory transport is also hidden from specialists: an eligible `<PROMPT_MEMORY>` carrier is processed by `PreToolUse` and stripped before the real `Agent` invocation.
 ## Context management versus durable memory
 
 The reference model context window is:
@@ -302,22 +266,25 @@ The reference model context window is:
 49152 tokens
 ```
 
-Qwen Code session context still has normal context-window limits.
+Qwen Code session context still has normal context-window limits. Durable project memory and conversational compaction solve different problems.
 
-Interactive context-management commands such as:
+The local runtime compression optimization uses:
 
 ```text
-/compress
-/summary
-/recap
+COMPACT_MAX_OUTPUT_TOKENS = 4096
+
+<state_snapshot>
+  <goal>
+  <durable_constraints>
+  <current_state>
+  <open_issues>
+  <next_step>
+</state_snapshot>
 ```
 
-manage the active conversation.
+The summary targets roughly 800?1500 tokens and omits full messages, long code, routine tool calls, and transient exploration.
 
-The external orchestration memory serves a different purpose: selected project knowledge can survive beyond the current context window and across sessions.
-
-Do not treat conversational compression and durable project memory as the same mechanism.
-
+Durable memory persists selected stable facts across sessions; compaction preserves only enough active execution state to continue the current conversation.
 ## Interactive versus headless execution
 
 This distinction matters for tool permissions.
@@ -338,7 +305,7 @@ Interactive validation confirmed that:
 
 ### Non-interactive `-p`
 
-Qwen Code 0.22.2 applies additional safety restrictions in non-interactive mode.
+Qwen Code 0.22.3 applies additional safety restrictions in non-interactive mode.
 
 A command such as:
 
@@ -395,18 +362,19 @@ You normally do not need to manage `llama-server` manually.
 The wrapper performs:
 
 ```text
-patch verification
--> server verification/start
+runtime patch/optimization verification
+-> server ownership verification/start
 -> Qwen Code
 -> deterministic server shutdown
 ```
 
-Shutdown occurs even if Qwen Code exits with an error.
+Shutdown occurs even when Qwen Code exits with an error.
 
-The Qwen exit code remains primary unless Qwen itself succeeded and cleanup failed.
+The listener on `127.0.0.1:8080` is authoritative. Shutdown verifies process identity through CIM, rechecks that the same PID still owns the listener, terminates it only when the evidence matches the configured runtime, then waits for the port to become free.
 
-A `SessionEnd` hook also participates in normal server cleanup, but wrapper-level `finally` cleanup is the deterministic fallback.
+The startup PID may differ from the eventual listener PID.
 
+A `SessionEnd` hook participates in normal cleanup; wrapper `finally` cleanup is the deterministic fallback.
 ## Manual server commands
 
 ### Ensure the server is running
@@ -452,7 +420,7 @@ Useful interactive Qwen Code commands include:
 
 Exact command availability can depend on the installed Qwen Code version.
 
-The reference environment was validated against Qwen Code 0.22.2.
+The reference environment was validated against Qwen Code 0.22.3.
 
 ## Reasoning mode
 
@@ -514,11 +482,9 @@ The corresponding `llama-server` configuration enables reasoning with:
 
 The server-level `xhigh` setting is the fallback/default. PROMPT and ALGORITHM currently use `xhigh` requests; TEST overrides the server default with `medium`.
 
-The repository reference runtime remains Qwen Code 0.22.2. The role-specific provider/reasoning configuration was additionally validated in the production environment with Qwen Code 0.22.3; this does not by itself constitute a complete migration of the repository runtime-patch baseline to 0.22.3.
-
 ## Updating Qwen Code
 
-The project patches specific Qwen Code runtime behavior.
+The project depends on two Qwen Code compatibility behaviors and one separate compression optimization.
 
 After upgrading Qwen Code, launch through:
 
@@ -526,25 +492,27 @@ After upgrading Qwen Code, launch through:
 .\scripts\qwen.cmd
 ```
 
-The compatibility patcher inspects the installed runtime.
+The runtime manager classifies all required structures.
 
 Possible outcomes:
 
 ```text
-compatible and already patched
-    -> verify and continue
+known patched
+    -> validate and continue
 
-known compatible but unpatched
-    -> backup, patch, syntax-check, verify
+known compatible unpatched
+    -> backup
+    -> apply required compatibility changes
+    -> apply compression optimization
+    -> node --check
+    -> post-validate
 
-unknown or incompatible
+mixed or unknown
     -> fail closed
+    -> modify nothing
 ```
 
-Do not manually force the patch onto an unsupported build.
-
-If Qwen Code changes the relevant runtime semantics, update and revalidate the compatibility patch deliberately.
-
+Do not force the transformations onto an unsupported runtime. Re-audit the changed Qwen Code implementation and update the semantic fingerprints deliberately.
 ## Installer behavior on an existing Qwen setup
 
 The installer is designed to coexist with unrelated Qwen configuration.
@@ -564,38 +532,39 @@ Before overwriting managed files, the installer creates a backup under the confi
 
 ## Benchmarking
 
-Benchmark execution is separate from normal coding use.
+Benchmark execution is separate from ordinary coding use.
 
-Full benchmark:
+Existing inference suites:
 
 ```powershell
 .\benchmark\run_full_benchmark.ps1
 ```
 
-Final `p-min` verification:
+and:
 
 ```powershell
 .\benchmark\run_pmin_verify.ps1
 ```
 
-These can be significantly more expensive than normal smoke validation.
-
-Reference outputs:
+Historical machine-readable reference outputs remain under:
 
 ```text
 results\reference\
 ```
 
-New runs:
+The later orchestration-efficiency validation used a fresh FastAPI implementation task and compared:
 
 ```text
-results\generated\
+387178  pre-efficiency patch
+340769  after ALGORITHM efficiency rules
+262032  after ALGORITHM + TEST efficiency rules
 ```
 
-`results\generated\` is excluded from Git.
+All three numbers are cumulative request-token metrics and therefore include repeated/cached prefixes. The final `262032` run retained independent TEST PASS.
+
+Compression was validated separately because the fresh FastAPI efficiency run had zero compactions.
 
 See [Benchmarking](benchmarking.md) for methodology and interpretation.
-
 ## Troubleshooting
 
 ### Qwen Code does not start
@@ -650,14 +619,20 @@ The project-identity layer is designed to isolate projects and does not use glob
 
 ### Memory is not reaching a subagent
 
-First verify the Qwen Code compatibility patch status:
+First verify runtime compatibility/optimization status:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\patches\ensure_qwen_code_patches.ps1
 ```
 
-Role-context delivery depends on the `SubagentStart` compatibility behavior being active.
+Then distinguish the intended data path:
 
+- ALGORITHM should receive its own `Axxx` memory plus a small PROMPT task delta.
+- TEST should receive its own `Txxx` memory plus a verification delta.
+- Neither specialist should receive PROMPT/project or cross-project memory wholesale.
+- `<PROMPT_MEMORY>` should **not** appear in the final specialist prompt; `PreToolUse` processes and strips it.
+
+If PROMPT-memory persistence is missing, verify that `settings.json` has the `PreToolUse` `agent` carrier hook in addition to the shell-maintenance hook.
 ## Recommended entry point
 
 For normal use, prefer:

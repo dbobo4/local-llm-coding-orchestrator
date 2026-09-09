@@ -30,12 +30,11 @@ All roles use the same local model endpoint, but they operate under different in
 
 Qwen Code provides the interactive coding CLI, tool execution, agent infrastructure, session handling, and lifecycle hook system.
 
-The reference implementation was developed and validated against:
+The current production reference is:
 
 ```text
-Qwen Code 0.22.2
+Qwen Code 0.22.3
 ```
-
 ### llama.cpp
 
 `llama-server` provides the OpenAI-compatible local inference endpoint.
@@ -64,34 +63,33 @@ The orchestration source is:
 
 ```text
 orchestration/
-├── QWEN.md
-├── hook_dispatcher.py
-├── maintenance_hook.py
-├── memory_protocol.py
-├── memory_store.py
-├── project_identity.py
-├── project_registry.py
-├── workflow_state.py
-└── agents/
-    ├── algorithm-agent.md
-    └── test-agent.md
+??? QWEN.md
+??? hook_dispatcher.py
+??? maintenance_hook.py
+??? memory_protocol.py
+??? memory_store.py
+??? project_identity.py
+??? project_registry.py
+??? workflow_state.py
+??? agents/
+    ??? algorithm-agent.md
+    ??? test-agent.md
 ```
 
 Responsibilities are intentionally split:
 
 | Component | Responsibility |
 | --- | --- |
-| `QWEN.md` | Main PROMPT-role orchestration policy |
-| `agents/algorithm-agent.md` | ALGORITHM role instructions and tool surface |
-| `agents/test-agent.md` | TEST role instructions and tool surface |
-| `hook_dispatcher.py` | Lifecycle dispatch, context injection, orchestration coordination |
-| `maintenance_hook.py` | Controlled `PreToolUse` maintenance behavior |
+| `QWEN.md` | PROMPT orchestration, minimal specialist handoffs, memory-carrier policy |
+| `agents/algorithm-agent.md` | Implementation role, private memory policy, execution-efficiency rules |
+| `agents/test-agent.md` | Independent verification role, private memory policy, verification-efficiency rules |
+| `hook_dispatcher.py` | Lifecycle dispatch, role-context construction, prompt-memory carrier, workflow coordination |
+| `maintenance_hook.py` | Controlled shell-command `PreToolUse` maintenance |
 | `project_identity.py` | Stable project identity resolution |
 | `project_registry.py` | Project registry and project-level bookkeeping |
-| `memory_protocol.py` | Structured memory-update protocol |
-| `memory_store.py` | Durable memory/journal storage operations |
-| `workflow_state.py` | Explicit bounded workflow/delegation state |
-
+| `memory_protocol.py` | Stable-ID structured durable-memory protocol |
+| `memory_store.py` | Bounded compact durable-memory storage |
+| `workflow_state.py` | Explicit turn, delegation, verification, anti-loop, and memory-write state |
 ## Role separation
 
 ### PROMPT role
@@ -184,7 +182,7 @@ TEST
 
 ### Headless `-p` caveat
 
-Qwen Code 0.22.2 has stricter non-interactive behavior.
+Qwen Code 0.22.3 has stricter non-interactive behavior.
 
 During non-interactive `-p` startup, Qwen can synthesize deny entries before the subagent configuration is resolved. In `auto` mode this can include:
 
@@ -220,35 +218,41 @@ PreToolUse
 
 ### SessionStart
 
-Establishes session-level orchestration context and prepares project-aware state.
+Resolves project/session context and supplies PROMPT with compact project memory. Controlled cross-project memory is read only here for the first PROMPT synthesis.
 
 ### UserPromptSubmit
 
-Updates PROMPT-side coordination context and participates in state/journal handling for the current project.
+Advances the real-user-turn state used by delegation, verification, and delayed durable-memory provenance.
 
 ### SubagentStart
 
-Builds role-specific context for ALGORITHM or TEST.
+Builds role-specific specialist context.
 
-This is where shared project memory, selected recent PROMPT context, role-private durable memory, and role journal context are injected according to the receiving role.
+ALGORITHM receives its own compact `Axxx` memory plus the smallest useful PROMPT task delta. TEST receives its own compact `Txxx` memory plus an independent verification delta and limited objective implementation facts.
+
+Neither specialist receives PROMPT/project memory wholesale, cross-project memory, or the other specialist's private memory.
 
 ### SubagentStop
 
-Captures bounded subagent completion information and updates orchestration state.
+Captures bounded completion facts and updates workflow state.
 
 ### Stop
 
-Participates in bounded task-finalization state handling.
+Participates in finalization and verification gating.
 
 ### SessionEnd
 
-Participates in session cleanup and state finalization.
-
-A separate server-stop hook is also installed for `SessionEnd`.
+Finalizes session state. A separate server-stop hook also participates in normal server cleanup.
 
 ### PreToolUse
 
-Invokes the maintenance hook for controlled behavior around shell-command execution.
+Two independent uses exist:
+
+1. shell-command maintenance;
+2. `agent` prompt-memory carrier handling.
+
+The second path processes an eligible `<PROMPT_MEMORY>` update and strips the carrier from `tool_input` before the specialist task is invoked.
+For the complete event-by-event execution path, see [Detailed Qwen Code session and hook data flow](session_hook_flow.md).
 
 ## Qwen Code compatibility patches
 
@@ -258,50 +262,64 @@ The repository contains:
 patches\ensure_qwen_code_patches.ps1
 ```
 
-The patcher handles two compatibility requirements used by the orchestration design.
+The patcher manages two compatibility requirements plus one deliberately separate compression optimization.
 
 ### Patch 1: SubagentStart context propagation
 
-Foreground `SubagentStart` hook `additionalContext` must become part of the effective subagent task prompt.
-
-Without this behavior, hook-generated role context can be returned but not actually reach the foreground delegated agent.
-
-The patch appends the hook-produced context into the subagent task passed to the model.
+Foreground `SubagentStart` hook `additionalContext` becomes part of the effective delegated task prompt.
 
 ### Patch 2: PreToolUse argument rewriting
 
-The maintenance layer can return a rewritten `tool_input` through `PreToolUse`.
+A rewritten `tool_input` returned by `PreToolUse` becomes the actual invocation input.
 
-The patch ensures that the rewritten input becomes the actual tool invocation input rather than merely being observed.
+This is required for both controlled maintenance rewrites and reliable prompt-memory carrier stripping.
+
+### Compression optimization
+
+This is documented separately because it is an optimization rather than a compatibility prerequisite.
+
+It reduces the compression output cap from the original `2e4` form to `4096`, requests a compact `<state_snapshot>` directly, and retains only:
+
+```text
+goal
+durable_constraints
+current_state
+open_issues
+next_step
+```
+
+The target is roughly 800?1500 summary tokens.
 
 ### Patch safety
 
-The patcher uses semantic anchors rather than blindly modifying a fixed filename.
-
-Behavior:
+State is classified as `patched`, `unpatched`, or `incompatible`.
 
 ```text
-already patched
-    -> verify
+patched
+    -> validate / no-op
 
-known compatible unpatched runtime
+known unpatched
     -> backup
-    -> patch
-    -> JavaScript syntax check
-    -> verify
+    -> transform
+    -> node --check
+    -> post-validate
 
-unknown or mixed runtime
+mixed / unknown
     -> fail closed
+    -> no modification
 ```
 
-The validated patched SHA256 for the reference Qwen Code 0.22.2 runtime is:
+Current Qwen Code 0.22.3 validated hashes:
 
 ```text
-753C03204D5B6388DCB9885ED5766AC496B449BDA291D27EFB5A110E159DB7ED
+byte-identical CRLF runtime
+662A99EB4C5B80CADE456856754AA9D4B5A005033AF4B6D4228557E237C45DF4
+
+newline-normalized runtime
+A326F41C11DD99E30A3FEA26A2FCF2C4E6B69118EC81D8A47ACF1B072746AE70
 ```
 
-The patcher is deliberately conservative across Qwen Code upgrades.
-
+The normalized hash permits equivalent LF/CRLF runtime content while still rejecting unknown semantic structures.
 ## Project identity
 
 Durable state only works correctly if unrelated directories do not collapse into the same project.
@@ -327,114 +345,123 @@ The project-identity implementation is designed so that:
 
 ## Durable memory model
 
-Qwen Code managed auto-memory features are disabled in the reference configuration.
+Qwen Code managed auto-memory is not used for orchestration memory.
 
-Instead, this project uses explicit durable stores controlled by the orchestration layer.
-
-Logical durable-memory layout:
+The current design uses bounded stable-ID durable facts:
 
 ```text
-project
-├── prompt_agent/
-│   └── memory.md
-├── algorithm_agent/
-│   └── memory.md
-└── test_agent/
-    └── memory.md
+Pxxx  PROMPT / project
+Axxx  ALGORITHM-private
+Txxx  TEST-private
+Cxxx  cross-project
 ```
 
-The semantics are important:
+Logical storage still uses role-specific compact memory files, but their contents are not journals or transcripts.
+
+A durable fact should contain only:
 
 ```text
-prompt_agent/memory.md
-=
-shared durable project memory
+durable decision
++ why it matters
++ durable consequence
 ```
 
-It is the shared project store, not a PROMPT-private fourth memory.
+Transient exploration, routine command history, progress narration, and temporary failures do not belong in durable memory.
 
-The other two files are role-private:
+Default bounds:
 
 ```text
-algorithm_agent/memory.md
-=
-ALGORITHM-private durable memory
-
-test_agent/memory.md
-=
-TEST-private durable memory
+MAX_PROJECT_MEMORY_FACTS       12
+MAX_AGENT_MEMORY_FACTS         12
+MAX_CROSS_PROJECT_MEMORY_FACTS  8
+MAX_DURABLE_UPDATE_CHARS      650
+MAX_DURABLE_UPDATE_SENTENCES    3
 ```
 
-## Journals versus durable memory
+`ADD` receives a new stable ID from Python. `REPLACE` and `REMOVE` must name an existing ID owned by the correct role. Invalid or oversized operations are rejected.
+## Durable memory and workflow state
 
-Durable memory and recent operational history are intentionally separate concepts.
+The current architecture has **no role journals**.
+
+Two concepts remain separate:
 
 ### Durable memory
 
-Used for project knowledge intended to survive across sessions and remain useful later.
-
-Examples include stable project constraints, implementation invariants, or durable role-specific knowledge.
-
-### Role journals
-
-Used for recent execution context and handoff information.
-
-They support coordination without turning every recent event into permanent memory.
+Small stable-ID facts that should survive sessions and still matter later.
 
 ### Workflow state
 
-Used for bounded orchestration mechanics such as current coordination/delegation state, anti-loop information, and lifecycle state.
+Bounded transient orchestration mechanics such as:
 
-This separation prevents a temporary execution trace from automatically becoming permanent project knowledge.
+- real user turn ID;
+- delegation selected/started/completed state;
+- implementation completion;
+- verification state;
+- fix cycles;
+- misunderstanding counters;
+- stop blocks;
+- fingerprints;
+- `turn_closed`;
+- `prompt_memory_written`.
 
+Workflow state prevents loops and coordinates the current execution but is not promoted automatically into durable memory.
 ## Context injection matrix
 
-The dispatcher injects context by role.
+Context is deliberately asymmetric:
 
 | Context source | PROMPT | ALGORITHM | TEST |
 | --- | :---: | :---: | :---: |
-| Shared durable project memory | yes | yes | yes |
-| Recent PROMPT project context | coordination path | yes | yes |
-| Recent ALGORITHM journal | as needed for coordination | own role | no private access |
-| Recent TEST journal | as needed for coordination | no private access | own role |
-| ALGORITHM-private durable memory | no | yes | no |
-| TEST-private durable memory | no | no | yes |
-| Controlled cross-project memory | optional | optional through policy | optional through policy |
+| PROMPT/project compact durable memory | yes | no wholesale injection | no wholesale injection |
+| ALGORITHM-private `Axxx` memory | no | yes | no |
+| TEST-private `Txxx` memory | no | no | yes |
+| Cross-project `Cxxx` memory | `SessionStart` only | no | no |
+| Small PROMPT task delta | n/a | yes | verification-specific only |
+| ALGORITHM rationale | synthesize only if needed | own execution | no |
+| Objective implementation facts | synthesis | own execution | limited factual receipt |
+| Workflow state | coordination | phase-relevant only | phase-relevant only |
 
-The invariant is role isolation: an agent should not receive another specialized role's private durable memory merely because it exists.
-
+The invariant is information minimization: a specialist receives only the smallest role-relevant state needed for the current action.
 ## Controlled cross-project memory
 
-Cross-project memory is not globally injected into every task.
+Cross-project memory is intentionally restricted.
 
-It is optional and intentionally controlled.
+It is read only during `SessionStart` / first PROMPT synthesis. Later PROMPT specialist calls do not re-inject it, and ALGORITHM/TEST never receive it.
 
-The purpose is to allow deliberate reuse of genuinely transferable knowledge without destroying project isolation.
-
-The default conceptual boundary remains:
+The boundary is therefore:
 
 ```text
-project A durable state
-!=
-project B durable state
+cross-project durable knowledge
+    -> PROMPT synthesis at SessionStart
+    -> task-specific local consequence if relevant
+    -> never wholesale into specialists
 ```
 
+Project-specific durable stores remain isolated.
 ## Memory update protocol
 
-Durable memory writes are not treated as arbitrary free-form filesystem edits by every component.
+`memory_protocol.py` defines stable-ID operations and role ownership. `memory_store.py` stores the resulting bounded compact state.
 
-`memory_protocol.py` defines the structured memory-update contract, while `memory_store.py` applies storage operations.
+Ownership prefixes are:
 
-This keeps memory updates explicit and makes the distinction between:
+```text
+P  PROMPT/project
+A  ALGORITHM
+T  TEST
+C  cross-project
+```
 
-- shared project memory;
-- ALGORITHM-private memory;
-- TEST-private memory;
-- recent journals;
-- workflow state
+The model does not choose a new ID for `ADD`; Python allocates it. `REPLACE` and `REMOVE` operate only on existing IDs for the correct role.
 
-visible in the implementation.
+PROMPT writes have an additional timing/provenance rule:
 
+```text
+turn N may persist only knowledge
+whose factual basis existed before prompt N
+```
+
+The eligible update is carried on the first already-required `Agent` call as `<PROMPT_MEMORY>`. If the first delegation is sent without the carrier, the turn does not get a later memory-only delegation. The carrier is stripped before the specialist receives its prompt.
+
+This keeps durable persistence off the critical path and prevents current-turn user content from being prematurely promoted into durable memory.
 ## Workflow state and anti-loop behavior
 
 A local coding agent can otherwise repeatedly cycle:
@@ -516,12 +543,22 @@ The wrapper therefore provides deterministic cleanup independently of hook deliv
 
 ## Server safety
 
-Server management is fail-closed.
+Server management is fail-closed and listener-owner based.
 
-Before reusing or terminating a process on the configured port, the scripts verify that it matches the expected local `llama-server` runtime.
+For shutdown the script:
 
-The scripts do not intentionally terminate an unrelated process merely because it occupies the same port.
+1. resolves the process currently owning `127.0.0.1:8080`;
+2. requires an unambiguous owner;
+3. reads `Win32_Process` through CIM;
+4. verifies the expected executable name;
+5. prefers exact `ExecutablePath` identity;
+6. falls back only to exact name plus command-line host/port/model evidence when the executable path is unavailable;
+7. revalidates that the same PID still owns the listener immediately before termination;
+8. waits for the port to become free.
 
+No process is terminated merely because its name resembles `llama-server`.
+
+The startup PID and final listener PID can legitimately differ; the listener PID is authoritative.
 ## Installer architecture
 
 `scripts/install_orchestrator.ps1` deploys the orchestration layer into the configured Qwen user directory.
@@ -628,9 +665,9 @@ TEST
   -> medium
 ```
 
-The three logical model IDs do not represent three separately loaded neural networks. They all target the same OpenAI-compatible `llama.cpp` endpoint and the same loaded GGUF.
+All three logical model IDs target the same OpenAI-compatible endpoint and the same loaded GGUF.
 
-Routing is split across two configuration layers:
+Routing is split across agent frontmatter and provider configuration:
 
 ```text
 agent frontmatter
@@ -645,25 +682,13 @@ Qwen Code settings.json provider
 llama.cpp OpenAI-compatible request
 ```
 
-For example:
+The explicit `extra_body.reasoning_effort` field is the wire-level request override used by the local OpenAI-compatible provider.
 
-```text
-test-agent.md
-    model: qwen3.8-27b-test
+The current repository/runtime reference is Qwen Code `0.22.3`.
 
-settings.json
-    qwen3.8-27b-test
-    -> reasoning.effort = medium
-    -> extra_body.reasoning_effort = medium
-```
+`llama-server` advertises all three aliases together. Server-level `--reasoning-effort xhigh` remains the fallback/default.
 
-The explicit `extra_body.reasoning_effort` value is used as the wire-level reasoning override for the local OpenAI-compatible provider.
-
-The repository-wide runtime compatibility baseline remains Qwen Code 0.22.2. The role-specific provider routing and request-level reasoning behavior were additionally validated on the production Qwen Code 0.22.3 runtime. The existing 0.22.2 runtime-patch hashes and compatibility statements therefore remain historical reference data rather than being silently relabeled as 0.22.3 results.
-
-`llama-server` is started with all three aliases advertised together. The server's `--reasoning-effort xhigh` remains the fallback/default; the role-specific provider request can override it.
-
-The reference server configuration uses one model instance and one concurrent inference slot:
+Reference inference settings:
 
 ```text
 parallel = 1
@@ -684,17 +709,11 @@ reasoning budget = -1
 reasoning preserve = enabled
 ```
 
-Speculative decoding combines:
+Speculative decoding:
 
 ```text
-draft-mtp
-+
-ngram-mod
-```
+draft-mtp + ngram-mod
 
-with:
-
-```text
 draft n-max = 2
 p-min = 0.025
 ngram n-min = 32
@@ -702,8 +721,7 @@ ngram n-max = 64
 ngram n-match = 16
 ```
 
-These values are reference results for the tested hardware/model/runtime combination, not universal optimums.
-
+These values are specific reference results for the tested hardware/model/runtime combination.
 ## Design principle
 
 The architecture separates four concerns:

@@ -37,11 +37,11 @@ Operating system: Windows
 
 ## Reference software
 
-The validated environment used:
+The current validated production environment uses:
 
 ```text
 Qwen Code:
-  0.22.2
+  0.22.3
 
 llama.cpp:
   build b10636
@@ -50,7 +50,6 @@ llama.cpp:
 CUDA:
   13.3
 ```
-
 ## Reference model
 
 Final model:
@@ -123,7 +122,7 @@ This benchmark focuses on the final 49k-context configuration and compares the s
 
 The benchmark is intentionally multi-dimensional.
 
-Relevant dimensions include:
+Inference dimensions include:
 
 ```text
 model quantization
@@ -138,10 +137,20 @@ p-min
 reasoning effort
 ```
 
-The final choice prioritizes successful useful completion and end-to-end behavior.
+Orchestration dimensions additionally include:
 
-A configuration is not preferred merely because one isolated throughput measurement is larger.
+```text
+number of model rounds
+tool-call count
+redundant repository inspection
+duplicate validation probes
+handoff size
+cached versus uncached input
+compaction frequency
+independent verification success
+```
 
+The final choice prioritizes successful useful completion and end-to-end behavior. A larger isolated tok/s number or a lower cumulative-token number is not sufficient if correctness or independent verification degrades.
 ## Native CUDA selection
 
 Native CUDA execution was retained for the final system.
@@ -259,7 +268,7 @@ This comparison predates the role-specific reasoning policy and should not be in
 
 ## Role-specific reasoning end-to-end comparison
 
-The later orchestration configuration kept PROMPT and ALGORITHM at `xhigh` while reducing TEST to `medium`:
+The role-specific reasoning policy is:
 
 ```text
 PROMPT     -> xhigh
@@ -267,26 +276,101 @@ ALGORITHM  -> xhigh
 TEST       -> medium
 ```
 
-The roles still used the same physical Qwen3.8-27B GGUF and the same `llama.cpp` process. The difference was request-level provider configuration, not a model reload.
+All roles use the same physical Qwen3.8-27B GGUF and the same `llama.cpp` process. The difference is request-level provider configuration.
 
-Observed v3 to v4 workflow comparison:
+Historical v3 ? v4 observation:
 
 ```text
-uniform-xhigh orchestration:
+uniform-xhigh orchestration
   cumulative tokens: 339536
 
-role-specific orchestration:
+role-specific orchestration
   cumulative tokens: 234973
 
-reduction:
+reduction
   104563 tokens
   approximately 30.8%
 ```
 
-Independent final TEST verification remained `PASS`.
+Independent TEST verification remained PASS.
 
-This result is an orchestration-level token comparison. It does not replace the earlier isolated inference tuning results and should not be interpreted as a direct raw tok/s comparison.
+### Execution-efficiency follow-up
 
+A later fresh FastAPI task exposed specialist round-trip overhead unrelated to inference tuning.
+
+Before specialist-efficiency rules:
+
+```text
+PROMPT       98419
+ALGORITHM   256559
+TEST         32200
+TOTAL       387178
+```
+
+After ALGORITHM execution-efficiency rules:
+
+```text
+TOTAL       340769
+```
+
+After both ALGORITHM and TEST execution-efficiency rules:
+
+```text
+PROMPT      101203
+ALGORITHM   128631
+TEST         32198
+TOTAL       262032
+```
+
+The final run used:
+
+```text
+ALGORITHM
+  7 model rounds
+  10 tools
+
+TEST
+  3 model rounds
+  4 tools
+
+compactions
+  0
+
+wall clock
+  approximately 238 s
+```
+
+Relative changes:
+
+```text
+387178 -> 262032
+  approximately -32.3%
+
+340769 -> 262032
+  approximately -23.1%
+
+234973 -> 262032
+  approximately +11.5%
+```
+
+The final TEST independently reran the bounded test and returned PASS.
+
+The cumulative-token metric repeats request prefixes and cached context. It should therefore be interpreted together with request count, cache behavior, tool topology, and wall time rather than as unique model work.
+
+### Compression validation
+
+Compression was tested separately from the zero-compaction FastAPI run.
+
+Observed compaction:
+
+```text
+approximately 34772
+-> approximately 21867 tokens
+```
+
+Execution then continued to independent TEST PASS with 9 tests passing.
+
+This supports the local compression optimization as a fix for the prior low-threshold/re-compaction behavior, but it is not a raw inference-throughput benchmark.
 ## Final p-min comparison
 
 The final verification compared:
@@ -489,7 +573,7 @@ Reasoning preserve:
 
 ## Benchmark interpretation
 
-The benchmark contains both synthetic and real-agent measurements.
+The benchmark suite contains both synthetic inference measurements and real-agent workflow measurements.
 
 Synthetic throughput is useful for diagnosing raw inference behavior.
 
@@ -500,31 +584,38 @@ prompt processing
 reasoning length
 completion length
 tool-call count
-number of model requests
-speculative acceptance
-agent behavior
+model-request count
+cached prefix reuse
+specialist handoff size
 verification behavior
+compaction behavior
+agent stopping discipline
 ```
 
-For this reason, final selection prioritizes successful real-agent execution and end-to-end wall time.
+Cumulative request-token totals can substantially overstate unique input because each model round can include a repeated cached prefix.
 
+For that reason, final selection prioritizes:
+
+1. successful implementation;
+2. independent verification;
+3. bounded model/tool topology;
+4. end-to-end wall time;
+5. token/cache behavior;
+6. raw throughput only in context.
 ## Headless benchmark caveat
 
-Automated benchmark execution and permission validation are different concerns.
+Automated benchmark execution and interactive production capability are separate concerns.
 
-Qwen Code 0.22.2 has stricter built-in behavior for non-interactive `-p` execution than for the normal interactive workflow.
-
-In particular, non-interactive `auto` startup can synthesize deny rules affecting shell/edit/write tools.
+Qwen Code non-interactive `-p` behavior is version-sensitive and can apply stricter permission behavior than the normal interactive workflow.
 
 Therefore:
 
 - benchmark numbers remain useful for inference/workload comparison;
-- headless permission behavior should not be used as proof of interactive ALGORITHM/TEST capabilities;
-- interactive agent tool capability is validated separately through the normal production path;
-- the repository does not remove Qwen Code's built-in headless restrictions with an extra runtime patch.
+- headless permission behavior is not proof of interactive ALGORITHM/TEST capability;
+- interactive role capability is validated through the normal production path;
+- the repository does not add a compatibility patch merely to bypass Qwen Code headless safety policy.
 
-This distinction prevents a headless CLI safety policy from being confused with the production role architecture.
-
+This prevents CLI permission semantics from being confused with the orchestration role design.
 ## Reproducing the results
 
 First configure:
@@ -553,28 +644,25 @@ The methodology, configuration capture, and relative comparison process are the 
 
 ## Reference reports
 
-Retained reference artifacts:
+Retained historical machine-readable inference reports include:
 
 ```text
 results/reference/full_auto_v4/
-├── FINAL_REPORT.json
-├── FINAL_REPORT.txt
-├── FINAL_TABLE.csv
-└── RECOMMENDED_XHIGH_ARGS.txt
+??? FINAL_REPORT.json
+??? FINAL_REPORT.txt
+??? FINAL_TABLE.csv
+??? RECOMMENDED_XHIGH_ARGS.txt
 ```
 
 and:
 
 ```text
 results/reference/pmin_final_verify_49k/
-├── FINAL_PMIN_REPORT.json
-└── FINAL_PMIN_REPORT.txt
+??? FINAL_PMIN_REPORT.json
+??? FINAL_PMIN_REPORT.txt
 ```
 
-The JSON files contain structured results suitable for further analysis.
-
-The text and CSV files provide human-readable summaries.
-
+The later orchestration-efficiency and compression E2E observations are documented in this file, while the current end-to-end orchestration flow is documented in `docs/session_hook_flow.md`; these should not be silently mixed into the older inference-report datasets.
 ## Benchmark design principle
 
 The final configuration was not selected by asking:

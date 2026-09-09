@@ -515,19 +515,6 @@ def get_memory_path(
     )
 
 
-def get_journal_path(
-    identity: ProjectIdentity,
-    agent: str,
-) -> Path:
-    return (
-        get_agent_memory_root(
-            identity,
-            agent,
-        )
-        / "journal.md"
-    )
-
-
 def get_misunderstandings_path(
     identity: ProjectIdentity,
 ) -> Path:

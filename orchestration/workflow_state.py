@@ -76,6 +76,10 @@ class WorkflowState:
     # from an internal continuation prompt created by Stop blocking.
     turn_closed: bool = False
 
+    # At most one successful PROMPT-owned durable-memory mutation may
+    # be committed during one real root user turn.
+    prompt_memory_written: bool = False
+
 
 def _utc_timestamp() -> str:
     return datetime.now(
@@ -673,6 +677,58 @@ def mark_turn_closed(
     state: WorkflowState,
 ) -> None:
     state.turn_closed = True
+
+    save_state(
+        state
+    )
+
+
+def has_prior_closed_turn(
+    state: WorkflowState,
+) -> bool:
+    """
+    Return True only when this session already contains another
+    completed root user turn for the same project.
+    """
+
+    root = _session_root(
+        state.session_id
+    )
+
+    if not root.exists():
+        return False
+
+    current_path = _state_path(
+        state.session_id,
+        state.turn_id,
+    )
+
+    for path in root.glob("*.json"):
+        if path == current_path:
+            continue
+
+        payload = _read_json_document(
+            path
+        )
+
+        if payload is None:
+            continue
+
+        if (
+            payload.get("project_id")
+            == state.project_id
+            and payload.get("turn_closed")
+            is True
+        ):
+            return True
+
+    return False
+
+
+def mark_prompt_memory_written(
+    state: WorkflowState,
+) -> None:
+    state.prompt_memory_written = True
 
     save_state(
         state

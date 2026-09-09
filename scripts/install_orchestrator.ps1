@@ -174,6 +174,10 @@ foreach ($eventGroup in $template.hooks.PreToolUse) {
         if ($hook.name -eq "qwen-orchestration-maintenance") {
             $hook.command = $maintenanceCommand
         }
+
+        if ($hook.name -eq "qwen-prompt-memory-carrier") {
+            $hook.command = $dispatcherCommand
+        }
     }
 }
 
@@ -314,7 +318,7 @@ if (Test-Path $SettingsPath -PathType Leaf) {
 
     # Preserve third-party hooks. Replace only hooks owned by this project.
     $hooks = Ensure-ObjectProperty $settings "hooks"
-    $managedHookNames = @("qwen-orchestration-dispatcher","qwen-server-stop","qwen-orchestration-maintenance")
+    $managedHookNames = @("qwen-orchestration-dispatcher","qwen-server-stop","qwen-orchestration-maintenance","qwen-prompt-memory-carrier")
     foreach ($eventName in $template.hooks.PSObject.Properties.Name) {
         $preservedGroups = @()
         $existingEvent = $hooks.PSObject.Properties[$eventName]
@@ -429,8 +433,39 @@ if ($verify.hooks.SessionEnd[0].hooks.Count -ne 2) {
     throw "Installation verification failed: SessionEnd hooks"
 }
 
-if ($verify.hooks.PreToolUse[0].matcher -ne "run_shell_command") {
-    throw "Installation verification failed: PreToolUse hook"
+$maintenanceHookCount = 0
+$carrierHookCount = 0
+
+foreach ($eventGroup in @($verify.hooks.PreToolUse)) {
+    foreach ($hook in @($eventGroup.hooks)) {
+        if (
+            $eventGroup.matcher -eq "run_shell_command" -and
+            $hook.name -eq "qwen-orchestration-maintenance"
+        ) {
+            $maintenanceHookCount++
+        }
+
+        if (
+            $eventGroup.matcher -eq "agent" -and
+            $hook.name -eq "qwen-prompt-memory-carrier"
+        ) {
+            $carrierHookCount++
+        }
+    }
+}
+
+if ($maintenanceHookCount -ne 1) {
+    throw (
+        "Installation verification failed: expected exactly one " +
+        "run_shell_command maintenance PreToolUse hook."
+    )
+}
+
+if ($carrierHookCount -ne 1) {
+    throw (
+        "Installation verification failed: expected exactly one " +
+        "agent PROMPT memory carrier PreToolUse hook."
+    )
 }
 
 Write-Host "ORCHESTRATOR_INSTALL=PASS"

@@ -1,211 +1,225 @@
 {
-    "modelProviders":  {
-                           "openai":  [
-    {
-        "id":  "qwen3.8-27b-local",
-        "name":  "Qwen3.8-27B Local",
-        "description":  "Local Qwen3.8-27B UD-Q3_K_XL via llama.cpp - PROMPT role",
-        "envKey":  "LOCAL_QWEN_API_KEY",
-        "baseUrl":  "http://127.0.0.1:8080/v1",
-        "generationConfig":  {
-            "timeout":  0,
-            "contextWindowSize":  49152,
-            "reasoning":  {
-                "effort":  "xhigh"
-            },
-            "extra_body":  {
-                "reasoning_effort":  "xhigh"
-            }
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen3.8-27b-local",
+        "name": "Qwen3.8-27B Local",
+        "description": "Local Qwen3.8-27B UD-Q3_K_XL via llama.cpp - PROMPT role",
+        "envKey": "LOCAL_QWEN_API_KEY",
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "generationConfig": {
+          "timeout": 0,
+          "contextWindowSize": 49152,
+          "reasoning": {
+            "effort": "xhigh"
+          },
+          "extra_body": {
+            "reasoning_effort": "xhigh"
+          }
         }
-    },
-    {
-        "id":  "qwen3.8-27b-algorithm",
-        "name":  "Qwen3.8-27B Algorithm",
-        "description":  "Local Qwen3.8-27B UD-Q3_K_XL via llama.cpp - ALGORITHM role",
-        "envKey":  "LOCAL_QWEN_API_KEY",
-        "baseUrl":  "http://127.0.0.1:8080/v1",
-        "generationConfig":  {
-            "timeout":  0,
-            "contextWindowSize":  49152,
-            "reasoning":  {
-                "effort":  "xhigh"
-            },
-            "extra_body":  {
-                "reasoning_effort":  "xhigh"
-            }
+      },
+      {
+        "id": "qwen3.8-27b-algorithm",
+        "name": "Qwen3.8-27B Algorithm",
+        "description": "Local Qwen3.8-27B UD-Q3_K_XL via llama.cpp - ALGORITHM role",
+        "envKey": "LOCAL_QWEN_API_KEY",
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "generationConfig": {
+          "timeout": 0,
+          "contextWindowSize": 49152,
+          "reasoning": {
+            "effort": "xhigh"
+          },
+          "extra_body": {
+            "reasoning_effort": "xhigh"
+          }
         }
-    },
-    {
-        "id":  "qwen3.8-27b-test",
-        "name":  "Qwen3.8-27B Test",
-        "description":  "Local Qwen3.8-27B UD-Q3_K_XL via llama.cpp - TEST role",
-        "envKey":  "LOCAL_QWEN_API_KEY",
-        "baseUrl":  "http://127.0.0.1:8080/v1",
-        "generationConfig":  {
-            "timeout":  0,
-            "contextWindowSize":  49152,
-            "reasoning":  {
-                "effort":  "medium"
-            },
-            "extra_body":  {
-                "reasoning_effort":  "medium"
-            }
+      },
+      {
+        "id": "qwen3.8-27b-test",
+        "name": "Qwen3.8-27B Test",
+        "description": "Local Qwen3.8-27B UD-Q3_K_XL via llama.cpp - TEST role",
+        "envKey": "LOCAL_QWEN_API_KEY",
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "generationConfig": {
+          "timeout": 0,
+          "contextWindowSize": 49152,
+          "reasoning": {
+            "effort": "medium"
+          },
+          "extra_body": {
+            "reasoning_effort": "medium"
+          }
         }
+      }
+    ]
+  },
+  "env": {
+    "LOCAL_QWEN_API_KEY": "local"
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
     }
-]
-                       },
-    "env":  {
-                "LOCAL_QWEN_API_KEY":  "local"
-            },
-    "security":  {
-                     "auth":  {
-                                  "selectedType":  "openai"
-                              }
-                 },
-    "model":  {
-                  "name":  "qwen3.8-27b-local",
-                  "reasoningEffort":  "xhigh",
-                  "maxSubagentDepth":  1
-              },
-    "agents":  {
-                   "maxParallelAgents":  1
-               },
-    "permissions":  {
-                        "deny":  [
-                                     "Agent(general-purpose)",
-                                     "Agent(Explore)",
-                                     "Agent(statusline-setup)",
-                                     "Agent(review-agent)"
-                                 ]
-                    },
-    "memory":  {
-                   "enableManagedAutoMemory":  false,
-                   "enableManagedAutoDream":  false,
-                   "enableAutoSkill":  false,
-                   "enableTeamMemory":  false,
-                   "enableTeamMemorySync":  false
-               },
-    "disableAllHooks":  false,
-    "hooks":  {
-                  "SubagentStart":  [
-                                        {
-                                            "matcher":  "*",
-                                            "sequential":  true,
-                                            "hooks":  [
-                                                          {
-                                                              "type":  "command",
-                                                              "command":  "python \"\u003cUSERPROFILE\u003e\\.qwen\\orchestration\\hook_dispatcher.py\"",
-                                                              "name":  "qwen-orchestration-dispatcher",
-                                                              "description":  "Qwen Codex-style orchestration lifecycle dispatcher",
-                                                              "timeout":  10000,
-                                                              "shell":  "powershell"
-                                                          }
-                                                      ]
-                                        }
-                                    ],
-                  "UserPromptSubmit":  [
-                                           {
-                                               "matcher":  "*",
-                                               "sequential":  true,
-                                               "hooks":  [
-                                                             {
-                                                                 "type":  "command",
-                                                                 "command":  "python \"\u003cUSERPROFILE\u003e\\.qwen\\orchestration\\hook_dispatcher.py\"",
-                                                                 "name":  "qwen-orchestration-dispatcher",
-                                                                 "description":  "Qwen Codex-style orchestration lifecycle dispatcher",
-                                                                 "timeout":  10000,
-                                                                 "shell":  "powershell"
-                                                             }
-                                                         ]
-                                           }
-                                       ],
-                  "SessionStart":  [
-                                       {
-                                           "matcher":  "*",
-                                           "sequential":  true,
-                                           "hooks":  [
-                                                         {
-                                                             "type":  "command",
-                                                             "command":  "python \"\u003cUSERPROFILE\u003e\\.qwen\\orchestration\\hook_dispatcher.py\"",
-                                                             "name":  "qwen-orchestration-dispatcher",
-                                                             "description":  "Qwen Codex-style orchestration lifecycle dispatcher",
-                                                             "timeout":  10000,
-                                                             "shell":  "powershell"
-                                                         }
-                                                     ]
-                                       }
-                                   ],
-                  "SessionEnd":  [
-                                     {
-                                         "matcher":  "*",
-                                         "sequential":  true,
-                                         "hooks":  [
-                                                       {
-                                                           "type":  "command",
-                                                           "command":  "python \"\u003cUSERPROFILE\u003e\\.qwen\\orchestration\\hook_dispatcher.py\"",
-                                                           "name":  "qwen-orchestration-dispatcher",
-                                                           "description":  "Qwen Codex-style orchestration lifecycle dispatcher",
-                                                           "timeout":  10000,
-                                                           "shell":  "powershell"
-                                                       },
-                                                       {
-                                                           "type":  "command",
-                                                           "command":  "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"\u003cREPO_ROOT\u003e\\scripts\\stop_qwen_server.ps1\"",
-                                                           "name":  "qwen-server-stop",
-                                                           "description":  "Stop local llama.cpp server after Qwen session cleanup",
-                                                           "timeout":  10000,
-                                                           "shell":  "powershell"
-                                                       }
-                                                   ]
-                                     }
-                                 ],
-                  "SubagentStop":  [
-                                       {
-                                           "matcher":  "*",
-                                           "sequential":  true,
-                                           "hooks":  [
-                                                         {
-                                                             "type":  "command",
-                                                             "command":  "python \"\u003cUSERPROFILE\u003e\\.qwen\\orchestration\\hook_dispatcher.py\"",
-                                                             "name":  "qwen-orchestration-dispatcher",
-                                                             "description":  "Qwen Codex-style orchestration lifecycle dispatcher",
-                                                             "timeout":  10000,
-                                                             "shell":  "powershell"
-                                                         }
-                                                     ]
-                                       }
-                                   ],
-                  "Stop":  [
-                               {
-                                   "matcher":  "*",
-                                   "sequential":  true,
-                                   "hooks":  [
-                                                 {
-                                                     "type":  "command",
-                                                     "command":  "python \"\u003cUSERPROFILE\u003e\\.qwen\\orchestration\\hook_dispatcher.py\"",
-                                                     "name":  "qwen-orchestration-dispatcher",
-                                                     "description":  "Qwen Codex-style orchestration lifecycle dispatcher",
-                                                     "timeout":  10000,
-                                                     "shell":  "powershell"
-                                                 }
-                                             ]
-                               }
-                           ],
-                  "PreToolUse":  [
-                                     {
-                                         "matcher":  "run_shell_command",
-                                         "sequential":  true,
-                                         "hooks":  [
-                                                       {
-                                                           "type":  "command",
-                                                           "command":  "python \"\u003cUSERPROFILE\u003e\\.qwen\\orchestration\\maintenance_hook.py\"",
-                                                           "name":  "qwen-orchestration-maintenance",
-                                                           "description":  "Trusted global project registry maintenance hook",
-                                                           "timeout":  10000,
-                                                           "shell":  "powershell"
-                                                       }
-                                                   ]
-                                     }
-                                 ]
-              }
+  },
+  "model": {
+    "name": "qwen3.8-27b-local",
+    "reasoningEffort": "xhigh",
+    "maxSubagentDepth": 1
+  },
+  "agents": {
+    "maxParallelAgents": 1
+  },
+  "permissions": {
+    "deny": [
+      "Agent(general-purpose)",
+      "Agent(Explore)",
+      "Agent(statusline-setup)",
+      "Agent(review-agent)"
+    ]
+  },
+  "memory": {
+    "enableManagedAutoMemory": false,
+    "enableManagedAutoDream": false,
+    "enableAutoSkill": false,
+    "enableTeamMemory": false,
+    "enableTeamMemorySync": false
+  },
+  "disableAllHooks": false,
+  "hooks": {
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          },
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"<REPO_ROOT>\\scripts\\stop_qwen_server.ps1\"",
+            "name": "qwen-server-stop",
+            "description": "Stop local llama.cpp server after Qwen session cleanup",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_shell_command",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\maintenance_hook.py\"",
+            "name": "qwen-orchestration-maintenance",
+            "description": "Trusted global project registry maintenance hook",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      },
+      {
+        "matcher": "agent",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-prompt-memory-carrier",
+            "description": "Persist PROMPT Pxxx memory and strip its carrier before Agent execution",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ]
+  }
 }

@@ -32,22 +32,24 @@ The objective is not simply to run a local coding model. The repository focuses 
 - PROMPT / ALGORITHM / TEST role separation
 - Independent TEST-agent verification
 - Stable project identity and isolated project state
-- Shared durable project memory plus role-private memory
-- Role journals and explicit workflow state outside the model context
-- Controlled optional cross-project memory
+- Bounded stable-ID durable memory instead of role journals
+- PROMPT-, ALGORITHM-, TEST-, and cross-project memory ownership (`P/A/T/C`)
+- Role-isolated specialist context and compact task-specific handoffs
+- Delayed PROMPT-memory persistence through the `PreToolUse` carrier
+- Cross-project memory limited to `SessionStart` / PROMPT synthesis
+- Explicit bounded workflow and anti-loop state
+- Role-specific reasoning effort on one physical GGUF
 - Qwen Code lifecycle hooks
-- Anti-loop behavior
-- Bounded smoke-validation policy
+- Two compatibility patches plus a separate compression optimization
+- Bounded compaction handoff using `<state_snapshot>`
 - Automatic local inference server startup and shutdown
-- Fail-closed process ownership checks
-- Qwen Code compatibility patch management
+- Fail-closed listener/process ownership checks
 - Non-destructive, idempotent Qwen settings installation
 - Reproducible benchmark suite
 - Hardware-specific reference configuration and benchmark results
-
 ## Reference stack
 
-The reference implementation was validated with:
+The current production reference implementation was validated with:
 
 ```text
 Operating system
@@ -64,7 +66,7 @@ System RAM
   32 GB DDR5
 
 Qwen Code
-  0.22.2
+  0.22.3
 
 llama.cpp
   build b10636
@@ -84,7 +86,6 @@ Reference model SHA256:
 ```
 
 The model, Qwen Code runtime, and llama.cpp binaries are **not** distributed in this repository.
-
 ## Why this project exists
 
 Running an LLM locally is relatively straightforward. Building a useful local coding-agent workflow requires additional engineering.
@@ -196,45 +197,47 @@ All roles use the same local model endpoint. The separation is created through o
 
 ## Memory and project state
 
-The orchestration layer keeps durable project context outside the model context window instead of relying on Qwen Code's managed auto-memory features.
+The orchestration layer keeps selected durable project knowledge outside the model context window. It does not use role journals and does not rely on Qwen Code managed auto-memory.
 
-Each working project receives a stable project identity and isolated storage. Global Qwen configuration such as `~/.qwen/settings.json` is deliberately not treated as a project marker, so unrelated directories do not collapse into the same project identity.
+Each working project receives a stable project identity and isolated storage. Global Qwen configuration such as `~/.qwen/settings.json` is deliberately not treated as a project marker.
 
-The durable-memory model is:
+Logical durable-memory ownership is:
 
 ```text
-project
-├── prompt_agent/
-│   └── memory.md          # shared durable project memory
-├── algorithm_agent/
-│   └── memory.md          # ALGORITHM-private durable memory
-└── test_agent/
-    └── memory.md          # TEST-private durable memory
+Pxxx  PROMPT / project durable knowledge
+Axxx  ALGORITHM-private durable knowledge
+Txxx  TEST-private durable knowledge
+Cxxx  controlled cross-project knowledge
 ```
 
-`prompt_agent/memory.md` is the shared durable project memory. It is not a fourth independent store.
+The current implementation uses bounded compact stores rather than append-only execution history. `ADD` receives its stable ID from Python; `REPLACE` and `REMOVE` must reference an existing ID owned by the correct role. Invalid or oversized durable updates are rejected instead of being converted into free-form history.
 
-Recent role journals and workflow state are maintained separately from durable memory. At lifecycle boundaries, the dispatcher injects only context appropriate for the receiving role:
+Default bounds include:
 
-| Receiving role | Injected context |
+```text
+project/PROMPT facts     12
+ALGORITHM facts          12
+TEST facts               12
+cross-project facts       8
+durable update chars    650
+durable update sentences  3
+```
+
+Context is intentionally asymmetric:
+
+| Receiving role | Durable/context input |
 | --- | --- |
-| PROMPT | Shared durable project memory plus recent role journals needed for coordination |
-| ALGORITHM | Shared project memory, recent PROMPT context, ALGORITHM-private memory, ALGORITHM journal |
-| TEST | Shared project memory, recent PROMPT context, TEST-private memory, TEST journal |
+| PROMPT | Compact project/PROMPT memory; controlled cross-project memory only at `SessionStart` |
+| ALGORITHM | Small PROMPT task delta plus ALGORITHM-private compact memory |
+| TEST | Small verification delta plus TEST-private compact memory and objective implementation facts |
 
-Cross-project memory is optional and intentionally controlled rather than globally mixed into every task.
+ALGORITHM does not receive PROMPT memory wholesale. TEST does not inherit ALGORITHM rationale or private memory.
 
-The implementation is split across:
+PROMPT durable writes use a delayed `<PROMPT_MEMORY>` carrier. A fact written during user turn N may only be based on information that already existed before prompt N. The carrier is attached only to the first already-needed `Agent` delegation, processed by `PreToolUse`, then stripped before the specialist receives the task. The orchestrator never creates an extra agent call solely to save memory.
 
-- `project_identity.py`
-- `project_registry.py`
-- `memory_protocol.py`
-- `memory_store.py`
-- `workflow_state.py`
-- `hook_dispatcher.py`
+Cross-project memory is read only for `SessionStart` / first PROMPT synthesis and is never injected into specialists.
 
-This keeps project history persistent across sessions while preserving project isolation and role separation.
-
+The main implementation is split across `project_identity.py`, `project_registry.py`, `memory_protocol.py`, `memory_store.py`, `workflow_state.py`, and `hook_dispatcher.py`.
 ## Lifecycle
 
 The orchestration layer integrates with Qwen Code lifecycle events:
@@ -249,11 +252,19 @@ SessionEnd
 PreToolUse
 ```
 
-The dispatcher uses those events to resolve project context, load/store orchestration state, prepare role-specific subagent context, update journals, and maintain bounded workflow coordination.
+Key behavior:
 
-`PreToolUse` is used by the maintenance layer for controlled shell-command maintenance behavior.
+- `SessionStart` resolves project identity and supplies PROMPT with compact project memory plus controlled cross-project memory.
+- `UserPromptSubmit` advances bounded turn/workflow state.
+- `SubagentStart` supplies only role-appropriate specialist memory/context.
+- `SubagentStop` records bounded objective completion state.
+- `Stop` and `SessionEnd` finalize workflow/session state.
+- `PreToolUse` has two distinct uses: controlled shell maintenance and the `agent` prompt-memory carrier.
+- The prompt-memory carrier persists eligible `Pxxx` updates and removes `<PROMPT_MEMORY>` before the delegated specialist sees the task.
 
-A separate `SessionEnd` server-stop hook participates in normal cleanup, while the outer wrapper still performs deterministic server shutdown in `finally`.
+A separate `SessionEnd` server-stop hook participates in normal cleanup, while the outer wrapper still performs deterministic shutdown in `finally`.
+
+For the complete `SessionStart` ? PROMPT ? ALGORITHM ? TEST ? `Stop` ? server-cleanup path, see [Detailed session and hook data flow](docs/session_hook_flow.md).
 
 ## Repository structure
 
@@ -343,7 +354,7 @@ New-Item -ItemType Directory -Force C:\LocalAI\qwen\runtime\qwen-code\standalone
 This project was validated against:
 
 ```text
-Qwen Code 0.22.2
+Qwen Code 0.22.3
 ```
 
 For maximum reproducibility, use that version rather than automatically upgrading to the newest release.
@@ -621,23 +632,46 @@ The corresponding provider entry in `settings.json` controls the reasoning profi
 
 The server-level `--reasoning-effort xhigh` remains the reference fallback/default. Role-specific requests can override that default without loading another GGUF or another inference server.
 
-The repository's original validated runtime baseline remains Qwen Code 0.22.2. The role-specific model-provider routing and request-level reasoning configuration described above were additionally validated in the production environment with Qwen Code 0.22.3. This update does not redefine the repository-wide runtime patch baseline or its recorded 0.22.2 patched hashes.
-
 ## Qwen Code compatibility layer
 
-The project carries two runtime compatibility patches required by this orchestration design.
+The runtime manager intentionally distinguishes **two compatibility patches** from a separate **compression optimization**.
 
 ### SubagentStart context propagation
 
-Foreground `SubagentStart` hook `additionalContext` is propagated into the effective subagent task prompt.
+Foreground `SubagentStart` hook `additionalContext` is appended to the effective delegated task prompt.
 
-This is required for role-specific project memory and orchestration context to reach the delegated agent.
+This is required for the role-specific handoff produced by the orchestration layer to reach ALGORITHM or TEST.
 
 ### PreToolUse argument rewriting
 
 A rewritten `tool_input` returned through `PreToolUse` becomes the effective tool invocation input.
 
-This is required for the maintenance hook to make controlled argument rewrites effective.
+This is required both for controlled maintenance behavior and for the prompt-memory carrier to be removed before the real `Agent` call.
+
+### Compression optimization
+
+Compression is a separate local optimization layer rather than a compatibility patch.
+
+For the current Qwen Code 0.22.3 runtime it changes:
+
+```text
+COMPACT_MAX_OUTPUT_TOKENS
+  20000-equivalent -> 4096
+
+compression directive
+  analysis + large historical summary
+  ->
+  direct compact <state_snapshot>
+
+state snapshot
+  goal
+  durable_constraints
+  current_state
+  open_issues
+  next_step
+```
+
+The target snapshot is roughly 800?1500 tokens and omits full messages, long source listings, routine tool calls, and transient exploration.
 
 The patch manager is:
 
@@ -648,27 +682,31 @@ patches/ensure_qwen_code_patches.ps1
 It operates fail-closed:
 
 ```text
-already patched
-    -> verify
+known patched state
+    -> verify / no-op
 
-known compatible unpatched runtime
+known compatible unpatched state
     -> backup
     -> patch
     -> JavaScript syntax check
-    -> verify
+    -> post-validate
 
-unknown or mixed runtime
-    -> stop
+mixed or unknown state
+    -> fail closed
+    -> modify nothing
 ```
 
-The validated patched runtime baseline for the reference Qwen Code 0.22.2 build is:
+Validated current Qwen Code 0.22.3 patched baselines:
 
 ```text
-753C03204D5B6388DCB9885ED5766AC496B449BDA291D27EFB5A110E159DB7ED
+CRLF byte SHA256
+  662A99EB4C5B80CADE456856754AA9D4B5A005033AF4B6D4228557E237C45DF4
+
+newline-normalized SHA256
+  A326F41C11DD99E30A3FEA26A2FCF2C4E6B69118EC81D8A47ACF1B072746AE70
 ```
 
-The patcher does not blindly modify an unknown runtime.
-
+The normalized baseline allows semantically identical LF and CRLF runtime files to be distinguished from genuinely different runtime content without forcing newline conversion.
 ## Interactive and headless permission semantics
 
 Normal production use is interactive:
@@ -691,7 +729,7 @@ TEST
   no direct edit/write_file tools
 ```
 
-Qwen Code 0.22.2 applies stricter built-in behavior to non-interactive `-p` execution. In non-interactive `auto` mode it can synthesize deny rules for shell/edit/write capabilities before a subagent override is created.
+Qwen Code 0.22.3 applies stricter built-in behavior to non-interactive `-p` execution. In non-interactive `auto` mode it can synthesize deny rules for shell/edit/write capabilities before a subagent override is created.
 
 Therefore:
 
@@ -723,10 +761,25 @@ This gives deterministic cleanup even when the lifecycle event is absent.
 
 ## Fail-closed server ownership
 
-The server scripts do not terminate an arbitrary process merely because it is listening on the configured port.
+Server shutdown starts from the authoritative listener owner for `127.0.0.1:8080`; it does not kill by process name alone.
 
-Before reuse or termination, they verify that the listener belongs to the expected local `llama-server` runtime. A conflicting or ambiguous process causes startup/shutdown verification to fail rather than killing the unrelated process.
+The stop path:
 
+```text
+resolve listener PID
+-> require exactly one owner
+-> inspect Win32_Process through CIM
+-> verify exact executable name
+-> prefer exact ExecutablePath match
+-> otherwise require exact name + command-line host/port/model evidence
+-> revalidate that the same PID still owns the listener
+-> terminate
+-> wait until the port is free
+```
+
+A vanished process is handled as a benign race only when the listener is no longer owned by that PID. Ambiguous identity, a conflicting process, or a listener-owner change fails closed.
+
+The PID printed during startup may differ from the final listening PID; listener ownership is authoritative.
 ## Bounded validation
 
 The orchestration policy favors:
@@ -807,11 +860,62 @@ high
   completion tokens:  7786
 ```
 
-`xhigh` was retained as the server-wide reference default because both configurations completed successfully while `xhigh` produced lower end-to-end wall time.
+`xhigh` remained the server-wide fallback/default. The current role policy uses:
 
-The current orchestration additionally uses role-specific request-level reasoning. In the validated reference policy, PROMPT and ALGORITHM remain at `xhigh`, while TEST uses `medium`.
+```text
+PROMPT     xhigh
+ALGORITHM  xhigh
+TEST       medium
+```
 
-The observed v3 to v4 orchestration benchmark reduced cumulative tokens from `339536` to `234973`, a reduction of `104563` tokens, or approximately `30.8%`, while final independent verification still passed.
+The earlier v3 ? v4 orchestration change reduced cumulative tokens from `339536` to `234973`, approximately `30.8%`, while final TEST verification still passed.
+
+### Agent execution-efficiency follow-up
+
+A later fresh FastAPI orchestration benchmark exposed excessive specialist tool/model round trips.
+
+Observed cumulative-token chain:
+
+```text
+pre-efficiency-patch
+  387178
+
+after ALGORITHM execution-efficiency rules
+  340769
+
+after ALGORITHM + TEST execution-efficiency rules
+  262032
+```
+
+The final `262032` run was approximately `32.3%` below the pre-patch `387178` run and approximately `23.1%` below the intermediate `340769` run. It remained about `11.5%` above the earlier `234973` v4 benchmark while preserving independent TEST PASS.
+
+Final fresh-run topology:
+
+```text
+ALGORITHM
+  7 rounds
+  10 tools
+
+TEST
+  3 rounds
+  4 tools
+
+compactions
+  0
+```
+
+The cumulative-token metric repeats cached prefixes across requests, so it is not identical to unique uncached model work. In the final run the cached-input ratio was high and uncached input was substantially smaller than cumulative input.
+
+### Compression E2E
+
+The first fresh compression validation after the runtime optimization produced one visible compaction:
+
+```text
+approximately 34772 tokens
+-> approximately 21867 tokens
+```
+
+Execution then continued successfully through independent TEST verification with 9 tests passing. This is evaluated separately from the no-compaction FastAPI efficiency benchmark.
 
 ### Final p-min verification
 
@@ -829,20 +933,9 @@ Selection rule:
 2. Among fully successful candidates, minimize median real-agent wall time.
 ```
 
-Therefore:
+Therefore `p-min = 0.025` remains the reference setting.
 
-```text
-p-min = 0.025
-```
-
-was retained.
-
-Reference machine-readable reports are available under:
-
-```text
-results/reference/
-```
-
+Machine-readable historical benchmark reports remain under `results/reference/`.
 ## Running the benchmarks
 
 Full automated benchmark:
@@ -890,17 +983,16 @@ Those components must be obtained or generated separately.
 
 ## Compatibility
 
-The reference configuration is specifically validated against:
+The current production reference configuration is specifically validated against:
 
 ```text
-Qwen Code 0.22.2
+Qwen Code 0.22.3
 llama.cpp b10636
 Qwen3.8-27B-UD-Q3_K_XL.gguf
 Windows + CUDA 13.3
 ```
 
-Newer versions may work, but Qwen Code upgrades should be treated deliberately because the compatibility patcher depends on known runtime semantics.
-
+Qwen Code upgrades must still be treated deliberately because both compatibility patches and the separate compression optimization depend on known runtime semantics. Unknown or mixed runtime structures fail closed.
 ## License
 
 The original code and documentation in this repository are licensed under the Apache License 2.0.
@@ -915,19 +1007,22 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 This project is primarily an orchestration and local-inference engineering project.
 
-Its main contribution is not the underlying Qwen model, Qwen Code, or llama.cpp. The contribution is the system around them:
+Its contribution is the system around the underlying Qwen model, Qwen Code, and llama.cpp:
 
 ```text
 local inference
-+ role separation
++ PROMPT / ALGORITHM / TEST role separation
 + stable project identity
-+ controlled durable memory
-+ role journals and workflow state
++ bounded stable-ID durable memory
++ role-isolated specialist context
++ delayed prompt-memory transport
++ explicit workflow state
 + lifecycle hooks
 + compatibility management
-+ deterministic cleanup
++ compact context compression
++ deterministic server cleanup
 + independent verification
 + benchmark-driven configuration
 ```
 
-The result is a reproducible local coding-agent workflow designed to behave more like a controlled engineering system than a single unconstrained chat model.
+The result is a reproducible local coding-agent workflow designed to behave like a controlled engineering system rather than a single unconstrained chat model.
