@@ -1,5 +1,6 @@
 # Local machine configuration
 config/local.ps1
+config/qwen_models.ini
 
 # Generated benchmark output
 results/generated/

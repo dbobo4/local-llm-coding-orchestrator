@@ -150,7 +150,7 @@
           },
           {
             "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"<REPO_ROOT>\\scripts\\stop_qwen_server.ps1\"",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"<REPO_ROOT>\\scripts\\stop_qwen_server.ps1\" -IfIdle",
             "name": "qwen-server-stop",
             "description": "Stop local llama.cpp server after Qwen session cleanup",
             "timeout": 10000,

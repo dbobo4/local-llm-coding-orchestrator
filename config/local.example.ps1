@@ -13,6 +13,7 @@ $LlamaServerExe = Join-Path $LlamaCppRoot "llama-server.exe"
 $ModelAlias = "qwen3.8-27b-local"
 $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
 $TestModelAlias = "qwen3.8-27b-test"
+$ChatModelAlias = "qwen3.8-27b-chat"
 
 $PromptReasoningEffort = "xhigh"
 $AlgorithmReasoningEffort = "xhigh"

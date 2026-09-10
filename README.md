@@ -42,7 +42,9 @@ The objective is not simply to run a local coding model. The repository focuses 
 - Qwen Code lifecycle hooks
 - Two compatibility patches plus a separate compression optimization
 - Bounded compaction handoff using `<state_snapshot>`
-- Automatic local inference server startup and shutdown
+- Automatic shared local inference router startup and idle-aware shutdown
+- Optional plain llama.cpp Web UI through `qwen chat`
+- CLI/chat client leases so either interface can keep the shared model alive
 - Fail-closed listener/process ownership checks
 - Non-destructive, idempotent Qwen settings installation
 - Reproducible benchmark suite
@@ -311,6 +313,8 @@ local-llm-coding-orchestrator/
 │   ├── install_orchestrator.ps1
 │   ├── qwen.cmd
 │   ├── qwen.ps1
+│   ├── qwen_chat.ps1
+│   ├── watch_qwen_chat.ps1
 │   ├── start_qwen_server.ps1
 │   └── stop_qwen_server.ps1
 │
@@ -501,7 +505,7 @@ Use:
 .\scripts\qwen.cmd
 ```
 
-This is the recommended production entry point.
+This remains the recommended coding entry point.
 
 The wrapper performs:
 
@@ -509,15 +513,48 @@ The wrapper performs:
 Qwen Code compatibility verification
         |
         v
-llama-server verification/start
+shared llama.cpp router verification/start
         |
         v
 interactive Qwen Code session
         |
         v
-deterministic llama-server shutdown
+idle-aware shared-server cleanup
 ```
 
+The CLI holds an exclusive client lease while Qwen Code is active. When Qwen Code exits, the wrapper asks the shared server to stop only if no coding CLI and no plain-chat client still owns a lease.
+
+### 9. Start the plain chat UI
+
+Use:
+
+```powershell
+.\scripts\qwen.cmd chat
+```
+
+This path bypasses Qwen Code orchestration, hooks, project memory, and agent roles. It opens the built-in llama.cpp Web UI in a dedicated Chrome app window, with Edge as fallback.
+
+Chat browser data is isolated under:
+
+```text
+%USERPROFILE%\.qwen\chat_ui\
+```
+
+including the dedicated browser profile and export directory.
+
+The shared inference router uses:
+
+```text
+canonical model ID
+  qwen3.8-27b-chat
+
+Qwen Code role aliases
+  qwen3.8-27b-local
+  qwen3.8-27b-algorithm
+  qwen3.8-27b-test
+```
+
+Only one physical GGUF is loaded. `--models-max 1` and `--parallel 1` remain the reference production policy.
 ## Local inference configuration
 
 The reference production configuration uses:
@@ -593,7 +630,15 @@ These settings were selected through the benchmark suite included in this reposi
 
 ### Role-specific model and reasoning routing
 
-The reference setup still loads only one physical GGUF model into one `llama-server` process. Qwen Code exposes that same server through three logical model/provider identities:
+The reference production server runs llama.cpp in router mode with one preset and one physical GGUF.
+
+The canonical router model ID is:
+
+```text
+qwen3.8-27b-chat
+```
+
+Qwen Code continues to address the same model through three role aliases:
 
 ```text
 qwen3.8-27b-local      -> PROMPT     -> xhigh
@@ -601,11 +646,49 @@ qwen3.8-27b-algorithm  -> ALGORITHM  -> xhigh
 qwen3.8-27b-test       -> TEST       -> medium
 ```
 
-All three providers use the same OpenAI-compatible base URL and the same physical model.
+The canonical `chat` ID is used by the built-in llama.cpp Web UI. The role aliases are API aliases for Qwen Code; they do not create extra model instances or extra VRAM copies.
+
+The generated router preset uses:
+
+```text
+[qwen3.8-27b-chat]
+model = <configured GGUF path>
+alias = qwen3.8-27b-local,qwen3.8-27b-algorithm,qwen3.8-27b-test
+load-on-startup = true
+```
+
+and the router is limited to one loaded model with `--models-max 1`.
+
+All Qwen Code providers use the same OpenAI-compatible base URL and the same physical model.
 
 The agent frontmatter selects the logical provider:
 
 ```yaml
+# algorithm-agent.md
+model: qwen3.8-27b-algorithm
+```
+
+```yaml
+# test-agent.md
+model: qwen3.8-27b-test
+```
+
+The corresponding provider entry in `settings.json` controls the reasoning profile. For example, the TEST role uses:
+
+```json
+"generationConfig": {
+  "reasoning": {
+    "effort": "medium"
+  },
+  "extra_body": {
+    "reasoning_effort": "medium"
+  }
+}
+```
+
+`generationConfig.reasoning.effort` represents the Qwen Code-side reasoning configuration. The explicit `extra_body.reasoning_effort` field is the wire-level override sent through the OpenAI-compatible request to `llama.cpp`.
+
+The server-level `--reasoning-effort xhigh` remains the reference fallback/default. Role-specific requests can override that default without loading another GGUF or another inference router.
 # algorithm-agent.md
 model: qwen3.8-27b-algorithm
 ```
@@ -718,27 +801,51 @@ No third runtime patch is used to bypass those headless safety rules.
 
 ## Lifecycle management
 
-The orchestration layer uses:
+The production runtime is shared by two client paths:
 
 ```text
-SessionStart
-UserPromptSubmit
-SubagentStart
-SubagentStop
-Stop
-SessionEnd
-PreToolUse
+coding CLI
+  .\scripts\qwen.cmd
+  -> Qwen Code
+  -> CLI lease
+
+plain chat
+  .\scripts\qwen.cmd chat
+  -> llama.cpp Web UI
+  -> chat lease
 ```
 
-Qwen Code's `SessionEnd` hook participates in normal cleanup.
+Both paths use the same router listener and the same single loaded GGUF.
 
-The wrapper also performs server shutdown in a `finally` block because headless execution may not reliably deliver `SessionEnd`.
+The lifecycle invariant is:
 
-This gives deterministic cleanup even when the lifecycle event is absent.
+```text
+CLI active
+  -> server stays running
 
+chat active
+  -> server stays running
+
+CLI + chat active
+  -> server stays running
+
+CLI exits while chat remains
+  -> QWEN_SERVER_STATUS=KEPT_FOR_CHAT
+
+chat closes while CLI remains
+  -> QWEN_SERVER_STATUS=KEPT_FOR_CLI
+
+last client exits
+  -> unload model child
+  -> stop router
+```
+
+Qwen Code's `SessionEnd` server-stop hook uses idle-aware shutdown. The outer CLI wrapper also performs `-IfIdle` cleanup after releasing its CLI lease, so missing `SessionEnd` delivery does not leave the runtime unmanaged.
+
+The chat watcher owns an exclusive `chat.lock` while the dedicated browser app is active. Browser absence must persist for multiple samples before that lease is released, avoiding shutdown from a transient Chrome process-list miss.
 ## Fail-closed server ownership
 
-Server shutdown starts from the authoritative listener owner for `127.0.0.1:8080`; it does not kill by process name alone.
+Server shutdown starts from the authoritative listener owner for the configured host/port; it does not kill by process name alone.
 
 The stop path:
 
@@ -748,15 +855,20 @@ resolve listener PID
 -> inspect Win32_Process through CIM
 -> verify exact executable name
 -> prefer exact ExecutablePath match
--> otherwise require exact name + command-line host/port/model evidence
--> revalidate that the same PID still owns the listener
--> terminate
+-> otherwise require strict host/port plus legacy-model or router-preset command-line evidence
+-> if -IfIdle: keep server while any CLI/chat lease is active
+-> if router mode: request /models/unload for qwen3.8-27b-chat
+-> wait for the model child to exit
+-> revalidate listener ownership
+-> terminate router
 -> wait until the port is free
 ```
 
-A vanished process is handled as a benign race only when the listener is no longer owned by that PID. Ambiguous identity, a conflicting process, or a listener-owner change fails closed.
+The router preset is generated from `config/local.ps1` values at server start and stored under the configured Qwen root, not in the Git repository.
 
-The PID printed during startup may differ from the final listening PID; listener ownership is authoritative.
+A vanished process is handled as a benign race only when the listener is no longer owned by that PID. Ambiguous identity, a conflicting process, an unexpected model topology, or a listener-owner change fails closed.
+
+The PID printed during startup may differ from the final router listener PID; listener ownership is authoritative.
 ## Bounded validation
 
 The orchestration policy favors:
@@ -988,6 +1100,7 @@ Its contribution is the system around the underlying Qwen model, Qwen Code, and 
 
 ```text
 local inference
++ shared router-backed coding and plain-chat interfaces
 + PROMPT / ALGORITHM / TEST role separation
 + stable project identity
 + bounded stable-ID durable memory

@@ -1,3 +1,7 @@
+param(
+    [switch]$IfIdle
+)
+
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path $PSScriptRoot -Parent
@@ -9,11 +13,32 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
+if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
+    $ChatModelAlias = "qwen3.8-27b-chat"
+}
+
 $ExpectedExe = $LlamaServerExe
 $ExpectedModelPath = $ModelPath
+$ExpectedRouterPreset = Join-Path $QwenRoot "config\qwen_models.ini"
+
 $HostAddress = [string]$ServerHost
 $Port = [int]$ServerPort
 $ShutdownTimeoutSeconds = 5
+
+$RouterBaseUrl = "http://${HostAddress}:${Port}"
+$RouterUnloadUrl = "$RouterBaseUrl/models/unload"
+
+$ClientStateRoot = Join-Path `
+    $QwenUserRoot `
+    "runtime_clients"
+
+$CliLeaseRoot = Join-Path `
+    $ClientStateRoot `
+    "cli"
+
+$ChatLeasePath = Join-Path `
+    $ClientStateRoot `
+    "chat.lock"
 
 if (-not (Test-Path $ExpectedExe -PathType Leaf)) {
     throw "Expected llama-server.exe not found: $ExpectedExe"
@@ -21,6 +46,95 @@ if (-not (Test-Path $ExpectedExe -PathType Leaf)) {
 
 if (-not (Test-Path $ExpectedModelPath -PathType Leaf)) {
     throw "Expected Qwen model not found: $ExpectedModelPath"
+}
+
+function Test-QwenExclusiveLeaseActive {
+    param(
+        [string]$Path
+    )
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $Path `
+            -PathType Leaf
+    )) {
+        return $false
+    }
+
+    $stream = $null
+
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::DeleteOnClose
+        )
+
+        $stream.Dispose()
+        $stream = $null
+
+        return $false
+    }
+    catch [System.IO.FileNotFoundException] {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+
+        return $false
+    }
+    catch [System.IO.DirectoryNotFoundException] {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+
+        return $false
+    }
+    catch [System.IO.IOException] {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+
+        return $true
+    }
+}
+
+function Test-QwenCliActive {
+    if (-not (
+        Test-Path `
+            -LiteralPath $CliLeaseRoot `
+            -PathType Container
+    )) {
+        return $false
+    }
+
+    $leaseFiles = @(
+        Get-ChildItem `
+            -LiteralPath $CliLeaseRoot `
+            -Filter "*.lock" `
+            -File `
+            -ErrorAction Stop
+    )
+
+    foreach ($leaseFile in $leaseFiles) {
+        if (
+            Test-QwenExclusiveLeaseActive `
+                -Path $leaseFile.FullName
+        ) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-QwenChatLeaseActive {
+    return (
+        Test-QwenExclusiveLeaseActive `
+            -Path $ChatLeasePath
+    )
 }
 
 function Get-QwenListenerProcessIds {
@@ -52,6 +166,175 @@ function Test-QwenListenerOwnedBy {
     }
 
     return ([int]$owners[0] -eq $ProcessId)
+}
+
+function Test-QwenRouterMode {
+    param(
+        [string]$CommandLine
+    )
+
+    $expectedPresetName = [System.IO.Path]::GetFileName(
+        $ExpectedRouterPreset
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($CommandLine)) {
+        $hasPresetSwitch = (
+            $CommandLine.IndexOf(
+                "--models-preset",
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -ge 0
+        )
+
+        $hasPresetName = (
+            $CommandLine.IndexOf(
+                $expectedPresetName,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -ge 0
+        )
+
+        if (
+            $hasPresetSwitch -and
+            $hasPresetName
+        ) {
+            return $true
+        }
+    }
+
+    try {
+        $response = Invoke-RestMethod `
+            -Uri "$RouterBaseUrl/v1/models" `
+            -Method Get `
+            -TimeoutSec 2
+
+        foreach ($model in @($response.data)) {
+            if (
+                [string]$model.id -eq $ChatModelAlias -and
+                [string]$model.source -eq "preset"
+            ) {
+                return $true
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+
+    return $false
+}
+
+function Get-QwenRouterModelChildIds {
+    param(
+        [int]$RouterProcessId
+    )
+
+    $expectedName = [System.IO.Path]::GetFileName(
+        $ExpectedExe
+    )
+
+    $children = @(
+        Get-CimInstance `
+            -ClassName Win32_Process `
+            -Filter "ParentProcessId = $RouterProcessId" `
+            -ErrorAction Stop |
+        Where-Object {
+            $_.Name -ieq $expectedName
+        }
+    )
+
+    return @(
+        $children |
+            Select-Object -ExpandProperty ProcessId
+    )
+}
+
+function Invoke-QwenRouterModelUnload {
+    param(
+        [int]$RouterProcessId
+    )
+
+    $initialChildren = @(
+        Get-QwenRouterModelChildIds `
+            -RouterProcessId $RouterProcessId
+    )
+
+    if ($initialChildren.Count -eq 0) {
+        Write-Host "QWEN_ROUTER_MODEL_STATUS=ALREADY_UNLOADED"
+        return
+    }
+
+    if ($initialChildren.Count -ne 1) {
+        throw (
+            "Expected at most one llama.cpp router model child, found " +
+            "$($initialChildren.Count). Refusing router shutdown."
+        )
+    }
+
+    $payload = @{
+        model = $ChatModelAlias
+    } | ConvertTo-Json -Compress
+
+    try {
+        $response = Invoke-RestMethod `
+            -Uri $RouterUnloadUrl `
+            -Method Post `
+            -ContentType "application/json" `
+            -Body $payload `
+            -TimeoutSec 10
+    }
+    catch {
+        $remainingChildren = @(
+            Get-QwenRouterModelChildIds `
+                -RouterProcessId $RouterProcessId
+        )
+
+        if ($remainingChildren.Count -eq 0) {
+            Write-Host "QWEN_ROUTER_MODEL_STATUS=UNLOADED"
+            return
+        }
+
+        throw (
+            "Could not unload router model '" +
+            $ChatModelAlias +
+            "'. Refusing to force-stop the router while " +
+            "the model child may still be active. " +
+            $_.Exception.Message
+        )
+    }
+
+    if (
+        $null -eq $response -or
+        $response.success -ne $true
+    ) {
+        throw (
+            "Router rejected model unload for '" +
+            $ChatModelAlias +
+            "'. Refusing to stop the router."
+        )
+    }
+
+    $deadline = (
+        Get-Date
+    ).AddSeconds(15)
+
+    while ((Get-Date) -lt $deadline) {
+        $children = @(
+            Get-QwenRouterModelChildIds `
+                -RouterProcessId $RouterProcessId
+        )
+
+        if ($children.Count -eq 0) {
+            Write-Host "QWEN_ROUTER_MODEL_STATUS=UNLOADED"
+            return
+        }
+
+        Start-Sleep `
+            -Milliseconds 250
+    }
+
+    throw (
+        "Router model unload succeeded, but a model child " +
+        "remained active after 15 seconds. Refusing to stop the router."
+    )
 }
 
 $processIds = @(
@@ -156,6 +439,10 @@ if ([string]::IsNullOrWhiteSpace($identitySource)) {
         $ExpectedModelPath
     )
 
+    $expectedPresetName = [System.IO.Path]::GetFileName(
+        $ExpectedRouterPreset
+    )
+
     $hostToken = "--host $HostAddress"
     $portToken = "--port $Port"
 
@@ -165,7 +452,9 @@ if ([string]::IsNullOrWhiteSpace($identitySource)) {
 
     $hasHost = $false
     $hasPort = $false
-    $hasModel = $false
+    $hasLegacyModel = $false
+    $hasRouterPresetSwitch = $false
+    $hasRouterPresetName = $false
 
     if ($hasCommandLine) {
         $hasHost = (
@@ -182,19 +471,41 @@ if ([string]::IsNullOrWhiteSpace($identitySource)) {
             ) -ge 0
         )
 
-        $hasModel = (
+        $hasLegacyModel = (
             $commandLine.IndexOf(
                 $expectedModelName,
                 [System.StringComparison]::OrdinalIgnoreCase
             ) -ge 0
         )
+
+        $hasRouterPresetSwitch = (
+            $commandLine.IndexOf(
+                "--models-preset",
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -ge 0
+        )
+
+        $hasRouterPresetName = (
+            $commandLine.IndexOf(
+                $expectedPresetName,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -ge 0
+        )
     }
+
+    $hasRouterPreset = (
+        $hasRouterPresetSwitch -and
+        $hasRouterPresetName
+    )
 
     $commandMatches = (
         $hasCommandLine -and
         $hasHost -and
         $hasPort -and
-        $hasModel
+        (
+            $hasLegacyModel -or
+            $hasRouterPreset
+        )
     )
 
     if (-not $commandMatches) {
@@ -216,6 +527,26 @@ if (-not (Test-QwenListenerOwnedBy -ProcessId $serverPid)) {
 }
 
 Write-Host "QWEN_SERVER_IDENTITY=$identitySource"
+
+if ($IfIdle) {
+    if (Test-QwenCliActive) {
+        Write-Host "QWEN_SERVER_STATUS=KEPT_FOR_CLI"
+        exit 0
+    }
+
+    if (Test-QwenChatLeaseActive) {
+        Write-Host "QWEN_SERVER_STATUS=KEPT_FOR_CHAT"
+        exit 0
+    }
+}
+
+$isRouter = Test-QwenRouterMode `
+    -CommandLine $commandLine
+
+if ($isRouter) {
+    Invoke-QwenRouterModelUnload `
+        -RouterProcessId $serverPid
+}
 
 try {
     Stop-Process `

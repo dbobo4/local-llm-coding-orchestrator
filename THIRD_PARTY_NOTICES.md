@@ -10,7 +10,7 @@ Project: Qwen Code
 Upstream: https://github.com/QwenLM/qwen-code
 License: Apache License 2.0
 
-This project was developed and validated against Qwen Code 0.22.2.
+This project was developed and validated against Qwen Code 0.22.3.
 
 The repository includes a compatibility patcher for specific Qwen Code runtime behavior. Qwen Code itself is not redistributed here.
 

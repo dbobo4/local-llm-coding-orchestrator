@@ -9,8 +9,6 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
-# Backward-compatible defaults for local.ps1 files created before
-# role-specific model aliases were introduced.
 if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
     $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
 }
@@ -19,14 +17,22 @@ if ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) {
     $TestModelAlias = "qwen3.8-27b-test"
 }
 
-$ExpectedModels = @(
+if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
+    $ChatModelAlias = "qwen3.8-27b-chat"
+}
+
+$RoleModelAliases = @(
     $ModelAlias
     $AlgorithmModelAlias
     $TestModelAlias
 )
 
-if (@($ExpectedModels | Select-Object -Unique).Count -ne 3) {
-    throw "PROMPT, ALGORITHM, and TEST model aliases must be unique."
+$ExpectedModels = @(
+    $ChatModelAlias
+) + @($RoleModelAliases)
+
+if (@($ExpectedModels | Select-Object -Unique).Count -ne 4) {
+    throw "PROMPT, ALGORITHM, TEST, and CHAT model names must be unique."
 }
 
 $ExpectedModelSummary = $ExpectedModels -join ", "
@@ -34,7 +40,7 @@ $ExpectedModelSummary = $ExpectedModels -join ", "
 $StartScript = Join-Path $PSScriptRoot "start_qwen_server.ps1"
 $LogRoot = Join-Path $QwenRoot "logs"
 
-$HostAddress = $ServerHost
+$HostAddress = [string]$ServerHost
 $Port = [int]$ServerPort
 $ApiUrl = "http://${HostAddress}:${Port}/v1/models"
 
@@ -89,28 +95,28 @@ function Get-QwenApiState {
             return "wrong_api"
         }
 
-        $models = @($response.data)
-        $advertisedModels = @()
-
-        foreach ($model in $models) {
-            if ($null -ne $model.id) {
-                $advertisedModels += [string]$model.id
-            }
-
-            foreach ($alias in @($model.aliases)) {
-                if ($null -ne $alias) {
-                    $advertisedModels += [string]$alias
+        $canonicalMatches = @(
+            @($response.data) |
+                Where-Object {
+                    $null -ne $_.id -and
+                    [string]$_.id -eq $ChatModelAlias
                 }
-            }
+        )
+
+        if ($canonicalMatches.Count -ne 1) {
+            return "wrong_model"
         }
 
-        $advertisedModels = @(
-            $advertisedModels |
+        $advertisedAliases = @(
+            @($canonicalMatches[0].aliases) |
+                ForEach-Object {
+                    [string]$_
+                } |
                 Select-Object -Unique
         )
 
-        foreach ($expectedModel in $ExpectedModels) {
-            if ($advertisedModels -notcontains $expectedModel) {
+        foreach ($expectedAlias in $RoleModelAliases) {
+            if ($advertisedAliases -notcontains $expectedAlias) {
                 return "wrong_model"
             }
         }
@@ -135,9 +141,9 @@ $portListening = Test-PortListening `
 
 if ($portListening) {
     throw (
-        "Port $Port is already in use, but the required models " +
-        "'$ExpectedModelSummary' are not available at $ApiUrl. " +
-        "Refusing to start a second server."
+        "Port $Port is already in use, but the required canonical model " +
+        "'$ChatModelAlias' and role aliases '$($RoleModelAliases -join ", ")' " +
+        "are not available at $ApiUrl. Refusing to start a second server."
     )
 }
 
@@ -145,7 +151,7 @@ New-Item `
     -Path $LogRoot `
     -ItemType Directory `
     -Force |
-    Out-Null
+Out-Null
 
 $stdoutLog = Join-Path $LogRoot "qwen-server.stdout.log"
 $stderrLog = Join-Path $LogRoot "qwen-server.stderr.log"
@@ -189,8 +195,8 @@ while ((Get-Date) -lt $deadline) {
 
     if ($state -eq "wrong_model") {
         throw (
-            "A server responded at $ApiUrl, but required models " +
-            "'$ExpectedModelSummary' were not all advertised. " +
+            "A server responded at $ApiUrl, but the canonical model " +
+            "'$ChatModelAlias' and required role aliases were not all advertised. " +
             "Refusing to continue."
         )
     }

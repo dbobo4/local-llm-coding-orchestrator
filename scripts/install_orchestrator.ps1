@@ -22,6 +22,9 @@ if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
 if ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) {
     $TestModelAlias = "qwen3.8-27b-test"
 }
+if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
+    $ChatModelAlias = "qwen3.8-27b-chat"
+}
 if ([string]::IsNullOrWhiteSpace([string]$PromptReasoningEffort)) {
     $PromptReasoningEffort = "xhigh"
 }
@@ -35,11 +38,12 @@ if ([string]::IsNullOrWhiteSpace([string]$TestReasoningEffort)) {
 $configuredAliases = @(
     $ModelAlias,
     $AlgorithmModelAlias,
-    $TestModelAlias
+    $TestModelAlias,
+    $ChatModelAlias
 )
 
-if (@($configuredAliases | Select-Object -Unique).Count -ne 3) {
-    throw "Model aliases for PROMPT, ALGORITHM, and TEST must be unique."
+if (@($configuredAliases | Select-Object -Unique).Count -ne 4) {
+    throw "Model names for PROMPT, ALGORITHM, TEST, and CHAT must be unique."
 }
 
 $SourceQwenMd = Join-Path $RepoRoot "orchestration\QWEN.md"
@@ -154,7 +158,7 @@ $stopServerPath = Join-Path $RepoRoot "scripts\stop_qwen_server.ps1"
 
 $dispatcherCommand = 'python "' + $dispatcherPath + '"'
 $maintenanceCommand = 'python "' + $maintenancePath + '"'
-$stopServerCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $stopServerPath + '"'
+$stopServerCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $stopServerPath + '" -IfIdle'
 
 foreach ($eventName in @("SubagentStart","UserPromptSubmit","SessionStart","SessionEnd","SubagentStop","Stop")) {
     foreach ($eventGroup in $template.hooks.$eventName) {
@@ -431,6 +435,26 @@ if (-not [regex]::IsMatch($installedTestAgent,$testPattern)) {
 
 if ($verify.hooks.SessionEnd[0].hooks.Count -ne 2) {
     throw "Installation verification failed: SessionEnd hooks"
+}
+
+$serverStopHooks = @(
+    @($verify.hooks.SessionEnd[0].hooks) |
+        Where-Object {
+            $_.name -eq "qwen-server-stop"
+        }
+)
+
+if ($serverStopHooks.Count -ne 1) {
+    throw "Installation verification failed: qwen-server-stop hook"
+}
+
+if (
+    ([string]$serverStopHooks[0].command).IndexOf(
+        "-IfIdle",
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -lt 0
+) {
+    throw "Installation verification failed: qwen-server-stop must use -IfIdle"
 }
 
 $maintenanceHookCount = 0

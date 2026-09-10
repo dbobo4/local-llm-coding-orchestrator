@@ -355,12 +355,19 @@ Qwen Code process exits
         v
 outer qwen wrapper
         |
-        +--> stop_qwen_server.ps1 runs as deterministic fallback
+        +--> release CLI lease
         |
-        +--> resolve port 8080 listener OwningProcess
-        +--> validate identity through Win32_Process
-        +--> stop validated llama-server process
-        +--> verify port is free
+        +--> stop_qwen_server.ps1 -IfIdle runs as deterministic fallback
+        |
+        +--> if chat lease is active:
+        |       keep shared llama.cpp router/model running
+        |
+        +--> otherwise:
+                resolve port 8080 listener OwningProcess
+                validate identity through Win32_Process
+                explicitly unload router model child when applicable
+                stop validated llama.cpp router
+                verify port is free
         |
         v
 QWEN LIFECYCLE ENDS
@@ -381,7 +388,7 @@ active conversation context
     Qwen Code session context + compact task deltas
 
 runtime process state
-    llama-server listener ownership and lifecycle
+    llama.cpp router/model-child ownership + CLI/chat client leases
 ```
 
 The boundaries are deliberate:
@@ -392,3 +399,36 @@ The boundaries are deliberate:
 - TEST does not inherit ALGORITHM rationale;
 - `<PROMPT_MEMORY>` transport is stripped before specialist execution;
 - process ownership is not inferred from process name alone.
+
+## Shared CLI / plain-chat server lifecycle
+
+The hook flow above describes the Qwen Code coding path. A second user-facing path is intentionally outside the orchestration layer:
+
+```text
+qwen chat
+    -> built-in llama.cpp Web UI
+    -> qwen3.8-27b-chat canonical router model
+```
+
+Plain chat does not emit the Qwen Code orchestration hooks and does not read or write orchestration project memory.
+
+The coding CLI and chat UI share the same local router/model through external client leases:
+
+```text
+CLI active
+    -> ~/.qwen/runtime_clients/cli/<pid>.lock
+
+chat active
+    -> ~/.qwen/runtime_clients/chat.lock
+
+either lease locked
+    -> stop -IfIdle keeps server running
+
+no active lease
+    -> model child unload
+    -> router stop
+```
+
+The dedicated chat browser profile is stored under `~/.qwen/chat_ui/browser-profile`. A watcher holds the chat lease while the dedicated app window exists and requires sustained process absence before releasing the lease.
+
+The runtime process state therefore includes both router/model-child ownership and client-lease ownership; neither is orchestration durable memory.

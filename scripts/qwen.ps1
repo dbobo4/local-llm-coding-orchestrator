@@ -14,38 +14,102 @@ $PatchScript = Join-Path $RepoRoot "patches\ensure_qwen_code_patches.ps1"
 $EnsureServerScript = Join-Path $PSScriptRoot "ensure_qwen_server.ps1"
 $StopServerScript = Join-Path $PSScriptRoot "stop_qwen_server.ps1"
 
-foreach ($required in @($PatchScript, $EnsureServerScript, $StopServerScript, $QwenCodeCli)) {
+foreach ($required in @(
+    $PatchScript,
+    $EnsureServerScript,
+    $StopServerScript,
+    $QwenCodeCli
+)) {
     if (-not (Test-Path $required -PathType Leaf)) {
         Write-Error "Required file not found: $required"
         exit 1
     }
 }
 
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PatchScript
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Qwen Code patch integrity check failed."
-    exit $LASTEXITCODE
-}
+$CliLeaseRoot = Join-Path `
+    $QwenUserRoot `
+    "runtime_clients\cli"
 
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $EnsureServerScript
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Qwen server preflight failed."
-    exit $LASTEXITCODE
-}
+New-Item `
+    -Path $CliLeaseRoot `
+    -ItemType Directory `
+    -Force |
+Out-Null
 
+$CliLeasePath = Join-Path `
+    $CliLeaseRoot `
+    ("{0}.lock" -f $PID)
+
+$CliLeaseStream = $null
 $qwenExitCode = 0
 $stopExitCode = 0
+$primaryError = $null
 
 try {
+    $CliLeaseStream = [System.IO.FileStream]::new(
+        $CliLeasePath,
+        [System.IO.FileMode]::OpenOrCreate,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::DeleteOnClose
+    )
+
+    & powershell.exe `
+        -NoProfile `
+        -ExecutionPolicy Bypass `
+        -File $PatchScript
+
+    if ($LASTEXITCODE -ne 0) {
+        $qwenExitCode = $LASTEXITCODE
+        throw "Qwen Code patch integrity check failed."
+    }
+
+    & powershell.exe `
+        -NoProfile `
+        -ExecutionPolicy Bypass `
+        -File $EnsureServerScript
+
+    if ($LASTEXITCODE -ne 0) {
+        $qwenExitCode = $LASTEXITCODE
+        throw "Qwen server preflight failed."
+    }
+
     & $QwenCodeCli @args
     $qwenExitCode = $LASTEXITCODE
 }
+catch {
+    $primaryError = $_
+
+    if ($qwenExitCode -eq 0) {
+        $qwenExitCode = 1
+    }
+}
 finally {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $StopServerScript
+    if ($null -ne $CliLeaseStream) {
+        $CliLeaseStream.Dispose()
+        $CliLeaseStream = $null
+    }
+
+    & powershell.exe `
+        -NoProfile `
+        -ExecutionPolicy Bypass `
+        -File $StopServerScript `
+        -IfIdle
+
     $stopExitCode = $LASTEXITCODE
 }
 
-if ($stopExitCode -ne 0 -and $qwenExitCode -eq 0) {
+if ($null -ne $primaryError) {
+    Write-Error `
+        -Message $primaryError.Exception.Message `
+        -ErrorAction Continue
+}
+
+if (
+    $stopExitCode -ne 0 -and
+    $qwenExitCode -eq 0
+) {
     Write-Error "Qwen server cleanup failed."
     exit $stopExitCode
 }

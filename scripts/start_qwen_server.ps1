@@ -9,8 +9,6 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
-# Backward-compatible defaults for local.ps1 files created before
-# role-specific model aliases were introduced.
 if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
     $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
 }
@@ -19,13 +17,35 @@ if ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) {
     $TestModelAlias = "qwen3.8-27b-test"
 }
 
-$ServerModelAliases = @(
+if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
+    $ChatModelAlias = "qwen3.8-27b-chat"
+}
+
+$RoleModelAliases = @(
     $ModelAlias
     $AlgorithmModelAlias
     $TestModelAlias
-) -join ","
+)
+
+$AllModelNames = @(
+    $ChatModelAlias
+) + @($RoleModelAliases)
+
+if (@($AllModelNames | Select-Object -Unique).Count -ne 4) {
+    throw "PROMPT, ALGORITHM, TEST, and CHAT model names must be unique."
+}
+
+foreach ($modelName in $AllModelNames) {
+    if (
+        [string]::IsNullOrWhiteSpace([string]$modelName) -or
+        [string]$modelName -match '[,\[\]\r\n]'
+    ) {
+        throw "Invalid model name for llama.cpp router preset: '$modelName'"
+    }
+}
 
 $ServerExe = $LlamaServerExe
+$ModelsPreset = Join-Path $QwenRoot "config\qwen_models.ini"
 
 if (-not (Test-Path $ServerExe -PathType Leaf)) {
     throw "llama-server.exe not found: $ServerExe"
@@ -35,20 +55,54 @@ if (-not (Test-Path $ModelPath -PathType Leaf)) {
     throw "Qwen model not found: $ModelPath"
 }
 
+$PresetRoot = Split-Path $ModelsPreset -Parent
+
+New-Item `
+    -Path $PresetRoot `
+    -ItemType Directory `
+    -Force |
+Out-Null
+
+$PresetModelPath = (
+    [System.IO.Path]::GetFullPath(
+        $ModelPath
+    )
+).Replace(
+    "\",
+    "/"
+)
+
+$PresetText = @(
+    "version = 1"
+    ""
+    "[$ChatModelAlias]"
+    "model = $PresetModelPath"
+    ("alias = " + ($RoleModelAliases -join ","))
+    "load-on-startup = true"
+    ""
+) -join [Environment]::NewLine
+
+[System.IO.File]::WriteAllText(
+    $ModelsPreset,
+    $PresetText,
+    (New-Object System.Text.UTF8Encoding($false))
+)
+
 Write-Host "========================================"
 Write-Host " Local Qwen Server"
 Write-Host "========================================"
-Write-Host "Model:   Qwen3.8-27B UD-Q3_K_XL + MTP2 + ngram-mod"
-Write-Host "Aliases: $ServerModelAliases"
-Write-Host "Context: 49152"
-Write-Host "Reason:  xhigh"
-Write-Host "API:     http://${ServerHost}:${ServerPort}/v1"
+Write-Host "Model:    Qwen3.8-27B UD-Q3_K_XL + MTP2 + ngram-mod"
+Write-Host "Model ID: $ChatModelAlias"
+Write-Host "Aliases:  $($RoleModelAliases -join ', ')"
+Write-Host "Context:  49152"
+Write-Host "Reason:   xhigh"
+Write-Host "API:      http://${ServerHost}:${ServerPort}/v1"
 Write-Host "========================================"
 Write-Host ""
 
 & $ServerExe `
-    --model $ModelPath `
-    --alias $ServerModelAliases `
+    --models-preset $ModelsPreset `
+    --models-max 1 `
     --host $ServerHost `
     --port $ServerPort `
     --ctx-size 49152 `

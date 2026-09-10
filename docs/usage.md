@@ -2,22 +2,35 @@
 
 ## Overview
 
-The repository provides a Windows-first wrapper around Qwen Code that automatically:
+The repository provides a Windows-first wrapper around a shared local llama.cpp runtime.
 
-1. verifies the required Qwen Code compatibility patches;
-2. starts the local `llama-server` when necessary;
-3. launches Qwen Code;
-4. preserves the Qwen Code exit status;
-5. stops the local inference server when the Qwen process exits.
-
-The normal entry point is:
+Two normal entry points are available:
 
 ```powershell
 .\scripts\qwen.cmd
 ```
 
-Normal production use is interactive.
+for the full Qwen Code coding orchestrator, and:
 
+```powershell
+.\scripts\qwen.cmd chat
+```
+
+for a plain browser chat that bypasses Qwen Code orchestration.
+
+The coding path automatically:
+
+1. acquires a CLI client lease;
+2. verifies the required Qwen Code compatibility patches;
+3. starts or reuses the shared llama.cpp router;
+4. launches Qwen Code;
+5. preserves the Qwen Code exit status;
+6. releases the CLI lease;
+7. stops the shared runtime only when no CLI or chat client remains active.
+
+The chat path starts or reuses the same router, opens the built-in llama.cpp Web UI in a dedicated Chrome app window, and keeps a chat lease active until that window is closed.
+
+Normal production coding use remains interactive.
 ## Initial repository configuration
 
 Copy the example configuration:
@@ -48,6 +61,7 @@ OrchestrationRoot
 ModelAlias
 AlgorithmModelAlias
 TestModelAlias
+ChatModelAlias
 PromptReasoningEffort
 AlgorithmReasoningEffort
 TestReasoningEffort
@@ -126,8 +140,68 @@ For normal coding use, start without `-p`:
 .\scripts\qwen.cmd
 ```
 
-This starts the interactive production workflow.
+This starts the interactive production workflow and acquires a CLI lease for the lifetime of the Qwen Code process.
 
+## Plain chat UI
+
+For direct chat without Qwen Code orchestration:
+
+```powershell
+.\scripts\qwen.cmd chat
+```
+
+The chat path:
+
+```text
+browser
+  -> built-in llama.cpp Web UI
+  -> shared llama.cpp router
+  -> qwen3.8-27b-chat
+```
+
+It intentionally bypasses:
+
+```text
+Qwen Code
+PROMPT / ALGORITHM / TEST
+lifecycle hooks
+project identity
+orchestration durable memory
+workflow state
+```
+
+Chrome is preferred and Microsoft Edge is used only as fallback.
+
+The dedicated browser data root is:
+
+```text
+%USERPROFILE%\.qwen\chat_ui
+```
+
+with:
+
+```text
+browser-profile\
+exports\
+```
+
+The dedicated profile keeps llama.cpp Web UI browser storage separate from the user's ordinary browser profile.
+
+If the chat app is already open, running `qwen chat` again reuses it instead of opening another dedicated app window.
+
+The router canonical model ID is:
+
+```text
+qwen3.8-27b-chat
+```
+
+while the existing Qwen Code model names remain aliases to the same GGUF:
+
+```text
+qwen3.8-27b-local
+qwen3.8-27b-algorithm
+qwen3.8-27b-test
+```
 ## Normal coding workflow
 
 A typical interaction is intentionally simple.
@@ -365,22 +439,48 @@ unless the task explicitly requires them.
 
 You normally do not need to manage `llama-server` manually.
 
-The wrapper performs:
+The production server runs in router mode with one generated model preset and one loaded model maximum.
+
+The shared lifecycle is:
 
 ```text
-runtime patch/optimization verification
--> server ownership verification/start
--> Qwen Code
--> deterministic server shutdown
+qwen
+  -> CLI lease
+  -> Qwen Code
+
+qwen chat
+  -> chat lease
+  -> dedicated browser Web UI
+
+either lease active
+  -> keep shared router/model alive
+
+no lease active
+  -> explicit model unload
+  -> router shutdown
 ```
 
-Shutdown occurs even when Qwen Code exits with an error.
+`qwen` and `qwen chat` can therefore coexist. Requests still use the reference `--parallel 1` policy, so simultaneous generation is serialized rather than creating multiple model slots.
 
-The listener on `127.0.0.1:8080` is authoritative. Shutdown verifies process identity through CIM, rechecks that the same PID still owns the listener, terminates it only when the evidence matches the configured runtime, then waits for the port to become free.
+When Qwen Code exits while chat remains open, idle cleanup reports:
 
-The startup PID may differ from the eventual listener PID.
+```text
+QWEN_SERVER_STATUS=KEPT_FOR_CHAT
+```
 
-A `SessionEnd` hook participates in normal cleanup; wrapper `finally` cleanup is the deterministic fallback.
+When the chat window closes while a CLI remains active, cleanup reports:
+
+```text
+QWEN_SERVER_STATUS=KEPT_FOR_CLI
+```
+
+When the last client exits, the stop path explicitly unloads the canonical model child through the router before terminating the router listener.
+
+The listener on the configured host/port remains authoritative for process identity. Shutdown verifies the listener owner through CIM, prefers exact executable-path validation, supports a strict legacy-model/router-preset command-line fallback, and waits for the port to become free.
+
+The startup PID may differ from the eventual router listener PID.
+
+The Qwen Code `SessionEnd` hook uses `-IfIdle`; wrapper cleanup is the deterministic fallback. The chat watcher owns an exclusive `chat.lock` and releases it only after sustained absence of the dedicated browser app process.
 ## Manual server commands
 
 ### Ensure the server is running
@@ -430,9 +530,12 @@ The reference environment was validated against Qwen Code 0.22.3.
 
 ## Reasoning mode
 
-The reference configuration uses role-specific logical model/provider profiles:
+The reference llama.cpp router exposes one canonical model ID plus three Qwen Code role aliases:
 
 ```text
+canonical chat model
+  ChatModelAlias = qwen3.8-27b-chat
+
 PROMPT
   ModelAlias = qwen3.8-27b-local
   PromptReasoningEffort = xhigh
@@ -446,11 +549,49 @@ TEST
   TestReasoningEffort = medium
 ```
 
-Each custom agent selects its logical provider through the `model:` field in its Markdown frontmatter.
+The canonical chat ID and all three role aliases resolve to the same physical GGUF.
+
+Each custom Qwen Code agent selects its role alias through the `model:` field in its Markdown frontmatter.
 
 For example:
 
 ```yaml
+# algorithm-agent.md
+model: qwen3.8-27b-algorithm
+```
+
+```yaml
+# test-agent.md
+model: qwen3.8-27b-test
+```
+
+The installer creates corresponding Qwen Code provider entries in `settings.json`. A role provider contains both the Qwen Code-side reasoning value and the explicit request-body override:
+
+```json
+"generationConfig": {
+  "reasoning": {
+    "effort": "medium"
+  },
+  "extra_body": {
+    "reasoning_effort": "medium"
+  }
+}
+```
+
+For the local OpenAI-compatible provider, `extra_body.reasoning_effort` is the explicit wire-level value sent to `llama.cpp`.
+
+The server-level configuration enables:
+
+```text
+--reasoning on
+--reasoning-effort xhigh
+--reasoning-budget -1
+--reasoning-preserve
+```
+
+The server-level `xhigh` setting is the fallback/default. PROMPT and ALGORITHM currently use `xhigh` requests; TEST overrides the server default with `medium`.
+
+Plain chat does not use the Qwen Code role-provider routing layer; it addresses the canonical `qwen3.8-27b-chat` router model directly.
 # algorithm-agent.md
 model: qwen3.8-27b-algorithm
 ```
@@ -606,6 +747,12 @@ in local configuration.
 
 Inspect the local server logs generated by the runtime scripts.
 
+### Chat closes the server while Qwen Code is still active
+
+The shared lifecycle uses client leases. Verify that the coding wrapper was used through `scripts\qwen.cmd` and that `~\.qwen\runtime_clients\cli\` contains a locked lease while Qwen Code is active.
+
+For chat, the watcher owns `~\.qwen\runtime_clients\chat.lock` while the dedicated browser app is open.
+
 ### Port 8080 is already occupied
 
 The server scripts will not blindly terminate the listener.
@@ -650,12 +797,16 @@ Then distinguish the intended data path:
 If PROMPT-memory persistence is missing, verify that `settings.json` has the `PreToolUse` `agent` carrier hook in addition to the shell-maintenance hook.
 ## Recommended entry point
 
-For normal use, prefer:
+For normal coding use, prefer:
 
 ```powershell
 .\scripts\qwen.cmd
 ```
 
-rather than starting Qwen Code or `llama-server` independently.
+For plain local chat without coding orchestration, use:
 
-That wrapper provides the complete patch verification, inference lifecycle, exit-code handling, and deterministic cleanup behavior.
+```powershell
+.\scripts\qwen.cmd chat
+```
+
+Do not start a second standalone llama.cpp server for the chat path. Both entry points intentionally share the same router and physical GGUF, with client leases controlling idle shutdown.
