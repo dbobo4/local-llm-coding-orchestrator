@@ -1,19 +1,23 @@
 # Compression tuning
 
-## Final production decision
+## Current production decision
 
 ```text
 Qwen Code: 0.22.3
-context window: 49152
+context window: 40960
 COMPACT_MAX_OUTPUT_TOKENS = 3072
-auto-compaction threshold = 33080
+auto-compaction threshold = 24888
 compaction reasoning = xhigh
 cache sharing = enabled / preserved
 ```
 
+The Qwen Code provider `generationConfig.contextWindowSize` is synchronized with the `40960` llama.cpp server context because compression thresholds are computed from the provider context window.
+
+The `3072` output cap was selected by the earlier controlled A/B/C tuning performed at a 49152-token context. The cap remains unchanged; the current automatic-compaction threshold is lower because the production context is now 40960.
+
 The compact state handoff contains `goal`, `durable_constraints`, `current_state`, `open_issues`, and `next_step`, targeting roughly 800-1500 tokens.
 
-## Why the cap was tuned
+## Historical 49152-context tuning basis
 
 The stock Qwen Code reserve was equivalent to `COMPACT_MAX_OUTPUT_TOKENS = 2e4`. At a 49152-token context window that produced an effective auto-compaction threshold of roughly 16152 tokens. The first local optimization reduced the cap to 4096, moving the threshold to 32056 and eliminating the observed rapid re-compaction behavior.
 

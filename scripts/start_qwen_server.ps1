@@ -21,6 +21,35 @@ if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
     $ChatModelAlias = "qwen3.8-27b-chat"
 }
 
+# Backward-compatible inference defaults for local.ps1 files created
+# before the unified benchmark/local override layer was added.
+$BenchmarkDefaults = [ordered]@{
+    ContextWindowSize = 40960
+    SpecDraftPMin = "0.025"
+    SpecNgramModNMin = 48
+    SpecNgramModNMax = 64
+    SpecNgramModNMatch = 16
+    CacheTypeK = "q8_0"
+    CacheTypeV = "q8_0"
+}
+
+foreach ($Entry in $BenchmarkDefaults.GetEnumerator()) {
+    if ($null -eq (Get-Variable -Name $Entry.Key -ErrorAction SilentlyContinue)) {
+        Set-Variable -Name $Entry.Key -Value $Entry.Value
+    }
+}
+
+if ([int]$ContextWindowSize -le 0) {
+    throw "ContextWindowSize must be a positive integer."
+}
+
+if ([double]::Parse(
+    [string]$SpecDraftPMin,
+    [System.Globalization.CultureInfo]::InvariantCulture
+) -lt 0.0) {
+    throw "SpecDraftPMin must be non-negative."
+}
+
 $RoleModelAliases = @(
     $ModelAlias
     $AlgorithmModelAlias
@@ -94,7 +123,7 @@ Write-Host "========================================"
 Write-Host "Model:    Qwen3.8-27B UD-Q3_K_XL + MTP2 + ngram-mod"
 Write-Host "Model ID: $ChatModelAlias"
 Write-Host "Aliases:  $($RoleModelAliases -join ', ')"
-Write-Host "Context:  49152"
+Write-Host ("Context:  " + $ContextWindowSize)
 Write-Host "Reason:   xhigh"
 Write-Host "API:      http://${ServerHost}:${ServerPort}/v1"
 Write-Host "========================================"
@@ -105,23 +134,23 @@ Write-Host ""
     --models-max 1 `
     --host $ServerHost `
     --port $ServerPort `
-    --ctx-size 49152 `
+    --ctx-size $ContextWindowSize `
     --parallel 1 `
     --n-gpu-layers 99 `
     --fit off `
     --spec-type draft-mtp,ngram-mod `
     --spec-draft-n-max 2 `
-    --spec-draft-p-min 0.025 `
-    --spec-ngram-mod-n-min 32 `
-    --spec-ngram-mod-n-max 64 `
-    --spec-ngram-mod-n-match 16 `
+    --spec-draft-p-min $SpecDraftPMin `
+    --spec-ngram-mod-n-min $SpecNgramModNMin `
+    --spec-ngram-mod-n-max $SpecNgramModNMax `
+    --spec-ngram-mod-n-match $SpecNgramModNMatch `
     --threads 20 `
     --threads-batch 20 `
     --spec-draft-threads 20 `
     --spec-draft-threads-batch 20 `
     --flash-attn on `
-    --cache-type-k q8_0 `
-    --cache-type-v q8_0 `
+    --cache-type-k $CacheTypeK `
+    --cache-type-v $CacheTypeV `
     --batch-size 1024 `
     --ubatch-size 512 `
     --jinja `

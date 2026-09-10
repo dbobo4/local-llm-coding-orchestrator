@@ -347,6 +347,30 @@ else {
     $settings = $template
 }
 
+# Keep managed provider context metadata synchronized with the
+# actual local llama.cpp context used by scripts\start_qwen_server.ps1.
+if ($null -eq (Get-Variable -Name ContextWindowSize -ErrorAction SilentlyContinue)) {
+    $ContextWindowSize = 40960
+}
+
+$ContextWindowSize = [int]$ContextWindowSize
+
+if ($ContextWindowSize -le 0) {
+    throw "ContextWindowSize must be a positive integer."
+}
+
+$ManagedProviderIds = @(
+    $ModelAlias
+    $AlgorithmModelAlias
+    $TestModelAlias
+)
+
+foreach ($Provider in @($settings.modelProviders.openai)) {
+    if ($ManagedProviderIds -contains $Provider.id) {
+        $Provider.generationConfig.contextWindowSize = $ContextWindowSize
+    }
+}
+
 $json = $settings | ConvertTo-Json -Depth 30
 [IO.File]::WriteAllText(
     $SettingsPath,
@@ -397,7 +421,7 @@ foreach ($expected in $expectedRoleProviders) {
 
     $provider = $matches[0]
 
-    if ($provider.generationConfig.contextWindowSize -ne 49152) {
+    if ($provider.generationConfig.contextWindowSize -ne $ContextWindowSize) {
         throw "Installation verification failed: $($expected.Role) context window"
     }
 

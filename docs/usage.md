@@ -337,7 +337,7 @@ Prompt-memory transport is also hidden from specialists: an eligible `<PROMPT_ME
 The reference model context window is:
 
 ```text
-49152 tokens
+40960 tokens
 ```
 
 Qwen Code session context still has normal context-window limits. Durable project memory and conversational compaction solve different problems.
@@ -346,8 +346,8 @@ The local runtime compression optimization uses:
 
 ```text
 COMPACT_MAX_OUTPUT_TOKENS = 3072
-AUTO_COMPACTION_THRESHOLD = 33080
-CONTEXT_WINDOW = 49152
+AUTO_COMPACTION_THRESHOLD = 24888
+CONTEXT_WINDOW = 40960
 
 <state_snapshot>
   <goal>
@@ -688,39 +688,36 @@ Before overwriting managed files, the installer creates a backup under the confi
 
 ## Benchmarking
 
-Benchmark execution is separate from ordinary coding use.
+Benchmark execution is optional and separate from ordinary coding use.
 
-Existing inference suites:
-
-```powershell
-.\benchmark\run_full_benchmark.ps1
-```
-
-and:
+There is one public benchmark entry point:
 
 ```powershell
-.\benchmark\run_pmin_verify.ps1
+.\benchmark\benchmark_qwen.ps1
 ```
 
-Historical machine-readable reference outputs remain under:
+With no switches it runs the full adaptive sequence automatically: preflight, NGRAM screening and real-agent gate, adaptive `p-min` comparison, Q8/Q8 context/KV selection and quality gate, optional Q8/Q5 capacity exploration, then the final recommendation.
+
+The result is a recommendation within the tested candidate set for the current machine; it is not a claim of a global optimum.
+
+The benchmark does not modify production configuration while testing. At the end it asks whether to apply the primary tested recommendation. Only an explicit `Y` transactionally updates the benchmark-tunable values in Git-ignored `config\local.ps1` and synchronizes the managed Qwen Code provider context-window metadata. Reasoning effort remains unchanged and is not auto-tuned.
+
+Temporary benchmark servers and workspaces are cleaned up on completion and error paths.
+
+Historical machine-readable reports from the earlier benchmark implementations remain under:
 
 ```text
 results\reference\
 ```
 
-The later orchestration-efficiency validation used a fresh FastAPI implementation task and compared:
+For a preflight-only environment check:
 
-```text
-387178  pre-efficiency patch
-340769  after ALGORITHM efficiency rules
-262032  after ALGORITHM + TEST efficiency rules
+```powershell
+.\benchmark\benchmark_qwen.ps1 -PreflightOnly
 ```
 
-All three numbers are cumulative request-token metrics and therefore include repeated/cached prefixes. The final `262032` run retained independent TEST PASS.
+See [Benchmarking](benchmarking.md) for methodology, candidate-selection rules, historical reference measurements, and interpretation.
 
-Compression was validated separately because the fresh FastAPI efficiency run had zero compactions.
-
-See [Benchmarking](benchmarking.md) for methodology and interpretation.
 ## Troubleshooting
 
 ### Qwen Code does not start

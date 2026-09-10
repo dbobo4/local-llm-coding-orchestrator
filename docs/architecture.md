@@ -296,7 +296,7 @@ The production compression path now uses:
 ```text
 COMPACT_MAX_OUTPUT_TOKENS = 3072
 
-context window = 49152
+context window = 40960
 auto-compaction threshold = 33080
 
 request directive
@@ -792,7 +792,7 @@ Reference inference settings:
 ```text
 models-max = 1
 parallel = 1
-context = 49152
+context = 40960
 GPU layers = 99
 fit = off
 Flash Attention = on

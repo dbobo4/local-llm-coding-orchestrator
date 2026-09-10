@@ -20,3 +20,13 @@ $AlgorithmReasoningEffort = "xhigh"
 $TestReasoningEffort = "medium"
 $ServerHost = "127.0.0.1"
 $ServerPort = 8080
+
+# Benchmark-tunable inference settings.
+# The unified benchmark may update only these local values after explicit approval.
+$ContextWindowSize = 40960
+$SpecDraftPMin = "0.025"
+$SpecNgramModNMin = 48
+$SpecNgramModNMax = 64
+$SpecNgramModNMatch = 16
+$CacheTypeK = "q8_0"
+$CacheTypeV = "q8_0"

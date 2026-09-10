@@ -66,57 +66,87 @@ Reference SHA256:
 
 The model weights are not included in this repository.
 
-## Benchmark files
+## Benchmark file
 
-Implementation:
+The current public implementation is a single PowerShell runner:
 
 ```text
 benchmark/
-├── qwen_full_auto_benchmark_v4.py
-├── qwen_pmin_final_verify_49k_v2.py
-├── run_full_benchmark.ps1
-└── run_pmin_verify.ps1
+└── benchmark_qwen.ps1
 ```
 
-Reference outputs:
+The previous split Python/wrapper benchmark implementation has been retired from the runnable public surface.
+
+Its historical machine-readable reports remain under:
 
 ```text
 results/reference/
 ```
 
-New locally generated output:
+Those reports are retained as provenance and tuning evidence; the unified runner does not rewrite them.
 
-```text
-results/generated/
-```
+## Unified adaptive benchmark
 
-`results/generated/` is excluded from Git.
-
-## Full automated benchmark
-
-Run:
+Run the complete benchmark with:
 
 ```powershell
-.\benchmark\run_full_benchmark.ps1
+.\benchmark\benchmark_qwen.ps1
 ```
 
-The runner obtains installation paths and endpoint configuration from:
+Machine-specific paths, aliases, endpoint information, and benchmark-tunable production values are obtained from:
 
 ```text
 config/local.ps1
 ```
 
-The Python benchmark receives machine-specific paths through environment/configuration rather than embedding the reference machine's private paths in the public source.
+The default invocation is non-interactive during measurement. It executes the stages sequentially and asks for user input only after the final recommendation has been produced.
 
-## Final p-min verification
+Pipeline:
 
-Run:
-
-```powershell
-.\benchmark\run_pmin_verify.ps1
+```text
+preflight
+-> NGRAM candidates
+   -> synthetic screening
+   -> real-agent quality gate
+-> p-min candidates
+   -> repeated real-agent measurements
+   -> adaptive escalation when results are noisy or close
+-> Q8/Q8 context candidates
+   -> VRAM/capacity checks
+   -> real-agent quality gate for the selected primary context
+-> Q8/Q5 extended-context candidates
+   -> capacity-only optional result
+-> final primary recommendation
+-> explicit Y/N apply prompt
 ```
 
-This benchmark focuses on the final 49k-context configuration and compares the selected `p-min` candidates using repeated agent workloads.
+The primary result is the recommended quality-gated configuration within the tested candidate set. The runner does not claim a global optimum.
+
+During measurement, production configuration is read-only. After an explicit `Y`, only this tested whitelist is written transactionally to Git-ignored `config/local.ps1`:
+
+```text
+ContextWindowSize
+SpecDraftPMin
+SpecNgramModNMin
+SpecNgramModNMax
+SpecNgramModNMatch
+CacheTypeK
+CacheTypeV
+```
+
+The same transaction synchronizes the three managed Qwen Code provider `generationConfig.contextWindowSize` values so Qwen Code context accounting and compression use the same limit as llama.cpp.
+
+Reasoning effort is report-only and unchanged. The runner does not auto-apply role-specific reasoning changes. Thread counts, batch size, and ubatch size likewise remain the established baseline.
+
+The optional Q8/Q5 maximum-context result is capacity-only unless separately quality-gated; it is not auto-applied as the primary recommendation.
+
+The benchmark uses isolated temporary servers/workspaces and cleans temporary artifacts on success and failure paths. The validated interruption path also cleans the benchmark listener and workspace.
+
+A fast environment check without benchmark workloads uses the same file:
+
+```powershell
+.\benchmark\benchmark_qwen.ps1 -PreflightOnly
+```
 
 ## What the benchmark is optimizing
 
@@ -159,23 +189,15 @@ Alternative runtime paths were tested during development, but the final benchmar
 
 ## Context and KV-cache selection
 
-The quality-oriented reference configuration uses:
+The current quality-oriented reference configuration uses:
 
 ```text
-context = 49152
+context = 40960
 KV cache K = q8_0
 KV cache V = q8_0
 ```
 
-A larger reference configuration was technically possible with:
-
-```text
-context = 65536
-K = q8_0
-V = q5_0
-```
-
-but the final system uses the 49,152-token Q8/Q8 configuration as the quality-first operating point.
+The unified adaptive benchmark also reports larger Q8/Q5 context candidates when they pass the VRAM-capacity gate. Those are capacity-only candidates and are not automatically applied without the real-agent quality gate.
 
 ## Speculative decoding
 
@@ -223,16 +245,16 @@ lower end-to-end latency
 Selected ngram configuration:
 
 ```text
-n-min = 32
+n-min = 48
 n-max = 64
 n-match = 16
 ```
 
 This was the winner of the automated ngram comparison used by the final benchmark pipeline.
 
-## Reasoning-effort comparison
+## Historical reasoning-effort comparison
 
-The final benchmark directly compared:
+The earlier benchmark directly compared:
 
 ```text
 xhigh
@@ -371,9 +393,9 @@ approximately 34772
 Execution then continued to independent TEST PASS with 9 tests passing.
 
 This supports the local compression optimization as a fix for the prior low-threshold/re-compaction behavior, but it is not a raw inference-throughput benchmark.
-## Final p-min comparison
+## Historical final p-min comparison
 
-The final verification compared:
+The historical dedicated p-min verification compared:
 
 ```text
 p-min = 0
@@ -504,7 +526,7 @@ Model:
   Qwen3.8-27B-UD-Q3_K_XL.gguf
 
 Context:
-  49152
+  40960
 
 Parallel:
   1
@@ -573,7 +595,7 @@ Reasoning preserve:
 
 ## Benchmark interpretation
 
-The benchmark suite contains both synthetic inference measurements and real-agent workflow measurements.
+The unified benchmark combines synthetic inference measurements with real-agent workflow measurements; the sections below also retain historical tuning evidence.
 
 Synthetic throughput is useful for diagnosing raw inference behavior.
 
@@ -616,7 +638,7 @@ Therefore:
 - the repository does not add a compatibility patch merely to bypass Qwen Code headless safety policy.
 
 This prevents CLI permission semantics from being confused with the orchestration role design.
-## Reproducing the results
+## Running the current benchmark
 
 First configure:
 
@@ -624,23 +646,19 @@ First configure:
 config/local.ps1
 ```
 
-Then run:
+Then run the single unified entry point:
 
 ```powershell
-.\benchmark\run_full_benchmark.ps1
+.\benchmark\benchmark_qwen.ps1
 ```
 
-For final `p-min` comparison:
+The runner uses the configured local model, llama.cpp runtime, Qwen Code installation, endpoint, and local production baseline.
 
-```powershell
-.\benchmark\run_pmin_verify.ps1
-```
+Hardware, drivers, model builds, llama.cpp builds, and Qwen Code versions can materially change the outcome, so exact numeric reproduction should not be expected on different machines.
 
-The benchmark scripts use the configured local model, llama.cpp runtime, Qwen Code installation, endpoint, and test workspace.
+The reproducible part is the methodology: fixed candidate sets, explicit quality gates, adaptive repeated measurements where needed, context-capacity constraints, a final recommendation within the tested candidate set, and no configuration change before explicit approval.
 
-Hardware, drivers, model builds, llama.cpp builds, and Qwen Code versions can change performance, so exact numeric reproduction should not be expected on different machines.
-
-The methodology, configuration capture, and relative comparison process are the reproducible parts.
+The historical reports under `results/reference/` were produced by the earlier benchmark implementations. They remain useful as provenance and comparison data but are not fresh output from `benchmark_qwen.ps1`.
 
 ## Reference reports
 

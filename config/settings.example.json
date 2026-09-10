@@ -9,7 +9,7 @@
         "baseUrl": "http://127.0.0.1:8080/v1",
         "generationConfig": {
           "timeout": 0,
-          "contextWindowSize": 49152,
+          "contextWindowSize": 40960,
           "reasoning": {
             "effort": "xhigh"
           },
@@ -26,7 +26,7 @@
         "baseUrl": "http://127.0.0.1:8080/v1",
         "generationConfig": {
           "timeout": 0,
-          "contextWindowSize": 49152,
+          "contextWindowSize": 40960,
           "reasoning": {
             "effort": "xhigh"
           },
@@ -43,7 +43,7 @@
         "baseUrl": "http://127.0.0.1:8080/v1",
         "generationConfig": {
           "timeout": 0,
-          "contextWindowSize": 49152,
+          "contextWindowSize": 40960,
           "reasoning": {
             "effort": "medium"
           },

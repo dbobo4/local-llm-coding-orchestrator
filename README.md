@@ -273,10 +273,7 @@ For the complete `SessionStart` ? PROMPT ? ALGORITHM ? TEST ? `Stop` ? server-cl
 ```text
 local-llm-coding-orchestrator/
 ├── benchmark/
-│   ├── qwen_full_auto_benchmark_v4.py
-│   ├── qwen_pmin_final_verify_49k_v2.py
-│   ├── run_full_benchmark.ps1
-│   └── run_pmin_verify.ps1
+│   └── benchmark_qwen.ps1
 │
 ├── config/
 │   ├── local.example.ps1
@@ -564,7 +561,7 @@ Model:
   Qwen3.8-27B-UD-Q3_K_XL.gguf
 
 Context:
-  49152
+  40960
 
 Parallel:
   1
@@ -609,7 +606,7 @@ p-min:
   0.025
 
 Ngram:
-  n-min 32
+  n-min 48
   n-max 64
   n-match 16
 
@@ -743,10 +740,10 @@ COMPACT_MAX_OUTPUT_TOKENS
   -> first production optimization 4096
   -> final production 3072
 
-auto-compaction threshold at 49152 context
-  stock approximately 16152
-  -> 4096 cap: 32056
-  -> final 3072 cap: 33080
+auto-compaction threshold at 40960 context
+  stock approximately 7960
+  -> 4096 cap: 23864
+  -> final 3072 cap: 24888
 
 compression directive
   analysis + large historical summary
@@ -931,7 +928,7 @@ largest isolated tok/s number
 
 See [Benchmark methodology and results](docs/benchmarking.md).
 
-## Selected benchmark results
+## Historical benchmark results and tuning evidence
 
 ### Reasoning effort
 
@@ -1025,27 +1022,43 @@ Selection rule:
 Therefore `p-min = 0.025` remains the reference setting.
 
 Machine-readable historical benchmark reports remain under `results/reference/`.
-## Running the benchmarks
+## Running the benchmark
 
-Full automated benchmark:
-
-```powershell
-.\benchmark\run_full_benchmark.ps1
-```
-
-Final 49k-context `p-min` verification:
+The repository exposes one optional benchmark entry point:
 
 ```powershell
-.\benchmark\run_pmin_verify.ps1
+.\benchmark\benchmark_qwen.ps1
 ```
 
-Generated benchmark output is written under:
+Running it without switches executes the complete adaptive pipeline sequentially:
 
 ```text
-results/generated/
+preflight
+-> NGRAM candidate screening + real-agent quality gate
+-> adaptive p-min comparison
+-> Q8/Q8 context/KV capacity scan + real-agent quality gate
+-> optional Q8/Q5 maximum-context capacity scan
+-> final recommendation
+-> explicit Y/N apply prompt
 ```
 
-and excluded from Git.
+The benchmark does not claim a universal or global optimum. It reports the recommended primary configuration within the tested candidate set for the current machine and software stack.
+
+No production configuration is changed during measurement. Only after an explicit `Y` does the benchmark transactionally update the benchmark-tunable values in Git-ignored `config/local.ps1` and synchronize the managed Qwen Code provider `contextWindowSize` metadata. A declined apply leaves production configuration unchanged.
+
+Reasoning effort, thread counts, batch size, and ubatch size remain unchanged established settings. The unified benchmark does not auto-tune the PROMPT / ALGORITHM / TEST reasoning policy.
+
+A larger Q8/Q5 context may be reported as an optional capacity-only candidate. It is not treated as quality-gated and is not auto-applied as the primary configuration.
+
+The benchmark uses isolated server/workspace state and removes its temporary artifacts during normal completion, errors, and interruption cleanup.
+
+For a quick environment-only check without workloads:
+
+```powershell
+.\benchmark\benchmark_qwen.ps1 -PreflightOnly
+```
+
+Historical machine-readable reports under `results/reference/` are retained as tuning evidence from the earlier benchmark implementations; they are not outputs of the current unified runner.
 
 ## Documentation
 
