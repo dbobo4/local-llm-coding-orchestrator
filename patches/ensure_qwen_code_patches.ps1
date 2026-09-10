@@ -13,10 +13,10 @@ $ChunksRoot = Join-Path $QwenCodeRoot "lib\chunks"
 $BackupRoot = Join-Path $QwenRoot "backups\qwen-code-patches"
 
 $KnownValidatedPatchedSha256 =
-    "662A99EB4C5B80CADE456856754AA9D4B5A005033AF4B6D4228557E237C45DF4"
+    "8854D92C278AD63603C1E2695A2BE74B198A7D3AB3358074E0FAEAA9CF36AA8D"
 
 $KnownValidatedNormalizedSha256 =
-    "A326F41C11DD99E30A3FEA26A2FCF2C4E6B69118EC81D8A47ACF1B072746AE70"
+    "C701EF0FDF6AD974DE89A5F00C18527D4CCD7BD17F48AA95AE63E0CE0B81A3CE"
 
 if (-not (Test-Path $ChunksRoot -PathType Container)) {
     throw "Qwen Code chunks directory not found: $ChunksRoot"
@@ -605,9 +605,13 @@ function Get-CompressionOptimizationSpec {
             ConvertFrom-CompressionBase64 `
                 -Value "dmFyIENPTVBBQ1RfTUFYX09VVFBVVF9UT0tFTlMgPSAyZTQ7"
 
-        PatchedCap =
+        LegacyCap =
             ConvertFrom-CompressionBase64 `
                 -Value "dmFyIENPTVBBQ1RfTUFYX09VVFBVVF9UT0tFTlMgPSA0MDk2Ow=="
+
+        PatchedCap =
+            ConvertFrom-CompressionBase64 `
+                -Value "dmFyIENPTVBBQ1RfTUFYX09VVFBVVF9UT0tFTlMgPSAzMDcyOw=="
 
         UnpatchedDirective =
             ConvertFrom-CompressionBase64 `
@@ -631,97 +635,64 @@ function Get-CompressionOptimizationState {
         $spec.PromptStartMarker,
         [System.StringComparison]::Ordinal
     )
-
-    if ($promptStart -lt 0) {
-        return "incompatible"
-    }
+    if ($promptStart -lt 0) { return "incompatible" }
 
     $secondPromptStart = $Text.IndexOf(
         $spec.PromptStartMarker,
         $promptStart + $spec.PromptStartMarker.Length,
         [System.StringComparison]::Ordinal
     )
-
-    if ($secondPromptStart -ge 0) {
-        return "incompatible"
-    }
+    if ($secondPromptStart -ge 0) { return "incompatible" }
 
     $promptEnd = $Text.IndexOf(
         $spec.PromptEndMarker,
         $promptStart,
         [System.StringComparison]::Ordinal
     )
-
-    if ($promptEnd -lt 0) {
-        return "incompatible"
-    }
+    if ($promptEnd -lt 0) { return "incompatible" }
 
     $secondPromptEnd = $Text.IndexOf(
         $spec.PromptEndMarker,
         $promptEnd + $spec.PromptEndMarker.Length,
         [System.StringComparison]::Ordinal
     )
-
-    if ($secondPromptEnd -ge 0) {
-        return "incompatible"
-    }
+    if ($secondPromptEnd -ge 0) { return "incompatible" }
 
     $promptEnd += $spec.PromptEndMarker.Length
+    $promptRegion = $Text.Substring($promptStart, $promptEnd - $promptStart)
 
-    $promptRegion = $Text.Substring(
-        $promptStart,
-        $promptEnd - $promptStart
-    )
-
-    $unpatchedCapCount =
-        ([regex]::Matches(
-            $Text,
-            [regex]::Escape($spec.UnpatchedCap)
-        )).Count
-
-    $patchedCapCount =
-        ([regex]::Matches(
-            $Text,
-            [regex]::Escape($spec.PatchedCap)
-        )).Count
-
-    $unpatchedDirectiveCount =
-        ([regex]::Matches(
-            $Text,
-            [regex]::Escape(
-                $spec.UnpatchedDirective
-            )
-        )).Count
-
-    $patchedDirectiveCount =
-        ([regex]::Matches(
-            $Text,
-            [regex]::Escape(
-                $spec.PatchedDirective
-            )
-        )).Count
-
-    $isPatched =
-        $promptRegion -eq $spec.PatchedPrompt -and
-        $patchedCapCount -eq 1 -and
-        $patchedDirectiveCount -eq 1 -and
-        $unpatchedCapCount -eq 0 -and
-        $unpatchedDirectiveCount -eq 0
-
-    if ($isPatched) {
-        return "patched"
-    }
+    $unpatchedCapCount = ([regex]::Matches($Text, [regex]::Escape($spec.UnpatchedCap))).Count
+    $legacyCapCount = ([regex]::Matches($Text, [regex]::Escape($spec.LegacyCap))).Count
+    $patchedCapCount = ([regex]::Matches($Text, [regex]::Escape($spec.PatchedCap))).Count
+    $unpatchedDirectiveCount = ([regex]::Matches($Text, [regex]::Escape($spec.UnpatchedDirective))).Count
+    $patchedDirectiveCount = ([regex]::Matches($Text, [regex]::Escape($spec.PatchedDirective))).Count
 
     $isUnpatched =
         $promptRegion -eq $spec.UnpatchedPrompt -and
         $unpatchedCapCount -eq 1 -and
-        $unpatchedDirectiveCount -eq 1 -and
+        $legacyCapCount -eq 0 -and
         $patchedCapCount -eq 0 -and
+        $unpatchedDirectiveCount -eq 1 -and
         $patchedDirectiveCount -eq 0
+    if ($isUnpatched) { return "unpatched" }
 
-    if ($isUnpatched) {
-        return "unpatched"
-    }
+    $isLegacy =
+        $promptRegion -eq $spec.PatchedPrompt -and
+        $unpatchedCapCount -eq 0 -and
+        $legacyCapCount -eq 1 -and
+        $patchedCapCount -eq 0 -and
+        $unpatchedDirectiveCount -eq 0 -and
+        $patchedDirectiveCount -eq 1
+    if ($isLegacy) { return "legacy" }
+
+    $isPatched =
+        $promptRegion -eq $spec.PatchedPrompt -and
+        $unpatchedCapCount -eq 0 -and
+        $legacyCapCount -eq 0 -and
+        $patchedCapCount -eq 1 -and
+        $unpatchedDirectiveCount -eq 0 -and
+        $patchedDirectiveCount -eq 1
+    if ($isPatched) { return "patched" }
 
     return "incompatible"
 }
@@ -732,62 +703,36 @@ function Apply-CompressionOptimization {
         [string]$Text
     )
 
-    $initialState =
-        Get-CompressionOptimizationState $Text
+    $initialState = Get-CompressionOptimizationState $Text
+    if ($initialState -eq "patched") { return $Text }
 
-    if ($initialState -ne "unpatched") {
-        throw (
-            "Compression optimization input is not " +
-            "safely unpatched."
-        )
+    if ($initialState -ne "unpatched" -and $initialState -ne "legacy") {
+        throw "Compression optimization input is not a known safe state."
     }
 
     $spec = Get-CompressionOptimizationSpec $Text
 
-    $promptStart = $Text.IndexOf(
-        $spec.PromptStartMarker,
-        [System.StringComparison]::Ordinal
-    )
-
-    $promptEnd = $Text.IndexOf(
-        $spec.PromptEndMarker,
-        $promptStart,
-        [System.StringComparison]::Ordinal
-    )
-
-    if ($promptStart -lt 0 -or $promptEnd -lt 0) {
-        throw (
-            "Compression prompt boundaries not found."
-        )
+    if ($initialState -eq "legacy") {
+        $legacyCount = ([regex]::Matches($Text, [regex]::Escape($spec.LegacyCap))).Count
+        if ($legacyCount -ne 1) { throw "Compression legacy cap is not unique." }
+        $Text = $Text.Replace($spec.LegacyCap, $spec.PatchedCap)
+    }
+    else {
+        $promptStart = $Text.IndexOf($spec.PromptStartMarker, [System.StringComparison]::Ordinal)
+        $promptEnd = $Text.IndexOf($spec.PromptEndMarker, $promptStart, [System.StringComparison]::Ordinal)
+        if ($promptStart -lt 0 -or $promptEnd -lt 0) {
+            throw "Compression prompt boundaries not found."
+        }
+        $promptEnd += $spec.PromptEndMarker.Length
+        $Text = $Text.Substring(0, $promptStart) + $spec.PatchedPrompt + $Text.Substring($promptEnd)
+        $Text = $Text.Replace($spec.UnpatchedCap, $spec.PatchedCap)
+        $Text = $Text.Replace($spec.UnpatchedDirective, $spec.PatchedDirective)
     }
 
-    $promptEnd += $spec.PromptEndMarker.Length
-
-    $Text =
-        $Text.Substring(0, $promptStart) +
-        $spec.PatchedPrompt +
-        $Text.Substring($promptEnd)
-
-    $Text = $Text.Replace(
-        $spec.UnpatchedCap,
-        $spec.PatchedCap
-    )
-
-    $Text = $Text.Replace(
-        $spec.UnpatchedDirective,
-        $spec.PatchedDirective
-    )
-
-    $finalState =
-        Get-CompressionOptimizationState $Text
-
+    $finalState = Get-CompressionOptimizationState $Text
     if ($finalState -ne "patched") {
-        throw (
-            "Compression optimization post-state " +
-            "is not patched."
-        )
+        throw "Compression optimization post-state is not patched. Final=$finalState"
     }
-
     return $Text
 }
 
@@ -888,7 +833,8 @@ if (
     ($patch2State -ne "patched" -and $patch2State -ne "unpatched") -or
     (
         $compressionState -ne "patched" -and
-        $compressionState -ne "unpatched"
+        $compressionState -ne "unpatched" -and
+        $compressionState -ne "legacy"
     )
 ) {
     throw "QWEN_PATCH_STATUS=INCOMPATIBLE. Unexpected patch state."
@@ -917,7 +863,10 @@ try {
         $state.Text = Apply-Patch2 $state.Text
     }
 
-    if ($compressionState -eq "unpatched") {
+    if (
+        $compressionState -eq "unpatched" -or
+        $compressionState -eq "legacy"
+    ) {
         $state = $fileState[$compressionFile]
         $state.Text =
             Apply-CompressionOptimization $state.Text

@@ -276,19 +276,47 @@ This is required for both controlled maintenance rewrites and reliable prompt-me
 
 ### Compression optimization
 
-This is documented separately because it is an optimization rather than a compatibility prerequisite.
+This remains deliberately separate from the two compatibility patches.
 
-It reduces the compression output cap from the original `2e4` form to `4096`, requests a compact `<state_snapshot>` directly, and retains only:
+The production compression path now uses:
 
 ```text
-goal
-durable_constraints
-current_state
-open_issues
-next_step
+COMPACT_MAX_OUTPUT_TOKENS = 3072
+
+context window = 49152
+auto-compaction threshold = 33080
+
+request directive
+  direct compact <state_snapshot>
+  no requested <analysis> block
+
+state snapshot
+  goal
+  durable_constraints
+  current_state
+  open_issues
+  next_step
 ```
 
-The target is roughly 800?1500 summary tokens.
+The patcher recognizes four compression states:
+
+```text
+unpatched
+  stock Qwen prompt/directive + 2e4 cap
+
+legacy
+  optimized prompt/directive + 4096 cap
+
+patched
+  optimized prompt/directive + 3072 cap
+
+incompatible
+  unknown or mixed state -> fail closed
+```
+
+The final 3072 cap was selected after exact 4096/3072/2048 runs plus strict semantic-retention validation. All tested caps passed the semantic checks; 2048 was not selected because its observed summary-output headroom was materially smaller. Production compaction reasoning remains `xhigh`; the tested medium override degraded cache sharing.
+
+See [Compression tuning](compression_tuning.md) for the measured results.
 
 ### Patch safety
 

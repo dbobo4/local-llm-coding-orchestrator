@@ -271,7 +271,9 @@ Qwen Code session context still has normal context-window limits. Durable projec
 The local runtime compression optimization uses:
 
 ```text
-COMPACT_MAX_OUTPUT_TOKENS = 4096
+COMPACT_MAX_OUTPUT_TOKENS = 3072
+AUTO_COMPACTION_THRESHOLD = 33080
+CONTEXT_WINDOW = 49152
 
 <state_snapshot>
   <goal>
@@ -282,9 +284,13 @@ COMPACT_MAX_OUTPUT_TOKENS = 4096
 </state_snapshot>
 ```
 
-The summary targets roughly 800?1500 tokens and omits full messages, long code, routine tool calls, and transient exploration.
+The summary targets roughly 800-1500 tokens and omits full messages, long code, routine tool calls, and transient exploration.
+
+The runtime manager accepts the previous optimized `4096` state as `legacy` and migrates it to the current `3072` state. Unknown or mixed compression structures fail closed.
 
 Durable memory persists selected stable facts across sessions; compaction preserves only enough active execution state to continue the current conversation.
+
+Measured 4096/3072/2048 results and the semantic-retention checks are documented in [Compression tuning](compression_tuning.md).
 ## Interactive versus headless execution
 
 This distinction matters for tool permissions.
@@ -504,6 +510,12 @@ known compatible unpatched
     -> backup
     -> apply required compatibility changes
     -> apply compression optimization
+    -> node --check
+    -> post-validate
+
+known legacy compression state
+    -> optimized prompt/directive already present
+    -> migrate 4096 cap to 3072
     -> node --check
     -> post-validate
 

@@ -652,11 +652,18 @@ This is required both for controlled maintenance behavior and for the prompt-mem
 
 Compression is a separate local optimization layer rather than a compatibility patch.
 
-For the current Qwen Code 0.22.3 runtime it changes:
+For the current Qwen Code 0.22.3 runtime the production path is:
 
 ```text
 COMPACT_MAX_OUTPUT_TOKENS
-  20000-equivalent -> 4096
+  stock 2e4 / 20000
+  -> first production optimization 4096
+  -> final production 3072
+
+auto-compaction threshold at 49152 context
+  stock approximately 16152
+  -> 4096 cap: 32056
+  -> final 3072 cap: 33080
 
 compression directive
   analysis + large historical summary
@@ -671,42 +678,12 @@ state snapshot
   next_step
 ```
 
-The target snapshot is roughly 800?1500 tokens and omits full messages, long source listings, routine tool calls, and transient exploration.
+The target snapshot is roughly 800-1500 tokens and omits full messages, long source listings, routine tool calls, and transient exploration.
 
-The patch manager is:
+The final cap was selected after exact 4096/3072/2048 compaction runs and strict semantic-retention tests. All three tested caps preserved the required state semantics, but 3072 was selected as the production balance between later compaction and output-budget safety headroom. Production compaction keeps `xhigh` reasoning because the tested medium override materially reduced cache sharing.
 
-```text
-patches/ensure_qwen_code_patches.ps1
-```
+See [Compression tuning](docs/compression_tuning.md) for the measured A/B/C results and final decision.
 
-It operates fail-closed:
-
-```text
-known patched state
-    -> verify / no-op
-
-known compatible unpatched state
-    -> backup
-    -> patch
-    -> JavaScript syntax check
-    -> post-validate
-
-mixed or unknown state
-    -> fail closed
-    -> modify nothing
-```
-
-Validated current Qwen Code 0.22.3 patched baselines:
-
-```text
-CRLF byte SHA256
-  662A99EB4C5B80CADE456856754AA9D4B5A005033AF4B6D4228557E237C45DF4
-
-newline-normalized SHA256
-  A326F41C11DD99E30A3FEA26A2FCF2C4E6B69118EC81D8A47ACF1B072746AE70
-```
-
-The normalized baseline allows semantically identical LF and CRLF runtime files to be distinguished from genuinely different runtime content without forcing newline conversion.
 ## Interactive and headless permission semantics
 
 Normal production use is interactive:
