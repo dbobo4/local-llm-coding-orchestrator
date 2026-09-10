@@ -327,10 +327,11 @@ patched
     -> validate / no-op
 
 known unpatched
-    -> backup
+    -> create transient rollback snapshot
     -> transform
     -> node --check
     -> post-validate
+    -> delete snapshot on success
 
 mixed / unknown
     -> fail closed
@@ -348,6 +349,9 @@ A326F41C11DD99E30A3FEA26A2FCF2C4E6B69118EC81D8A47ACF1B072746AE70
 ```
 
 The normalized hash permits equivalent LF/CRLF runtime content while still rejecting unknown semantic structures.
+
+The rollback snapshot exists only for the active patch transaction. If patching or validation fails, the patcher restores the original runtime files from that snapshot and removes it before failing. After successful post-validation, the snapshot is deleted. Persistent patch-backup retention is therefore zero.
+
 ## Project identity
 
 Durable state only works correctly if unrelated directories do not collapse into the same project.

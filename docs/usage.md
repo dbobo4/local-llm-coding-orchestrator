@@ -507,11 +507,12 @@ known patched
     -> validate and continue
 
 known compatible unpatched
-    -> backup
+    -> create transient rollback snapshot
     -> apply required compatibility changes
     -> apply compression optimization
     -> node --check
     -> post-validate
+    -> delete snapshot on success
 
 known legacy compression state
     -> optimized prompt/directive already present
@@ -523,6 +524,8 @@ mixed or unknown
     -> fail closed
     -> modify nothing
 ```
+
+The patch rollback snapshot is transactional rather than historical. A failed patch restores the original runtime from the snapshot and then removes it; a successful post-validation also removes the snapshot. Persistent patch-backup retention is zero.
 
 Do not force the transformations onto an unsupported runtime. Re-audit the changed Qwen Code implementation and update the semantic fingerprints deliberately.
 ## Installer behavior on an existing Qwen setup

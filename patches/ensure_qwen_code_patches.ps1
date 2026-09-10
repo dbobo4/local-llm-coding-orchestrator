@@ -850,7 +850,7 @@ foreach ($path in $runtimeFiles) {
     Copy-Item $path $backupPath -Force
 }
 
-Write-Host "Backup:       $backupDir"
+Write-Host "Transient backup: $backupDir"
 
 try {
     if ($patch1State -eq "unpatched") {
@@ -932,6 +932,15 @@ try {
         )
     }
 
+    if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        Remove-Item `
+            -LiteralPath $backupDir `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop
+    }
+
+    Write-Host "BACKUP_RETENTION=TRANSIENT_ONLY"
     Write-Host "QWEN_PATCH_STATUS=APPLIED"
 }
 catch {
@@ -944,6 +953,14 @@ catch {
         if (Test-Path $backupPath -PathType Leaf) {
             Copy-Item $backupPath $path -Force
         }
+    }
+
+    if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        Remove-Item `
+            -LiteralPath $backupDir `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
     }
 
     throw
