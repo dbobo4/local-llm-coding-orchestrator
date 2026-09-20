@@ -298,7 +298,7 @@ local-llm-coding-orchestrator/
 │       └── test-agent.md
 │
 ├── patches/
-│   └── ensure_qwen_code_patches.ps1
+│   └── qwen_runtime_patches.ps1
 │
 ├── results/
 │   └── reference/
@@ -306,14 +306,13 @@ local-llm-coding-orchestrator/
 │       └── pmin_final_verify_49k/
 │
 ├── scripts/
-│   ├── ensure_qwen_server.ps1
 │   ├── install_orchestrator.ps1
 │   ├── qwen.cmd
 │   ├── qwen.ps1
 │   ├── qwen_chat.ps1
-│   ├── watch_qwen_chat.ps1
-│   ├── start_qwen_server.ps1
-│   └── stop_qwen_server.ps1
+│   ├── qwen_server.ps1
+│   ├── qwen_update.ps1
+│   └── watch_qwen_chat.ps1
 │
 ├── .gitignore
 ├── LICENSE

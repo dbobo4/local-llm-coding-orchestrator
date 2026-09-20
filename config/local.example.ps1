@@ -10,6 +10,7 @@ $OrchestrationRoot = if ($env:ORCHESTRATION_ROOT) { $env:ORCHESTRATION_ROOT } el
 $QwenCodeCli = Join-Path $QwenCodeRoot "bin\qwen.cmd"
 $LlamaServerExe = Join-Path $LlamaCppRoot "llama-server.exe"
 
+# qwen_server.ps1 derives config\qwen_models.ini from these model settings; do not maintain the generated INI separately.
 $ModelAlias = "qwen3.8-27b-local"
 $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
 $TestModelAlias = "qwen3.8-27b-test"

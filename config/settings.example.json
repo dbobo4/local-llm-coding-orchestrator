@@ -55,7 +55,7 @@
     ]
   },
   "env": {
-    "LOCAL_QWEN_API_KEY": "local"
+    "LOCAL_QWEN_API_KEY": "<REDACTED_SECRET_VALUE>"
   },
   "security": {
     "auth": {
@@ -151,7 +151,7 @@
           },
           {
             "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"<REPO_ROOT>\\scripts\\stop_qwen_server.ps1\" -IfIdle",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"<QWEN_ROOT>\\config\\qwen_server.ps1\" -Action Stop -IfIdle",
             "name": "qwen-server-stop",
             "description": "Stop local llama.cpp server after Qwen session cleanup",
             "timeout": 10000,

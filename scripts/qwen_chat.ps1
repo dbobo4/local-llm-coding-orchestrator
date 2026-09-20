@@ -13,21 +13,16 @@ if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
     $ChatModelAlias = "qwen3.8-27b-chat"
 }
 
-$EnsureServer = Join-Path `
-    $PSScriptRoot `
-    "ensure_qwen_server.ps1"
-
-$StopServer = Join-Path `
-    $PSScriptRoot `
-    "stop_qwen_server.ps1"
+$ServerManager = Join-Path `
+    $QwenRoot `
+    "config\qwen_server.ps1"
 
 $Watcher = Join-Path `
     $PSScriptRoot `
     "watch_qwen_chat.ps1"
 
 foreach ($required in @(
-    $EnsureServer,
-    $StopServer,
+    $ServerManager,
     $Watcher
 )) {
     if (-not (Test-Path $required -PathType Leaf)) {
@@ -249,7 +244,8 @@ Out-Null
 & powershell.exe `
     -NoProfile `
     -ExecutionPolicy Bypass `
-    -File $EnsureServer
+    -File $ServerManager `
+    -Action Ensure
 
 if ($LASTEXITCODE -ne 0) {
     throw (
@@ -334,7 +330,8 @@ catch {
     & powershell.exe `
         -NoProfile `
         -ExecutionPolicy Bypass `
-        -File $StopServer `
+        -File $ServerManager `
+        -Action Stop `
         -IfIdle |
     Out-Null
 

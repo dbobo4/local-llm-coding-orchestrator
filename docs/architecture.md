@@ -267,15 +267,15 @@ Two independent uses exist:
 The second path processes an eligible `<PROMPT_MEMORY>` update and strips the carrier from `tool_input` before the specialist task is invoked.
 For the complete event-by-event execution path, see [Detailed Qwen Code session and hook data flow](session_hook_flow.md).
 
-## Qwen Code compatibility patches
+## Qwen Code runtime patch manager
 
-The repository contains:
+The repository contains one canonical runtime patch manager:
 
 ```text
-patches\ensure_qwen_code_patches.ps1
+patches\qwen_runtime_patches.ps1
 ```
 
-The patcher manages two compatibility requirements plus one deliberately separate compression optimization.
+It owns the Qwen Code compatibility, compression, runtime-resilience, context-growth, and specialist-growth modifications behind one Detect/Apply/Verify transaction. Patch blocks are named by responsibility; their revision metadata is tracked separately.
 
 ### Patch 1: SubagentStart context propagation
 
@@ -561,6 +561,8 @@ unsafe runtime/process ambiguity
 
 ## Server lifecycle
 
+Server/model machine configuration is sourced from `config\local.ps1`. `config\qwen_models.ini` is a generated llama.cpp preset: `qwen_server.ps1` derives, validates, and refreshes it from `local.ps1`; it is not a second hand-maintained source of truth.
+
 The public wrapper supports two user-facing paths:
 
 ```text
@@ -575,7 +577,7 @@ scripts\qwen.ps1
     +--> start Qwen Code
     +--> preserve Qwen Code exit status
     +--> release CLI lease
-    +--> request stop_qwen_server.ps1 -IfIdle
+    +--> request qwen_server.ps1 -Action Stop -IfIdle
 ```
 
 and:

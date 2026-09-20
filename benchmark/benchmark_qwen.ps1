@@ -57,8 +57,9 @@ foreach ($Entry in $BenchmarkDefaults.GetEnumerator()) {
     }
 }
 
-$StartScript = Join-Path $RepoRoot "scripts\start_qwen_server.ps1"
-$StopScript = Join-Path $RepoRoot "scripts\stop_qwen_server.ps1"
+$ServerScript = Join-Path $QwenRoot "config\qwen_server.ps1"
+$StartScript = $ServerScript
+$StopScript = $ServerScript
 $ModelsPreset = Join-Path $QwenRoot "config\qwen_models.ini"
 $SettingsPath = Join-Path $QwenUserRoot "settings.json"
 $ServerExe = $LlamaServerExe

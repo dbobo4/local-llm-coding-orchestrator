@@ -9,12 +9,12 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
-$StopServer = Join-Path `
-    $PSScriptRoot `
-    "stop_qwen_server.ps1"
+$ServerManager = Join-Path `
+    $QwenRoot `
+    "config\qwen_server.ps1"
 
-if (-not (Test-Path $StopServer -PathType Leaf)) {
-    throw "Qwen server stop script not found: $StopServer"
+if (-not (Test-Path $ServerManager -PathType Leaf)) {
+    throw "Qwen server manager not found: $ServerManager"
 }
 
 $BrowserProfile = Join-Path `
@@ -168,7 +168,8 @@ finally {
 & powershell.exe `
     -NoProfile `
     -ExecutionPolicy Bypass `
-    -File $StopServer `
+    -File $ServerManager `
+    -Action Stop `
     -IfIdle |
 Out-Null
 

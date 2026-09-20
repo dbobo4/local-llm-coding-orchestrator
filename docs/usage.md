@@ -486,22 +486,22 @@ The Qwen Code `SessionEnd` hook uses `-IfIdle`; wrapper cleanup is the determini
 ### Ensure the server is running
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\ensure_qwen_server.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\qwen_server.ps1 -Action Ensure
 ```
 
 ### Start the server directly
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_qwen_server.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\qwen_server.ps1 -Action Start
 ```
 
 ### Stop the server
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop_qwen_server.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\qwen_server.ps1 -Action Stop
 ```
 
-The server scripts are fail-closed around process ownership. They verify the process before reusing or terminating a listener on the configured port.
+The server manager is fail-closed around process ownership. It verifies the process before reusing or terminating a listener on the configured port. `config\qwen_models.ini` is generated and validated by `qwen_server.ps1` from `config\local.ps1`; edit `local.ps1`, not the generated INI.
 
 ## Qwen Code session commands
 
@@ -781,7 +781,7 @@ The project-identity layer is designed to isolate projects and does not use glob
 First verify runtime compatibility/optimization status:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\patches\ensure_qwen_code_patches.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\patches\qwen_runtime_patches.ps1 -VerifyOnly
 ```
 
 Then distinguish the intended data path:

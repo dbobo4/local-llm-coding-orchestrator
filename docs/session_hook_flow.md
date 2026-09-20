@@ -357,7 +357,7 @@ outer qwen wrapper
         |
         +--> release CLI lease
         |
-        +--> stop_qwen_server.ps1 -IfIdle runs as deterministic fallback
+        +--> qwen_server.ps1 -Action Stop -IfIdle runs as deterministic fallback
         |
         +--> if chat lease is active:
         |       keep shared llama.cpp router/model running

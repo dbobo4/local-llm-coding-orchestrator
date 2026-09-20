@@ -56,10 +56,13 @@ $SourceMemoryStore = Join-Path $RepoRoot "orchestration\memory_store.py"
 $SourceProjectIdentity = Join-Path $RepoRoot "orchestration\project_identity.py"
 $SourceProjectRegistry = Join-Path $RepoRoot "orchestration\project_registry.py"
 $SourceWorkflowState = Join-Path $RepoRoot "orchestration\workflow_state.py"
-$SourceRuntimePatcher = Join-Path $RepoRoot "patches\ensure_qwen_code_patches.ps1"
-$SourcePackage3Patcher = Join-Path $RepoRoot "patches\ensure_qwen_code_package3.ps1"
-$SourceGrowthPatcher = Join-Path $RepoRoot "patches\apply_runtime_growth_v5.py"
-$SourceSpecialistGrowthPatcher = Join-Path $RepoRoot "patches\apply_specialist_growth_v5_5.py"
+$SourceRuntimePatcher = Join-Path $RepoRoot "patches\qwen_runtime_patches.ps1"
+$SourceServerManager = Join-Path $RepoRoot "scripts\qwen_server.ps1"
+$SourceUpdateManager = Join-Path $RepoRoot "scripts\qwen_update.ps1"
+$SourceQwenLauncher = Join-Path $RepoRoot "scripts\qwen.ps1"
+$SourceChatLauncher = Join-Path $RepoRoot "scripts\qwen_chat.ps1"
+$SourceChatWatcher = Join-Path $RepoRoot "scripts\watch_qwen_chat.ps1"
+$SourceBenchmark = Join-Path $RepoRoot "benchmark\benchmark_qwen.ps1"
 
 $RequiredFiles = @(
     $SourceQwenMd,
@@ -73,9 +76,12 @@ $RequiredFiles = @(
     $SourceProjectRegistry,
     $SourceWorkflowState,
     $SourceRuntimePatcher,
-    $SourcePackage3Patcher,
-    $SourceGrowthPatcher,
-    $SourceSpecialistGrowthPatcher
+    $SourceServerManager,
+    $SourceUpdateManager,
+    $SourceQwenLauncher,
+    $SourceChatLauncher,
+    $SourceChatWatcher,
+    $SourceBenchmark
 )
 
 foreach ($file in $RequiredFiles) {
@@ -100,15 +106,21 @@ $Targets = @{
     $SourceProjectIdentity = Join-Path $OrchestrationRoot "project_identity.py"
     $SourceProjectRegistry = Join-Path $OrchestrationRoot "project_registry.py"
     $SourceWorkflowState   = Join-Path $OrchestrationRoot "workflow_state.py"
-    $SourceRuntimePatcher = Join-Path $QwenRoot "config\ensure_qwen_code_patches.ps1"
-    $SourcePackage3Patcher = Join-Path $QwenRoot "config\ensure_qwen_code_package3.ps1"
-    $SourceGrowthPatcher = Join-Path $QwenRoot "config\apply_runtime_growth_v5.py"
-    $SourceSpecialistGrowthPatcher = Join-Path $QwenRoot "config\apply_specialist_growth_v5_5.py"
+    $SourceRuntimePatcher = Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"
+    $SourceServerManager = Join-Path $QwenRoot "config\qwen_server.ps1"
+    $SourceUpdateManager = Join-Path $QwenRoot "config\qwen_update.ps1"
+    $SourceQwenLauncher = Join-Path $QwenRoot "config\qwen_cli.ps1"
+    $SourceChatLauncher = Join-Path $QwenRoot "config\qwen_chat.ps1"
+    $SourceChatWatcher = Join-Path $QwenRoot "config\watch_qwen_chat.ps1"
+    $SourceBenchmark = Join-Path $QwenRoot "config\benchmark_qwen.ps1"
 }
+
+$QwenBinRoot = Join-Path $QwenRoot "bin"
+$QwenUpdateCmdPath = Join-Path $QwenBinRoot "qwen-update.cmd"
 
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $BackupRoot = Join-Path $QwenRoot "backups\orchestrator-install\$Timestamp"
-$FilesToBackup = @($Targets.Values) + @($SettingsPath)
+$FilesToBackup = @($Targets.Values) + @($SettingsPath, $QwenUpdateCmdPath)
 $ExistingFiles = @($FilesToBackup | Where-Object { Test-Path $_ -PathType Leaf })
 
 if ($ExistingFiles.Count -gt 0) {
@@ -138,6 +150,34 @@ Write-Host "RUNTIME_LOCAL_CONFIG_DEPLOY=PASS"
 foreach ($entry in $Targets.GetEnumerator()) {
     Copy-Item $entry.Key $entry.Value -Force
 }
+
+foreach ($requiredProductionFile in @(
+    (Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"),
+    (Join-Path $QwenRoot "config\qwen_server.ps1"),
+    (Join-Path $QwenRoot "config\qwen_update.ps1"),
+    (Join-Path $QwenRoot "config\qwen_cli.ps1"),
+    (Join-Path $QwenRoot "config\qwen_chat.ps1"),
+    (Join-Path $QwenRoot "config\watch_qwen_chat.ps1"),
+    (Join-Path $QwenRoot "config\benchmark_qwen.ps1")
+)) {
+    if (-not (Test-Path -LiteralPath $requiredProductionFile -PathType Leaf)) {
+        throw "Production runtime deployment failed: $requiredProductionFile"
+    }
+}
+
+New-Item -ItemType Directory -Force -Path $QwenBinRoot | Out-Null
+$QwenUpdateCmdText = @(
+    "@echo off"
+    ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $QwenRoot "config\qwen_update.ps1") + '" %*')
+    "exit /b %ERRORLEVEL%"
+    ""
+) -join [Environment]::NewLine
+[IO.File]::WriteAllText(
+    $QwenUpdateCmdPath,
+    $QwenUpdateCmdText,
+    (New-Object Text.UTF8Encoding($false))
+)
+Write-Host "QWEN_UPDATE_WRAPPER_DEPLOY=PASS"
 
 function Set-AgentModelFrontmatter {
     param(
@@ -181,11 +221,11 @@ $template = Get-Content $SettingsTemplatePath -Raw | ConvertFrom-Json
 
 $dispatcherPath = Join-Path $OrchestrationRoot "hook_dispatcher.py"
 $maintenancePath = Join-Path $OrchestrationRoot "maintenance_hook.py"
-$stopServerPath = Join-Path $RepoRoot "scripts\stop_qwen_server.ps1"
+$stopServerPath = Join-Path $QwenRoot "config\qwen_server.ps1"
 
 $dispatcherCommand = 'python "' + $dispatcherPath + '"'
 $maintenanceCommand = 'python "' + $maintenancePath + '"'
-$stopServerCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $stopServerPath + '" -IfIdle'
+$stopServerCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $stopServerPath + '" -Action Stop -IfIdle'
 
 foreach ($eventName in @("SubagentStart","UserPromptSubmit","SessionStart","SessionEnd","SubagentStop","Stop")) {
     foreach ($eventGroup in $template.hooks.$eventName) {
@@ -375,7 +415,7 @@ else {
 }
 
 # Keep managed provider context metadata synchronized with the
-# actual local llama.cpp context used by scripts\start_qwen_server.ps1.
+# actual local llama.cpp context used by the installed qwen_server.ps1 manager.
 if ($null -eq (Get-Variable -Name ContextWindowSize -ErrorAction SilentlyContinue)) {
     $ContextWindowSize = 40960
 }
@@ -571,7 +611,7 @@ if ($ExistingFiles.Count -gt 0) {
 
 # Apply/verify all Qwen Code compatibility and runtime-hardening patches only
 # after orchestration files and settings have reached their final installed state.
-$InstalledRuntimePatcher = Join-Path $QwenRoot "config\ensure_qwen_code_patches.ps1"
+$InstalledRuntimePatcher = Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"
 
 & powershell.exe `
     -NoProfile `

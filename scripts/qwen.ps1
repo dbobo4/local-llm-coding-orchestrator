@@ -10,14 +10,12 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
-$PatchScript = Join-Path $RepoRoot "patches\ensure_qwen_code_patches.ps1"
-$EnsureServerScript = Join-Path $PSScriptRoot "ensure_qwen_server.ps1"
-$StopServerScript = Join-Path $PSScriptRoot "stop_qwen_server.ps1"
+$PatchScript = Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"
+$ServerScript = Join-Path $QwenRoot "config\qwen_server.ps1"
 
 foreach ($required in @(
     $PatchScript,
-    $EnsureServerScript,
-    $StopServerScript,
+    $ServerScript,
     $QwenCodeCli
 )) {
     if (-not (Test-Path $required -PathType Leaf)) {
@@ -68,7 +66,8 @@ try {
     & powershell.exe `
         -NoProfile `
         -ExecutionPolicy Bypass `
-        -File $EnsureServerScript
+        -File $ServerScript `
+        -Action Ensure
 
     if ($LASTEXITCODE -ne 0) {
         $qwenExitCode = $LASTEXITCODE
@@ -94,7 +93,8 @@ finally {
     & powershell.exe `
         -NoProfile `
         -ExecutionPolicy Bypass `
-        -File $StopServerScript `
+        -File $ServerScript `
+        -Action Stop `
         -IfIdle
 
     $stopExitCode = $LASTEXITCODE
