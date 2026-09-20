@@ -294,7 +294,7 @@ This remains deliberately separate from the two compatibility patches.
 The production compression path now uses:
 
 ```text
-COMPACT_MAX_OUTPUT_TOKENS = 3072
+COMPACT_MAX_OUTPUT_TOKENS = 2048
 
 context window = 40960
 auto-compaction threshold = 33080
@@ -321,13 +321,13 @@ legacy
   optimized prompt/directive + 4096 cap
 
 patched
-  optimized prompt/directive + 3072 cap
+  optimized canonical prompt/directive + 2048 cap
 
 incompatible
   unknown or mixed state -> fail closed
 ```
 
-The final 3072 cap was selected after exact 4096/3072/2048 runs plus strict semantic-retention validation. All tested caps passed the semantic checks; 2048 was not selected because its observed summary-output headroom was materially smaller. Production compaction reasoning remains `xhigh`; the tested medium override degraded cache sharing.
+The current production compression generation cap is 2048. The earlier 4096/3072/2048 comparison remains historical tuning evidence; production compaction reasoning remains `xhigh`, and the canonical snapshot soft target is 600-1000 tokens.
 
 See [Compression tuning](compression_tuning.md) for the measured results.
 
@@ -854,3 +854,9 @@ roles
 The plain-chat path deliberately stops at the inference layer. The coding path continues through Qwen Code and the orchestration layer.
 
 The portfolio value of the project is therefore not the local model itself. It is the engineering layer that makes local coding inference more structured, controllable, reproducible, stateful, and testable while still allowing a minimal direct-chat path to reuse the same local runtime.
+
+<!-- LOCALAI_CURRENT_LIFECYCLE_BEGIN -->
+## Current bounded context lifecycle
+
+The validated production lifecycle uses a 40960-token context, auto-compacts at 24888, caps compression generation at 2048, targets a canonical 600-1000-token replacement snapshot, and rolls over to a fresh `LlmChat` in the same physical session when compaction cannot return below the safe range. The LocalAI coding profile opts into an 8192-token per-turn growth budget; the generic runtime default is 0 so plain chat remains unchanged.
+<!-- LOCALAI_CURRENT_LIFECYCLE_END -->

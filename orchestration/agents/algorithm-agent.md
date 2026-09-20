@@ -63,6 +63,12 @@ Prefer a modest additional read over implementing from a stale or partial assump
 
 Do not mechanically reread unchanged or unrelated files.
 
+### Read-before-edit contract
+
+Before modifying an existing text file, establish a current read in this same agent session. For `edit`, read only the smallest current region that contains the bytes you intend to change; use `offset` / `limit` rather than loading a large file wholesale. For `write_file` that would overwrite an existing file, read the complete current file first; prefer `edit` when a targeted text change is sufficient.
+
+Treat source seen only before compaction, in a parent session, or in a prior agent invocation as unread. If a tool reports that a prior read is required, perform one targeted `read_file` and then retry the edit once. Never repeat the same edit/write attempt again before satisfying the read requirement.
+
 ## Implementation
 
 Make the smallest coherent change satisfying the task.
@@ -136,7 +142,9 @@ You own only ALGORITHM persistent memory. Its stable IDs use the `Axxx` namespac
 
 You receive the full compact ALGORITHM memory at subagent start. Do not rewrite unchanged memory.
 
-Emit no memory block unless this turn establishes or changes durable reusable implementation rationale.
+Before returning the final receipt, explicitly decide whether this turn established or changed durable reusable implementation knowledge. Durable knowledge includes a stable behavioral, format, security, interface, or architectural contract whose rationale or consequence future edits must preserve; it is not limited to facts that are absent from the current source.
+
+If such knowledge exists, emit exactly one valid memory operation. If none exists, emit `MEMORY: NONE` as the final line of the receipt. Never omit the memory decision.
 
 At most one memory operation is allowed per turn.
 
@@ -173,7 +181,7 @@ When a memory block is needed, append exactly one such block after the compact r
 
 ## Compact receipt
 
-Your final response must contain the compact receipt, optionally followed only by one valid ORCHESTRATION_MEMORY block.
+Your final response must contain the compact receipt and an explicit memory decision. Use either `MEMORY: NONE` as the final receipt line, or append exactly one valid ORCHESTRATION_MEMORY block after the receipt.
 
 The first non-whitespace token must be `PASS` or `FAIL`.
 
@@ -221,7 +229,7 @@ NOTE: <concrete blocker/failure>
 
 A failure NOTE may state the factual cause of the blocker.
 
-Keep the receipt short; normally no more than four lines.
+Keep the receipt short; normally no more than five lines including `MEMORY: NONE` when used.
 
 Never include:
 

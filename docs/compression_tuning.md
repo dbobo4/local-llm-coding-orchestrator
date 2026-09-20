@@ -5,7 +5,7 @@
 ```text
 Qwen Code: 0.22.3
 context window: 40960
-COMPACT_MAX_OUTPUT_TOKENS = 3072
+COMPACT_MAX_OUTPUT_TOKENS = 2048
 auto-compaction threshold = 24888
 compaction reasoning = xhigh
 cache sharing = enabled / preserved
@@ -13,7 +13,7 @@ cache sharing = enabled / preserved
 
 The Qwen Code provider `generationConfig.contextWindowSize` is synchronized with the `40960` llama.cpp server context because compression thresholds are computed from the provider context window.
 
-The `3072` output cap was selected by the earlier controlled A/B/C tuning performed at a 49152-token context. The cap remains unchanged; the current automatic-compaction threshold is lower because the production context is now 40960.
+The current production output cap is `2048`. The earlier 4096/3072/2048 A/B/C measurements remain historical evidence; the current runtime uses a 40960-token context and an auto-compaction threshold of 24888.
 
 The compact state handoff contains `goal`, `durable_constraints`, `current_state`, `open_issues`, and `next_step`, targeting roughly 800-1500 tokens.
 
@@ -72,9 +72,9 @@ Observed strict semantic summary outputs:
 2048: 1448, 1255
 ```
 
-## Why 3072 instead of 2048
+## Historical 3072 decision and current 2048 production cap
 
-2048 passed correctness tests, but the largest mechanical-run summary was 1557 tokens, leaving only 491 tokens of cap headroom. The 3072 configuration preserves materially more reserve while still delaying compaction relative to 4096. Therefore 3072 is the production robustness/frequency compromise; 2048 was not rejected for semantic correctness.
+Historical tuning initially selected 3072 for additional output-budget reserve. Later bounded lifecycle hardening adopted 2048 as the current production generation cap while retaining the same semantic-retention requirements. The benchmark rows above remain historical measurements and are not rewritten.
 
 ## Compaction reasoning effort
 
@@ -87,7 +87,7 @@ A same-model request-level `medium` override reached the wire, but cache sharing
 ```text
 unpatched: stock prompt/directive + cap 2e4
 legacy:    optimized prompt/directive + cap 4096
-patched:   optimized prompt/directive + cap 3072
+patched:   optimized canonical prompt/directive + cap 2048
 incompatible: unknown/mixed state -> fail closed
 ```
 
@@ -98,3 +98,9 @@ The validated production runtime SHA256 is:
 ```
 
 The 4096 optimized state is intentionally supported as a migration state.
+
+<!-- LOCALAI_CURRENT_COMPRESSION_DECISION_BEGIN -->
+## Current production decision
+
+The production context window is `40960`, the automatic-compaction threshold is `24888`, `COMPACT_MAX_OUTPUT_TOKENS = 2048`, and the canonical replacement snapshot has a soft target of roughly `600-1000` tokens. The older 4096/3072/2048 benchmark rows below are retained as historical tuning evidence.
+<!-- LOCALAI_CURRENT_COMPRESSION_DECISION_END -->

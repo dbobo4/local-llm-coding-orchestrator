@@ -65,7 +65,8 @@
   "model": {
     "name": "qwen3.8-27b-local",
     "reasoningEffort": "xhigh",
-    "maxSubagentDepth": 1
+    "maxSubagentDepth": 1,
+    "maxContextGrowthTokensPerTurn": 8192
   },
   "agents": {
     "maxParallelAgents": 1

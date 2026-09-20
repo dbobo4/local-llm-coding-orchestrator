@@ -145,7 +145,9 @@ You own only TEST persistent memory. Its stable IDs use the `Txxx` namespace.
 
 You receive the full compact TEST memory at subagent start. Do not rewrite unchanged memory.
 
-Emit no memory block unless this turn establishes or changes durable reusable verification knowledge.
+Before returning the final verdict receipt, explicitly decide whether this turn established or changed durable reusable verification knowledge. Durable verification knowledge is a stable verification constraint or rationale that should guide future independent checks; routine test outcomes and transient failures are not durable.
+
+If such knowledge exists, emit exactly one valid memory operation. If none exists, emit `MEMORY: NONE` as the final line of the verdict receipt. Never omit the memory decision.
 
 At most one memory operation is allowed per turn.
 
@@ -184,7 +186,7 @@ When a memory block is needed, append exactly one such block after the compact v
 
 ## Compact verdict receipt
 
-Your final response must contain the compact verdict receipt, optionally followed only by one valid ORCHESTRATION_MEMORY block.
+Your final response must contain the compact verdict receipt and an explicit memory decision. Use either `MEMORY: NONE` as the final receipt line, or append exactly one valid ORCHESTRATION_MEMORY block after the receipt.
 
 The first non-whitespace token must be exactly one of:
 
@@ -220,7 +222,7 @@ CHECK: <what was independently established>
 NOTE: <precise blocker>
 ```
 
-Keep the receipt short; normally no more than three lines.
+Keep the receipt short; normally no more than four lines including `MEMORY: NONE` when used.
 
 Do not restate the whole implementation.
 

@@ -56,6 +56,10 @@ $SourceMemoryStore = Join-Path $RepoRoot "orchestration\memory_store.py"
 $SourceProjectIdentity = Join-Path $RepoRoot "orchestration\project_identity.py"
 $SourceProjectRegistry = Join-Path $RepoRoot "orchestration\project_registry.py"
 $SourceWorkflowState = Join-Path $RepoRoot "orchestration\workflow_state.py"
+$SourceRuntimePatcher = Join-Path $RepoRoot "patches\ensure_qwen_code_patches.ps1"
+$SourcePackage3Patcher = Join-Path $RepoRoot "patches\ensure_qwen_code_package3.ps1"
+$SourceGrowthPatcher = Join-Path $RepoRoot "patches\apply_runtime_growth_v5.py"
+$SourceSpecialistGrowthPatcher = Join-Path $RepoRoot "patches\apply_specialist_growth_v5_5.py"
 
 $RequiredFiles = @(
     $SourceQwenMd,
@@ -67,7 +71,11 @@ $RequiredFiles = @(
     $SourceMemoryStore,
     $SourceProjectIdentity,
     $SourceProjectRegistry,
-    $SourceWorkflowState
+    $SourceWorkflowState,
+    $SourceRuntimePatcher,
+    $SourcePackage3Patcher,
+    $SourceGrowthPatcher,
+    $SourceSpecialistGrowthPatcher
 )
 
 foreach ($file in $RequiredFiles) {
@@ -92,6 +100,10 @@ $Targets = @{
     $SourceProjectIdentity = Join-Path $OrchestrationRoot "project_identity.py"
     $SourceProjectRegistry = Join-Path $OrchestrationRoot "project_registry.py"
     $SourceWorkflowState   = Join-Path $OrchestrationRoot "workflow_state.py"
+    $SourceRuntimePatcher = Join-Path $QwenRoot "config\ensure_qwen_code_patches.ps1"
+    $SourcePackage3Patcher = Join-Path $QwenRoot "config\ensure_qwen_code_package3.ps1"
+    $SourceGrowthPatcher = Join-Path $QwenRoot "config\apply_runtime_growth_v5.py"
+    $SourceSpecialistGrowthPatcher = Join-Path $QwenRoot "config\apply_specialist_growth_v5_5.py"
 }
 
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
@@ -108,6 +120,21 @@ if ($ExistingFiles.Count -gt 0) {
     }
 }
 
+# LOCALAI_PACKAGE3_INSTALLER_V1
+$RuntimeConfigRoot = Join-Path $QwenRoot "config"
+New-Item -ItemType Directory -Force -Path $RuntimeConfigRoot | Out-Null
+
+# LOCALAI_RUNTIME_LOCAL_CONFIG_DEPLOY_V1
+$SourceRuntimeLocalConfig = Join-Path $RepoRoot "config\local.ps1"
+if (-not (Test-Path -LiteralPath $SourceRuntimeLocalConfig -PathType Leaf)) {
+    throw "Missing source runtime config: $SourceRuntimeLocalConfig"
+}
+$InstalledRuntimeLocalConfig = Join-Path $RuntimeConfigRoot "local.ps1"
+Copy-Item `
+    -LiteralPath $SourceRuntimeLocalConfig `
+    -Destination $InstalledRuntimeLocalConfig `
+    -Force
+Write-Host "RUNTIME_LOCAL_CONFIG_DEPLOY=PASS"
 foreach ($entry in $Targets.GetEnumerator()) {
     Copy-Item $entry.Key $entry.Value -Force
 }
@@ -371,6 +398,15 @@ foreach ($Provider in @($settings.modelProviders.openai)) {
     }
 }
 
+# LocalAI coding profile opts into the bounded per-turn growth guard.
+# Generic Qwen Code runtime default remains 0 so plain chat stays unchanged.
+$modelSettings = Ensure-ObjectProperty $settings "model"
+$modelSettings |
+    Add-Member `
+        -NotePropertyName "maxContextGrowthTokensPerTurn" `
+        -NotePropertyValue 8192 `
+        -Force
+
 $json = $settings | ConvertTo-Json -Depth 30
 [IO.File]::WriteAllText(
     $SettingsPath,
@@ -379,6 +415,12 @@ $json = $settings | ConvertTo-Json -Depth 30
 )
 
 $verify = Get-Content $SettingsPath -Raw | ConvertFrom-Json
+
+if (
+    [int]$verify.model.maxContextGrowthTokensPerTurn -ne 8192
+) {
+    throw "Installation verification failed: maxContextGrowthTokensPerTurn"
+}
 
 if ($verify.model.name -ne $ModelAlias) {
     throw "Installation verification failed: model alias"
@@ -524,3 +566,21 @@ Write-Host "SETTINGS=$SettingsPath"
 if ($ExistingFiles.Count -gt 0) {
     Write-Host "BACKUP=$BackupRoot"
 }
+
+
+
+# Apply/verify all Qwen Code compatibility and runtime-hardening patches only
+# after orchestration files and settings have reached their final installed state.
+$InstalledRuntimePatcher = Join-Path $QwenRoot "config\ensure_qwen_code_patches.ps1"
+
+& powershell.exe `
+    -NoProfile `
+    -NonInteractive `
+    -ExecutionPolicy Bypass `
+    -File $InstalledRuntimePatcher
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Qwen Code runtime patch verification failed: exit=$LASTEXITCODE"
+}
+
+Write-Host "RUNTIME_PATCH_INSTALL=PASS"

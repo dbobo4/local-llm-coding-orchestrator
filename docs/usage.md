@@ -345,7 +345,7 @@ Qwen Code session context still has normal context-window limits. Durable projec
 The local runtime compression optimization uses:
 
 ```text
-COMPACT_MAX_OUTPUT_TOKENS = 3072
+COMPACT_MAX_OUTPUT_TOKENS = 2048
 AUTO_COMPACTION_THRESHOLD = 24888
 CONTEXT_WINDOW = 40960
 
@@ -358,9 +358,9 @@ CONTEXT_WINDOW = 40960
 </state_snapshot>
 ```
 
-The summary targets roughly 800-1500 tokens and omits full messages, long code, routine tool calls, and transient exploration.
+The canonical replacement snapshot has a soft target of roughly 600-1000 tokens and omits full messages, long code, routine tool calls, transient exploration, and superseded state.
 
-The runtime manager accepts the previous optimized `4096` state as `legacy` and migrates it to the current `3072` state. Unknown or mixed compression structures fail closed.
+The runtime manager accepts the previous optimized `4096` state as `legacy` and migrates it to the current `2048` state. Unknown or mixed compression structures fail closed.
 
 Durable memory persists selected stable facts across sessions; compaction preserves only enough active execution state to continue the current conversation.
 
@@ -657,7 +657,7 @@ known compatible unpatched
 
 known legacy compression state
     -> optimized prompt/directive already present
-    -> migrate 4096 cap to 3072
+    -> migrate 4096/3072 cap to 2048
     -> node --check
     -> post-validate
 
@@ -807,3 +807,9 @@ For plain local chat without coding orchestration, use:
 ```
 
 Do not start a second standalone llama.cpp server for the chat path. Both entry points intentionally share the same router and physical GGUF, with client leases controlling idle shutdown.
+
+<!-- LOCALAI_GROWTH_GUARD_BEGIN -->
+### Per-turn context-growth guard
+
+The LocalAI coding profile sets `model.maxContextGrowthTokensPerTurn` to `8192`. The Qwen Code runtime default is `0`, so the guard is opt-in and plain chat remains unchanged. Compaction and same-session rollover do not refund already-consumed growth.
+<!-- LOCALAI_GROWTH_GUARD_END -->

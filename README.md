@@ -738,7 +738,7 @@ For the current Qwen Code 0.22.3 runtime the production path is:
 COMPACT_MAX_OUTPUT_TOKENS
   stock 2e4 / 20000
   -> first production optimization 4096
-  -> final production 3072
+  -> final production 2048
 
 auto-compaction threshold at 40960 context
   stock approximately 7960
@@ -760,7 +760,7 @@ state snapshot
 
 The target snapshot is roughly 800-1500 tokens and omits full messages, long source listings, routine tool calls, and transient exploration.
 
-The final cap was selected after exact 4096/3072/2048 compaction runs and strict semantic-retention tests. All three tested caps preserved the required state semantics, but 3072 was selected as the production balance between later compaction and output-budget safety headroom. Production compaction keeps `xhigh` reasoning because the tested medium override materially reduced cache sharing.
+The current production compression generation cap is `2048`. The earlier 4096/3072/2048 runs remain historical tuning evidence. Production keeps the 40960 context, 24888 auto-compaction threshold, canonical 600-1000-token snapshot target, and `xhigh` compression reasoning.
 
 See [Compression tuning](docs/compression_tuning.md) for the measured A/B/C results and final decision.
 
@@ -1129,3 +1129,14 @@ local inference
 ```
 
 The result is a reproducible local coding-agent workflow designed to behave like a controlled engineering system rather than a single unconstrained chat model.
+
+<!-- LOCALAI_CURRENT_RUNTIME_LIMITS_BEGIN -->
+### Current LocalAI runtime limits
+
+- context window: `40960`
+- auto-compaction threshold: `24888`
+- compression generation cap: `2048`
+- canonical snapshot soft target: `600-1000` tokens
+- LocalAI coding-profile growth budget: `model.maxContextGrowthTokensPerTurn = 8192`
+- generic Qwen Code growth default: `0` (plain chat remains unchanged)
+<!-- LOCALAI_CURRENT_RUNTIME_LIMITS_END -->

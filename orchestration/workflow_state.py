@@ -56,6 +56,7 @@ class WorkflowState:
 
     verification_status: VerificationStatus = "not_started"
     verification_after_implementation: bool = False
+    implementation_verification_required: bool | None = None
 
     fix_cycle_count: int = 0
 
@@ -75,6 +76,11 @@ class WorkflowState:
     # workflow as terminal. This distinguishes a real next user turn
     # from an internal continuation prompt created by Stop blocking.
     turn_closed: bool = False
+
+    # Non-success terminal latch for runtime-enforced aborts. A set
+    # value closes the current root workflow without pretending that
+    # the selected specialist phase completed successfully.
+    terminal_abort_reason: str | None = None
 
     # At most one successful PROMPT-owned durable-memory mutation may
     # be committed during one real root user turn.
@@ -673,6 +679,24 @@ def unregister_agent_root_turn(
     )
 
 
+def mark_terminal_abort(
+    state: WorkflowState,
+    reason: str,
+) -> None:
+    normalized = reason.strip()
+
+    if not normalized:
+        raise ValueError(
+            "terminal abort reason must not be empty"
+        )
+
+    state.terminal_abort_reason = normalized[:4000]
+
+    save_state(
+        state
+    )
+
+
 def mark_turn_closed(
     state: WorkflowState,
 ) -> None:
@@ -780,11 +804,50 @@ def _invalidate_previous_verification(
     state.verification_after_implementation = True
 
 
+def select_implementation_workflow(
+    state: WorkflowState,
+    *,
+    require_test: bool,
+) -> None:
+    state.turn_closed = False
+    state.algorithm_selected = True
+
+    # Verification may be upgraded to required, but never downgraded
+    # after the workflow has already selected TEST.
+    if state.implementation_verification_required is True:
+        require_test = True
+
+    if state.test_selected:
+        require_test = True
+
+    state.implementation_verification_required = require_test
+
+    if require_test:
+        state.test_selected = True
+        state.final_test_started = False
+        state.final_test_completed = False
+        state.verification_status = "pending"
+        state.verification_after_implementation = True
+    else:
+        state.verification_after_implementation = False
+
+    save_state(
+        state
+    )
+
+
 def mark_algorithm_started(
     state: WorkflowState,
 ) -> None:
     state.turn_closed = False
     state.algorithm_selected = True
+
+    # Fail safe: if the Agent PreToolUse routing latch was missed,
+    # implementation requires independent TEST rather than silently
+    # becoming ALGORITHM-only.
+    if state.implementation_verification_required is None:
+        state.implementation_verification_required = True
+        state.test_selected = True
 
     if (
         state.test_selected
@@ -815,6 +878,10 @@ def mark_algorithm_completed(
     state.algorithm_started = True
     state.algorithm_completed = True
 
+    if state.implementation_verification_required is None:
+        state.implementation_verification_required = True
+        state.test_selected = True
+
     if state.test_selected:
         state.verification_after_implementation = True
 
@@ -828,6 +895,9 @@ def mark_final_test_started(
 ) -> None:
     state.turn_closed = False
     state.test_selected = True
+
+    if state.algorithm_selected:
+        state.implementation_verification_required = True
 
     state.final_test_started = True
     state.final_test_completed = False
@@ -961,6 +1031,7 @@ def begin_fix_cycle(
     state.algorithm_selected = True
     state.algorithm_started = False
     state.algorithm_completed = False
+    state.implementation_verification_required = True
 
     state.test_selected = True
     state.final_test_started = False
@@ -1053,6 +1124,14 @@ def can_finish_turn(
         )
     )
 
+    if state.terminal_abort_reason:
+        return (
+            True,
+            "Workflow terminated by runtime guard without "
+            "successful specialist completion: "
+            + state.terminal_abort_reason,
+        )
+
     if workflow_kind == "prompt_only":
         return (
             True,
@@ -1074,11 +1153,29 @@ def can_finish_turn(
                 "ALGORITHM_AGENT is still incomplete.",
             )
 
+    if state.algorithm_selected:
+        if state.implementation_verification_required is None:
+            return (
+                False,
+                "Implementation verification routing was not established. "
+                "Independent TEST is required as the fail-safe path.",
+            )
+
+        if (
+            state.implementation_verification_required
+            and not state.test_selected
+        ):
+            return (
+                False,
+                "Independent TEST is required for this implementation "
+                "workflow but TEST_AGENT is not selected.",
+            )
+
     if not state.test_selected:
         return (
             True,
             "Implementation completed; independent verification "
-            "was not selected.",
+            "was explicitly not required.",
         )
 
     if not state.final_test_started:

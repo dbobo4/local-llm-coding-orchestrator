@@ -11,6 +11,7 @@ from typing import Any
 from memory_protocol import (
     MemoryUpdate,
     apply_memory_update,
+    extract_memory_update,
     process_agent_memory_message,
     strip_memory_blocks,
 )
@@ -45,12 +46,14 @@ from workflow_state import (
     mark_final_test_started,
     mark_misunderstandings_read,
     mark_prompt_memory_written,
+    mark_terminal_abort,
     mark_turn_closed,
     mark_verification_blocked,
     mark_verification_pass,
     record_failure,
     register_agent_root_turn,
     requires_fix_cycle,
+    select_implementation_workflow,
     set_active_root_turn,
     start_or_resume_user_turn,
     unregister_agent_root_turn,
@@ -68,6 +71,8 @@ ERROR_LOG_PATH = ERROR_LOG_ROOT / "hook_errors.log"
 
 MAX_FAILURE_SUMMARY_CHARS = 3_000
 MAX_AUTO_MISUNDERSTANDING_CHARS = 1_200
+MAX_ALGORITHM_DELTA_CHARS = 3000
+MAX_TEST_DELTA_CHARS = 2500
 
 
 def _utc_timestamp() -> str:
@@ -493,12 +498,84 @@ def _process_subagent_message(
     if not message:
         return ""
 
-    return process_agent_memory_message(
+    clean_message = process_agent_memory_message(
         identity,
         agent,
         message,
     )
 
+    clean_message = re.sub(
+        r"(?mi)^\s*MEMORY:\s*NONE\s*$",
+        "",
+        clean_message,
+    )
+
+    return clean_message.strip()
+
+
+
+def _has_specialist_memory_decision(
+    message: str | None,
+) -> bool:
+    if not message:
+        return False
+
+    update = extract_memory_update(
+        message
+    )
+
+    if not update.is_empty():
+        return True
+
+    clean_message = strip_memory_blocks(
+        message
+    )
+
+    return (
+        re.search(
+            r"(?mi)^\s*MEMORY:\s*NONE\s*$",
+            clean_message,
+        )
+        is not None
+    )
+
+
+def _require_specialist_memory_decision(
+    payload: dict[str, Any],
+    message: str | None,
+    agent_label: str,
+) -> bool:
+    if _has_specialist_memory_decision(
+        message
+    ):
+        return True
+
+    stop_hook_active = bool(
+        payload.get(
+            "stop_hook_active"
+        )
+    )
+
+    if stop_hook_active:
+        # One protocol retry already occurred. Fail open rather than
+        # trapping the workflow in an infinite Stop loop.
+        return True
+
+    _write_json(
+        {
+            "decision": "block",
+            "reason": (
+                f"{agent_label} must make an explicit durable-memory "
+                "decision before stopping. If durable reusable knowledge "
+                "was established, append exactly one valid "
+                "<ORCHESTRATION_MEMORY> operation. Otherwise add exactly "
+                "`MEMORY: NONE` to the compact receipt. Do not add any "
+                "other narrative."
+            ),
+        }
+    )
+
+    return False
 
 def _extract_test_status(
     message: str | None,
@@ -877,11 +954,48 @@ def _unregister_subagent(
     )
 
 
+def _is_growth_limit_stop(
+    payload: dict[str, Any],
+) -> bool:
+    # LOCALAI_SPECIALIST_GROWTH_TERMINATION_V5_5
+    terminate_reason = payload.get(
+        "terminate_reason"
+    )
+
+    return (
+        isinstance(
+            terminate_reason,
+            str,
+        )
+        and terminate_reason.strip().upper()
+        == "GROWTH_LIMIT"
+    )
+
+
 def _handle_algorithm_stop(
     payload: dict[str, Any],
     identity: ProjectIdentity,
     state: WorkflowState,
 ) -> None:
+    if _is_growth_limit_stop(
+        payload
+    ):
+        mark_terminal_abort(
+            state,
+            "specialist_growth_limit",
+        )
+
+        _unregister_subagent(
+            payload
+        )
+
+        _write_json(
+            {
+                "continue": True,
+            }
+        )
+        return
+
     raw_message = payload.get(
         "last_assistant_message"
     )
@@ -894,6 +1008,13 @@ def _handle_algorithm_stop(
         )
         else None
     )
+
+    if not _require_specialist_memory_decision(
+        payload,
+        message,
+        "ALGORITHM_AGENT",
+    ):
+        return
 
     clean_message = (
         _process_subagent_message(
@@ -911,10 +1032,23 @@ def _handle_algorithm_stop(
         payload
     )
 
+    response = {
+        "continue": True,
+    }
+
+    if (
+        state.test_selected
+        and not state.final_test_completed
+    ):
+        response["systemMessage"] = (
+            "Implementation stage complete. Independent TEST_AGENT "
+            "verification is required next. Delegate test-agent now "
+            "with a concise verification delta; do not run parent-side "
+            "shell verification first."
+        )
+
     _write_json(
-        {
-            "continue": True,
-        }
+        response
     )
 
 
@@ -976,6 +1110,25 @@ def _handle_test_stop(
     identity: ProjectIdentity,
     state: WorkflowState,
 ) -> None:
+    if _is_growth_limit_stop(
+        payload
+    ):
+        mark_terminal_abort(
+            state,
+            "specialist_growth_limit",
+        )
+
+        _unregister_subagent(
+            payload
+        )
+
+        _write_json(
+            {
+                "continue": True,
+            }
+        )
+        return
+
     raw_message = payload.get(
         "last_assistant_message"
     )
@@ -1004,6 +1157,13 @@ def _handle_test_stop(
             state,
             status_preview,
         )
+        return
+
+    if not _require_specialist_memory_decision(
+        payload,
+        message,
+        "TEST_AGENT",
+    ):
         return
 
     clean_message = (
@@ -1282,19 +1442,13 @@ def _handle_stop(
 
 
 
+
 def _handle_prompt_memory_pre_tool_use(
     payload: dict[str, Any],
     identity: ProjectIdentity,
 ) -> None:
-    """
-    Consume PROMPT-owned durable-memory metadata carried inside an
-    Agent tool prompt, persist it as Pxxx memory, then remove the
-    metadata before the specialist sees the prompt.
-
-    Invalid memory metadata is silently discarded. The Agent call
-    itself is never blocked because of a memory-protocol failure.
-    """
-
+    # Enforce specialist routing, bounded deltas, PROMPT-memory transport,
+    # and foreground execution at the Agent tool boundary.
     tool_name = str(
         payload.get("tool_name")
         or ""
@@ -1322,6 +1476,13 @@ def _handle_prompt_memory_pre_tool_use(
         _write_json(
             {
                 "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "Agent delegation requires an object tool_input."
+                    ),
+                },
             }
         )
         return
@@ -1337,25 +1498,175 @@ def _handle_prompt_memory_pre_tool_use(
         _write_json(
             {
                 "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "Agent delegation requires a textual task delta."
+                    ),
+                },
             }
         )
         return
 
-    # Detect exact and plausibly malformed PROMPT-memory tags
-    # case-insensitively. Only an exact carrier may cause a write,
-    # but suspicious carrier-like metadata must never reach a specialist.
+    agent_type = _normalize_agent_type(
+        tool_input.get(
+            "subagent_type"
+        )
+    )
+
+    canonical_type_by_role = {
+        "algorithm_agent": "algorithm-agent",
+        "test_agent": "test-agent",
+    }
+
+    if agent_type not in canonical_type_by_role:
+        _write_json(
+            {
+                "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "Only the configured algorithm-agent and test-agent "
+                        "may be delegated work. Specify subagent_type explicitly; "
+                        "general-purpose, fork, omitted, and other agent types "
+                        "are not part of this orchestration."
+                    ),
+                },
+            }
+        )
+        return
+
+    workflow_marker_pattern = re.compile(
+        r"<\s*/?\s*ORCHESTRATION_WORKFLOW\s*>",
+        flags=re.IGNORECASE,
+    )
+    workflow_pattern = re.compile(
+        r"<ORCHESTRATION_WORKFLOW>\s*"
+        r"(ALGORITHM_ONLY|ALGORITHM_TEST)"
+        r"\s*</ORCHESTRATION_WORKFLOW>",
+        flags=re.IGNORECASE,
+    )
+    workflow_matches = list(
+        workflow_pattern.finditer(
+            prompt
+        )
+    )
+
+    workflow_choice = None
+
+    if workflow_marker_pattern.search(prompt) is not None:
+        if len(workflow_matches) != 1:
+            _write_json(
+                {
+                    "continue": True,
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Malformed orchestration workflow carrier. "
+                            "Use exactly one complete "
+                            "<ORCHESTRATION_WORKFLOW>ALGORITHM_ONLY"
+                            "</ORCHESTRATION_WORKFLOW> or "
+                            "<ORCHESTRATION_WORKFLOW>ALGORITHM_TEST"
+                            "</ORCHESTRATION_WORKFLOW> carrier."
+                        ),
+                    },
+                }
+            )
+            return
+
+        workflow_choice = (
+            workflow_matches[0]
+            .group(1)
+            .upper()
+        )
+
+    if agent_type == "algorithm_agent":
+        state = _ensure_active_state(
+            payload,
+            identity,
+        )
+
+        if state is None:
+            _write_json(
+                {
+                    "continue": True,
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Implementation delegation requires active "
+                            "workflow state; retry the algorithm-agent "
+                            "delegation after routing state is available."
+                        ),
+                    },
+                }
+            )
+            return
+
+        if state.implementation_verification_required is None:
+            select_implementation_workflow(
+                state,
+                require_test=(
+                    workflow_choice
+                    != "ALGORITHM_ONLY"
+                ),
+            )
+        elif workflow_choice == "ALGORITHM_TEST":
+            select_implementation_workflow(
+                state,
+                require_test=True,
+            )
+
+    elif workflow_choice is not None:
+        _write_json(
+            {
+                "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "ORCHESTRATION_WORKFLOW metadata is valid only "
+                        "on algorithm-agent implementation delegation."
+                    ),
+                },
+            }
+        )
+        return
+
+    prompt = workflow_pattern.sub(
+        "",
+        prompt,
+    )
+
+    suspicious_workflow = (
+        workflow_marker_pattern.search(
+            prompt
+        )
+    )
+
+    if suspicious_workflow is not None:
+        _write_json(
+            {
+                "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "Malformed orchestration workflow metadata "
+                        "must not reach a specialist."
+                    ),
+                },
+            }
+        )
+        return
+
     carrier_marker_pattern = re.compile(
         r"<\s*/?\s*PROM[A-Z0-9_-]{0,24}MEMORY\s*>",
         flags=re.IGNORECASE,
     )
-
-    if carrier_marker_pattern.search(prompt) is None:
-        _write_json(
-            {
-                "continue": True,
-            }
-        )
-        return
 
     carrier_pattern = re.compile(
         r"<PROMPT_MEMORY>\s*(.*?)\s*</PROMPT_MEMORY>",
@@ -1365,90 +1676,85 @@ def _handle_prompt_memory_pre_tool_use(
         ),
     )
 
-    matches = list(
-        carrier_pattern.finditer(
-            prompt
-        )
-    )
+    clean_prompt = prompt
 
-    # Exactly one complete carrier may cause a memory write.
-    # Zero/multiple/malformed carriers are rejected silently.
-    if len(matches) == 1:
-        body = (
-            matches[0]
-            .group(1)
-            .strip()
+    if carrier_marker_pattern.search(prompt) is not None:
+        matches = list(
+            carrier_pattern.finditer(
+                prompt
+            )
         )
 
-        if body:
-            session_id = _get_required_string(
-                payload,
-                "session_id",
+        if len(matches) == 1:
+            body = (
+                matches[0]
+                .group(1)
+                .strip()
             )
 
-            state = (
-                get_active_state(
-                    session_id
-                )
-                if session_id is not None
-                else None
-            )
-
-            write_allowed = (
-                state is not None
-                and has_prior_closed_turn(
-                    state
-                )
-                and not state.prompt_memory_written
-            )
-
-            if write_allowed:
-                wrapped_memory_message = (
-                    "<ORCHESTRATION_MEMORY>\n"
-                    + body
-                    + "\n</ORCHESTRATION_MEMORY>"
+            if body:
+                session_id = _get_required_string(
+                    payload,
+                    "session_id",
                 )
 
-                memory_before = read_memory(
-                    identity,
-                    "prompt_agent",
+                state = (
+                    get_active_state(
+                        session_id
+                    )
+                    if session_id is not None
+                    else None
                 )
 
-                process_agent_memory_message(
-                    identity,
-                    "prompt_agent",
-                    wrapped_memory_message,
-                )
-
-                memory_after = read_memory(
-                    identity,
-                    "prompt_agent",
-                )
-
-                if memory_after != memory_before:
-                    mark_prompt_memory_written(
+                write_allowed = (
+                    state is not None
+                    and has_prior_closed_turn(
                         state
                     )
+                    and not state.prompt_memory_written
+                )
 
-    # Always remove complete carrier blocks before the specialist
-    # receives the Agent prompt, even when the memory update was invalid.
-    clean_prompt = carrier_pattern.sub(
-        "",
-        prompt,
-    )
+                if write_allowed:
+                    wrapped_memory_message = (
+                        "<ORCHESTRATION_MEMORY>\n"
+                        + body
+                        + "\n</ORCHESTRATION_MEMORY>"
+                    )
 
-    # The carrier contract requires metadata to be appended at the end.
-    # After removing valid complete carriers, any remaining PROM...MEMORY
-    # marker is malformed/orphaned metadata. Truncate from its first
-    # occurrence rather than leaking it to the specialist.
-    suspicious_tail = carrier_marker_pattern.search(
-        clean_prompt
-    )
+                    memory_before = read_memory(
+                        identity,
+                        "prompt_agent",
+                    )
 
-    if suspicious_tail is not None:
-        clean_prompt = clean_prompt[
-            : suspicious_tail.start()
-        ]
+                    process_agent_memory_message(
+                        identity,
+                        "prompt_agent",
+                        wrapped_memory_message,
+                    )
+
+                    memory_after = read_memory(
+                        identity,
+                        "prompt_agent",
+                    )
+
+                    if memory_after != memory_before:
+                        mark_prompt_memory_written(
+                            state
+                        )
+
+        clean_prompt = carrier_pattern.sub(
+            "",
+            prompt,
+        )
+
+        suspicious_tail = carrier_marker_pattern.search(
+            clean_prompt
+        )
+
+        if suspicious_tail is not None:
+            clean_prompt = clean_prompt[
+                : suspicious_tail.start()
+            ]
 
     clean_prompt = re.sub(
         r"\n{3,}",
@@ -1456,18 +1762,53 @@ def _handle_prompt_memory_pre_tool_use(
         clean_prompt,
     ).strip()
 
+    max_chars = (
+        MAX_ALGORITHM_DELTA_CHARS
+        if agent_type == "algorithm_agent"
+        else MAX_TEST_DELTA_CHARS
+    )
+
+    if len(clean_prompt) > max_chars:
+        _write_json(
+            {
+                "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"{canonical_type_by_role[agent_type]} task delta is "
+                        f"{len(clean_prompt)} characters; hard limit is "
+                        f"{max_chars}. Resynthesize only the task-specific delta "
+                        "instead of restating the user prompt or conversation."
+                    ),
+                },
+            }
+        )
+        return
+
     updated_input = dict(
         tool_input
     )
+
     updated_input["prompt"] = (
         clean_prompt
     )
+    updated_input["subagent_type"] = (
+        canonical_type_by_role[
+            agent_type
+        ]
+    )
+    updated_input["run_in_background"] = False
 
     _write_json(
         {
             "continue": True,
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": (
+                    "Configured specialist delegation accepted."
+                ),
                 "tool_input": updated_input,
             },
         }
