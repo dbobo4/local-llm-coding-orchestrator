@@ -808,6 +808,114 @@ chat context proxy    : 127.0.0.1:8081
 llama.cpp backend     : 127.0.0.1:8080
 ```
 
+#### How the browser, proxy, and llama.cpp path fit together
+
+`qwen chat` does not replace or modify the llama.cpp Web UI. The launcher starts the normal local runtime, inserts one loopback proxy into the browser's HTTP path, and then opens a dedicated Chrome app window.
+
+```text
+qwen chat
+    |
+    v
+qwen_chat.ps1
+    |
+    +--> ensure llama.cpp is running on 127.0.0.1:8080
+    |
+    +--> start qwen_chat_context_proxy.py on 127.0.0.1:8081
+    |
+    +--> open a dedicated Chrome app window
+         with the normal llama.cpp Web UI:
+         http://127.0.0.1:8080/?model=qwen3.8-27b-chat
+```
+
+The important distinction is between the **destination** and the **route**. The Web UI still targets llama.cpp on `127.0.0.1:8080`, but that Chrome instance is launched with a proxy configuration pointing at `127.0.0.1:8081`. Loopback bypass is disabled for that dedicated browser instance, so its local HTTP requests pass through the proxy first.
+
+```text
+what the Web UI targets:
+
+Chrome / Web UI
+    -> http://127.0.0.1:8080/...
+
+actual network route:
+
+Chrome / Web UI
+    -> qwen_chat_context_proxy.py :8081
+    -> llama.cpp                  :8080
+    -> Qwen model
+```
+
+The proxy is therefore in the path for both the initial Web UI load and the later chat requests. The difference is that ordinary Web UI/static traffic is only relayed, while `/v1/chat/completions` is inspected and may be rewritten by the context manager.
+
+The complete request path is:
+
+```text
+1. Chrome asks for the llama.cpp Web UI on port 8080
+   GET http://127.0.0.1:8080/?model=qwen3.8-27b-chat
+   |
+   v
+2. Because this Chrome instance uses the 8081 proxy,
+   that GET reaches qwen_chat_context_proxy.py first
+   |
+   v
+3. The proxy forwards the GET to llama.cpp on 8080
+   |
+   v
+4. llama.cpp returns the Web UI response
+   (HTML / JavaScript / CSS / other assets)
+   |
+   v
+5. The proxy relays that response back to Chrome
+   |
+   v
+6. Chrome renders and displays the normal llama.cpp chat UI
+
+
+then, when the user sends a message:
+
+
+7. The Web UI JavaScript creates the normal chat request
+   POST /v1/chat/completions
+   |
+   v
+8. That POST also reaches qwen_chat_context_proxy.py on 8081 first
+   |
+   v
+9. For this endpoint the proxy runs the chat-context policy:
+      - count effective history
+      - reuse a cached snapshot when possible
+      - compact when required
+      - rollover when required
+      - use bounded fold recovery for overfull legacy history
+   |
+   v
+10. The proxy forwards the resulting safe request to llama.cpp on 8080
+    |
+    v
+11. llama.cpp runs the Qwen model and returns the generated response
+    |
+    v
+12. The proxy relays the response back to the Web UI
+```
+
+So the browser, the built-in llama.cpp Web UI, the llama.cpp backend, and the model all remain the normal components. The only added component is the proxy in the middle.
+
+For ordinary Web UI/static requests, the proxy simply relays the request to the original llama.cpp destination. For chat generation, the proxy sees the request before llama.cpp does and can automatically enforce the context policy:
+
+```text
+incoming POST /v1/chat/completions
+    |
+    +--> count effective history
+    |
+    +--> below 24888
+    |      -> forward normally
+    |
+    +--> at/above 24888
+           -> compact / reuse snapshot / rollover as needed
+           -> for overfull legacy history, use bounded fold recovery
+           -> forward the resulting safe request to llama.cpp :8080
+```
+
+The response returns through the same proxy path to the browser. No separate `qwen compact` command is invoked: the proxy performs the checks and any required internal llama.cpp chat-completions calls automatically as part of handling the browser request.
+
 This preserves the Web UI origin and its browser-side conversation storage while allowing the local proxy to intercept outbound `/v1/chat/completions` requests before they reach llama.cpp.
 
 The proxy preserves browser compression capability for Web UI/static traffic: the browser's `Accept-Encoding` value is forwarded upstream (with `gzip` as fallback), so llama.cpp can serve its compressed frontend normally. For `/v1/chat/completions`, the proxy deliberately requests `identity` encoding to keep completion/SSE relay behavior deterministic.
