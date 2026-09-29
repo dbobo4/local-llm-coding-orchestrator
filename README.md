@@ -731,6 +731,7 @@ The coding and plain-chat interfaces share the same physical GGUF and the same `
 | Rollover mechanism | fresh `LlmChat` in the same logical Qwen session | replace the old request prefix with one canonical snapshot and preserve the newest unsummarized turn |
 | Coding orchestration | PROMPT / ALGORITHM / TEST | none |
 | Per-turn growth guard | coding profile: `8192` tokens | no Qwen Code growth guard; bounded by the chat proxy policy |
+| Legacy overfull-history recovery | not applicable to plain browser history | bounded fold: ~`14000`-token source chunks, ~`18000`-token internal-request ceiling, max `8` fold chunks |
 
 The shared values are policy alignment, not shared conversation state. A coding session and a browser-chat conversation remain independent.
 
@@ -809,6 +810,8 @@ llama.cpp backend     : 127.0.0.1:8080
 
 This preserves the Web UI origin and its browser-side conversation storage while allowing the local proxy to intercept outbound `/v1/chat/completions` requests before they reach llama.cpp.
 
+The proxy preserves browser compression capability for Web UI/static traffic: the browser's `Accept-Encoding` value is forwarded upstream (with `gzip` as fallback), so llama.cpp can serve its compressed frontend normally. For `/v1/chat/completions`, the proxy deliberately requests `identity` encoding to keep completion/SSE relay behavior deterministic.
+
 For each chat request the proxy:
 
 ```text
@@ -842,6 +845,22 @@ Snapshots are persisted under the dedicated chat state:
 ```
 
 The cache records the model, summarized prefix length, exact prefix hash, canonical snapshot, action, and before/after token counts. When the browser sends the same historical prefix again on a later turn, the proxy can reuse that snapshot instead of re-summarizing the same prefix.
+
+Legacy conversations that were already near or beyond the hard context limit before this proxy existed need a separate recovery path. A single internal compaction request cannot safely include that entire history because the recovery request itself would overflow the model context.
+
+For that case the proxy performs a bounded **fold** before normal compaction/rollover continues:
+
+```text
+large legacy history
+    -> split into ~14000-token source chunks
+    -> chunk 1 -> canonical snapshot S1
+    -> S1 + chunk 2 -> canonical snapshot S2
+    -> S2 + chunk 3 -> canonical snapshot S3
+    -> ...
+    -> final canonical snapshot
+```
+
+Each internal recovery request is kept below an ~`18000`-token ceiling, and at most `8` fold chunks are allowed. A single oversized historical message is itself split into bounded text pieces when needed. Every fold step carries forward only the previous canonical snapshot plus the next chunk, so the proxy never has to submit the full overfull history to llama.cpp in one request.
 
 If ordinary compaction stalls, plain chat performs its own **rollover**. This is not a Qwen Code `LlmChat` rollover. The proxy creates a minimal canonical replacement state, discards the old request prefix for that outbound request, and preserves:
 

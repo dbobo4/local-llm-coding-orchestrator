@@ -33,6 +33,13 @@ MIN_PROGRESS_FRACTION = 0.01
 RECENT_TAIL_MESSAGES = 4
 CACHE_MAX_RECORDS = 512
 
+# Internal recovery requests must stay comfortably below the physical context.
+# Large legacy histories are folded in bounded chunks before normal compaction
+# or rollover continues.
+INTERNAL_COMPACTION_INPUT_LIMIT = 18000
+INTERNAL_COMPACTION_CHUNK_TARGET = 14000
+MAX_INTERNAL_FOLD_CHUNKS = 8
+
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
@@ -376,7 +383,137 @@ class ContextManager:
                 parts.append("[MESSAGE METADATA]\n" + canonical_json(extras))
         return "\n\n".join(parts)
 
-    def _completion(self, system_prompt: str, source_messages: list[dict[str, Any]]) -> str:
+    def _source_token_estimate(self, source_messages: list[dict[str, Any]]) -> int:
+        if not source_messages:
+            return 0
+        raw = self.count_text_tokens(self._format_source(source_messages))
+        return math.ceil(raw * 1.08) + 256
+
+    def _internal_request_token_estimate(
+        self,
+        system_prompt: str,
+        source_messages: list[dict[str, Any]],
+    ) -> int:
+        source = self._format_source(source_messages)
+        prompt = (
+            system_prompt
+            + "\n\nCreate the canonical state snapshot from this conversation "
+            "source. Do not answer the conversation itself.\n\n"
+            + source
+        )
+        raw = self.count_text_tokens(prompt)
+        return math.ceil(raw * 1.08) + 512
+
+    def _split_message_for_source_budget(
+        self,
+        message: dict[str, Any],
+        source_budget: int,
+    ) -> list[dict[str, Any]]:
+        if self._source_token_estimate([message]) <= source_budget:
+            return [dict(message)]
+
+        content = extract_text(message.get("content"))
+        if not content:
+            raise RuntimeError(
+                "A historical message is too large to fold safely and has no "
+                "splittable text content."
+            )
+
+        role = str(message.get("role", "user"))
+        extras = {
+            k: v
+            for k, v in message.items()
+            if k not in {"role", "content"}
+        }
+
+        pieces: list[dict[str, Any]] = []
+        remaining = content
+        first = True
+
+        while remaining:
+            lo = 1
+            hi = len(remaining)
+            best = 0
+
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate: dict[str, Any] = {
+                    "role": role,
+                    "content": remaining[:mid],
+                }
+                if first:
+                    candidate.update(extras)
+
+                if self._source_token_estimate([candidate]) <= source_budget:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+            if best <= 0:
+                raise RuntimeError(
+                    "A historical message could not be split into a safe "
+                    "internal compaction chunk."
+                )
+
+            piece: dict[str, Any] = {
+                "role": role,
+                "content": remaining[:best],
+            }
+            if first:
+                piece.update(extras)
+            pieces.append(piece)
+
+            remaining = remaining[best:]
+            first = False
+
+        return pieces
+
+    def _chunk_source_messages(
+        self,
+        source_messages: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
+        atomic: list[dict[str, Any]] = []
+
+        for message in source_messages:
+            atomic.extend(
+                self._split_message_for_source_budget(
+                    message,
+                    INTERNAL_COMPACTION_CHUNK_TARGET,
+                )
+            )
+
+        chunks: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+
+        for message in atomic:
+            candidate = current + [message]
+            if (
+                current
+                and self._source_token_estimate(candidate)
+                > INTERNAL_COMPACTION_CHUNK_TARGET
+            ):
+                chunks.append(current)
+                current = [message]
+            else:
+                current = candidate
+
+        if current:
+            chunks.append(current)
+
+        if len(chunks) > MAX_INTERNAL_FOLD_CHUNKS:
+            raise RuntimeError(
+                "Legacy history requires too many bounded compaction chunks: "
+                f"{len(chunks)} > {MAX_INTERNAL_FOLD_CHUNKS}."
+            )
+
+        return chunks
+
+    def _completion_once(
+        self,
+        system_prompt: str,
+        source_messages: list[dict[str, Any]],
+    ) -> str:
         source = self._format_source(source_messages)
         payload = {
             "model": self.model,
@@ -417,6 +554,51 @@ class ContextManager:
             raise RuntimeError("Compaction response did not contain <state_snapshot>.")
         if self.count_text_tokens(snapshot) > COMPACT_MAX_OUTPUT_TOKENS:
             raise RuntimeError("Compaction snapshot exceeds the hard output cap.")
+        return snapshot
+
+    def _completion(
+        self,
+        system_prompt: str,
+        source_messages: list[dict[str, Any]],
+    ) -> str:
+        if (
+            self._internal_request_token_estimate(
+                system_prompt,
+                source_messages,
+            )
+            <= INTERNAL_COMPACTION_INPUT_LIMIT
+        ):
+            return self._completion_once(system_prompt, source_messages)
+
+        chunks = self._chunk_source_messages(source_messages)
+        if not chunks:
+            raise RuntimeError("No source chunks were available for compaction.")
+
+        snapshot = None
+
+        for chunk in chunks:
+            fold_source = list(chunk)
+            if snapshot is not None:
+                fold_source = [snapshot_message(snapshot)] + fold_source
+
+            estimate = self._internal_request_token_estimate(
+                system_prompt,
+                fold_source,
+            )
+            if estimate > INTERNAL_COMPACTION_INPUT_LIMIT:
+                raise RuntimeError(
+                    "Bounded compaction chunk still exceeds the internal request "
+                    f"limit: {estimate} > {INTERNAL_COMPACTION_INPUT_LIMIT}."
+                )
+
+            snapshot = self._completion_once(
+                system_prompt,
+                fold_source,
+            )
+
+        if snapshot is None:
+            raise RuntimeError("Bounded compaction produced no snapshot.")
+
         return snapshot
 
     def _candidate(
@@ -691,6 +873,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "compact_max_output_tokens": COMPACT_MAX_OUTPUT_TOKENS,
             "snapshot_target_tokens": [SNAPSHOT_TARGET_LOW, SNAPSHOT_TARGET_HIGH],
             "max_compaction_passes": MAX_COMPACTION_PASSES,
+            "internal_compaction_input_limit": INTERNAL_COMPACTION_INPUT_LIMIT,
+            "internal_compaction_chunk_target": INTERNAL_COMPACTION_CHUNK_TARGET,
+            "max_internal_fold_chunks": MAX_INTERNAL_FOLD_CHUNKS,
             "stats": s.snapshot_stats(),
         })
 
@@ -820,6 +1005,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 timeout=360,
             )
             headers = {}
+            client_accept_encoding = self.headers.get("Accept-Encoding")
+            is_chat_completion = (
+                self.command == "POST"
+                and request_path == "/v1/chat/completions"
+            )
             for k, v in self.headers.items():
                 if k.lower() in HOP_BY_HOP or k.lower() in {"host", "content-length", "accept-encoding"}:
                     continue
@@ -827,7 +1017,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             headers["Host"] = (
                 f"{self.server.args.backend_host}:{self.server.args.backend_port}"
             )
-            headers["Accept-Encoding"] = "identity"
+            if is_chat_completion:
+                headers["Accept-Encoding"] = "identity"
+            else:
+                headers["Accept-Encoding"] = client_accept_encoding or "gzip"
             if body:
                 headers["Content-Length"] = str(len(body))
 

@@ -349,14 +349,20 @@ qwen
 
 qwen chat
   -> dedicated loopback qwen_chat_context_proxy.py
+  -> browser gzip/static forwarding preserved
   -> 2048-token hard snapshot cap
   -> 600-1000-token canonical target
-  -> up to 8 passes
+  -> up to 8 normal compaction/rollover passes
+  -> legacy overfull history: bounded ~14k source chunks
+     + ~18k internal-request ceiling
+     + max 8 fold chunks
   -> stalled compaction: canonical request-prefix rollover
   -> exact-prefix snapshot reuse
 ```
 
-For both paths, a useful pass must reduce context by at least `max(128 tokens, 1%)`.
+For both paths, a useful normal compaction pass must reduce context by at least `max(128 tokens, 1%)`.
+
+The legacy plain-chat fold exists for conversations that were already overfull before bounded chat context management was active. It repeatedly summarizes one bounded history chunk together with the previous canonical snapshot, so the recovery request itself never needs to carry the entire legacy transcript.
 
 Durable orchestration memory is a separate Qwen Code concept. It persists selected stable project facts across sessions; context compaction preserves only the active continuation state needed to keep the current conversation moving. Plain chat does not use orchestration durable memory.
 

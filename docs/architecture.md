@@ -840,11 +840,16 @@ qwen
 qwen chat
   -> llama.cpp Web UI
   -> independent qwen_chat_context_proxy.py
+  -> preserve gzip capability for Web UI/static traffic
   -> prefix compaction + persistent exact-prefix snapshot cache
+  -> legacy overfull history: bounded ~14k-token fold chunks
+     with ~18k internal-request ceiling, max 8 chunks
   -> stalled compaction: canonical request-prefix rollover
 ```
 
-Both paths use a `2048` hard snapshot generation cap, `600-1000` token soft snapshot target, at most `8` passes, and `max(128 tokens, 1%)` minimum accepted progress.
+Both paths use a `2048` hard snapshot generation cap, `600-1000` token soft snapshot target, at most `8` normal compaction/rollover passes, and `max(128 tokens, 1%)` minimum accepted progress.
+
+Plain-chat legacy recovery is an additional bounded internal fold used only when pre-existing browser history is already too large to summarize in one safe request. It uses ~`14000`-token source chunks, an ~`18000`-token internal-request ceiling, and at most `8` fold chunks. This recovery path does not merge plain-chat state with Qwen Code or orchestration state.
 
 Plain chat still bypasses Qwen Code orchestration, roles, hooks, project identity, and durable memory. The generic Qwen Code context-growth default remains `0`; that setting does not control the separate plain-chat proxy.
 
