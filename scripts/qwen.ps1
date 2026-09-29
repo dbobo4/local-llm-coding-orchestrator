@@ -1,5 +1,23 @@
 $ErrorActionPreference = "Stop"
 
+# LOCALAI_NODE_SYSTEM_CA
+# Qwen Code runs on Node.js. Reuse the Windows system CA store for HTTPS/MCP TLS.
+$LocalAiNodeSystemCaFlag = "--use-system-ca"
+$LocalAiNodeOptions = [string]$env:NODE_OPTIONS
+
+if ($LocalAiNodeOptions -notmatch '(^|\s)--use-system-ca(\s|$)') {
+    if ([string]::IsNullOrWhiteSpace($LocalAiNodeOptions)) {
+        $env:NODE_OPTIONS = $LocalAiNodeSystemCaFlag
+    }
+    else {
+        $env:NODE_OPTIONS = (
+            $LocalAiNodeOptions.TrimEnd() +
+            " " +
+            $LocalAiNodeSystemCaFlag
+        )
+    }
+}
+
 $RepoRoot = Split-Path $PSScriptRoot -Parent
 $ConfigPath = Join-Path $RepoRoot "config\local.ps1"
 
