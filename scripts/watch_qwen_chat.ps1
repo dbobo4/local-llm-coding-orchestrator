@@ -9,17 +9,46 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
 
 . $ConfigPath
 
+if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
+    $ChatModelAlias = "qwen3.8-27b-chat"
+}
+
+if ($null -eq $ChatProxyPort -or [int]$ChatProxyPort -le 0) {
+    $ChatProxyPort = 8081
+}
+
 $ServerManager = Join-Path `
     $QwenRoot `
     "config\qwen_server.ps1"
 
-if (-not (Test-Path $ServerManager -PathType Leaf)) {
-    throw "Qwen server manager not found: $ServerManager"
+$ContextProxy = Join-Path `
+    $QwenRoot `
+    "config\qwen_chat_context_proxy.py"
+
+foreach ($required in @(
+    $ServerManager,
+    $ContextProxy
+)) {
+    if (-not (Test-Path $required -PathType Leaf)) {
+        throw "Required Qwen chat watcher file not found: $required"
+    }
 }
 
-$BrowserProfile = Join-Path `
+$ChatRoot = Join-Path `
     $QwenUserRoot `
-    "chat_ui\browser-profile"
+    "chat_ui"
+
+$BrowserProfile = Join-Path `
+    $ChatRoot `
+    "browser-profile"
+
+$ProxyStateRoot = Join-Path `
+    $ChatRoot `
+    "context-proxy"
+
+$ProxyInstancePath = Join-Path `
+    $ProxyStateRoot `
+    "instance.json"
 
 $ClientStateRoot = Join-Path `
     $QwenUserRoot `
@@ -31,6 +60,16 @@ $ChatLeasePath = Join-Path `
 
 $ChatAppPrefix = (
     "--app=http://${ServerHost}:${ServerPort}/"
+)
+
+$ProxyHealthUrl = (
+    "http://${ServerHost}:${ChatProxyPort}" +
+    "/__localai_chat_proxy/health"
+)
+
+$ProxyShutdownUrl = (
+    "http://${ServerHost}:${ChatProxyPort}" +
+    "/__localai_chat_proxy/shutdown"
 )
 
 function Test-QwenChatWindowActive {
@@ -86,6 +125,83 @@ function Test-QwenChatWindowActive {
     return $false
 }
 
+function Get-QwenChatProxyHealth {
+    try {
+        $response = Invoke-RestMethod `
+            -Uri $ProxyHealthUrl `
+            -Method Get `
+            -TimeoutSec 2 `
+            -ErrorAction Stop
+
+        if (
+            [string]$response.status -eq "ok" -and
+            [int]$response.listen_port -eq [int]$ChatProxyPort -and
+            [int]$response.backend_port -eq [int]$ServerPort -and
+            [string]$response.model -eq [string]$ChatModelAlias
+        ) {
+            return $response
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Stop-QwenChatContextProxy {
+    $health = Get-QwenChatProxyHealth
+
+    if ($null -eq $health) {
+        return
+    }
+
+    if (-not (
+        Test-Path `
+            -LiteralPath $ProxyInstancePath `
+            -PathType Leaf
+    )) {
+        throw (
+            "Qwen chat context proxy is active, but its instance file " +
+            "is missing: $ProxyInstancePath"
+        )
+    }
+
+    $instance = Get-Content `
+        -LiteralPath $ProxyInstancePath `
+        -Raw `
+        -Encoding UTF8 |
+    ConvertFrom-Json
+
+    $token = [string]$instance.shutdown_token
+
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw "Qwen chat context proxy shutdown token is missing."
+    }
+
+    Invoke-RestMethod `
+        -Uri $ProxyShutdownUrl `
+        -Method Post `
+        -Headers @{
+            "X-LocalAI-Proxy-Token" = $token
+        } `
+        -TimeoutSec 5 `
+        -ErrorAction Stop |
+    Out-Null
+
+    $deadline = (Get-Date).AddSeconds(10)
+
+    while ((Get-Date) -lt $deadline) {
+        if ($null -eq (Get-QwenChatProxyHealth)) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
+
+    throw "Qwen chat context proxy did not stop cleanly."
+}
+
 New-Item `
     -Path $ClientStateRoot `
     -ItemType Directory `
@@ -108,6 +224,8 @@ catch [System.IO.IOException] {
     # Another watcher already owns the chat lease.
     exit 0
 }
+
+$watcherError = $null
 
 try {
     $startupDeadline = (
@@ -157,12 +275,23 @@ try {
         }
     }
 }
+catch {
+    $watcherError = $_
+}
 finally {
+    try {
+        Stop-QwenChatContextProxy
+    }
+    catch {
+        if ($null -eq $watcherError) {
+            $watcherError = $_
+        }
+    }
+
     if ($null -ne $LeaseStream) {
         $LeaseStream.Dispose()
         $LeaseStream = $null
     }
-
 }
 
 & powershell.exe `
@@ -173,4 +302,13 @@ finally {
     -IfIdle |
 Out-Null
 
-exit $LASTEXITCODE
+$serverStopExitCode = $LASTEXITCODE
+
+if ($null -ne $watcherError) {
+    Write-Error `
+        -Message $watcherError.Exception.Message `
+        -ErrorAction Continue
+    exit 1
+}
+
+exit $serverStopExitCode

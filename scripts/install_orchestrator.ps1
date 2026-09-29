@@ -62,6 +62,7 @@ $SourceUpdateManager = Join-Path $RepoRoot "scripts\qwen_update.ps1"
 $SourceQwenLauncher = Join-Path $RepoRoot "scripts\qwen.ps1"
 $SourceChatLauncher = Join-Path $RepoRoot "scripts\qwen_chat.ps1"
 $SourceChatWatcher = Join-Path $RepoRoot "scripts\watch_qwen_chat.ps1"
+$SourceChatContextProxy = Join-Path $RepoRoot "scripts\qwen_chat_context_proxy.py"
 $SourceBenchmark = Join-Path $RepoRoot "benchmark\benchmark_qwen.ps1"
 
 $RequiredFiles = @(
@@ -81,6 +82,7 @@ $RequiredFiles = @(
     $SourceQwenLauncher,
     $SourceChatLauncher,
     $SourceChatWatcher,
+    $SourceChatContextProxy,
     $SourceBenchmark
 )
 
@@ -112,6 +114,7 @@ $Targets = @{
     $SourceQwenLauncher = Join-Path $QwenRoot "config\qwen_cli.ps1"
     $SourceChatLauncher = Join-Path $QwenRoot "config\qwen_chat.ps1"
     $SourceChatWatcher = Join-Path $QwenRoot "config\watch_qwen_chat.ps1"
+    $SourceChatContextProxy = Join-Path $QwenRoot "config\qwen_chat_context_proxy.py"
     $SourceBenchmark = Join-Path $QwenRoot "config\benchmark_qwen.ps1"
 }
 
@@ -158,6 +161,7 @@ foreach ($requiredProductionFile in @(
     (Join-Path $QwenRoot "config\qwen_cli.ps1"),
     (Join-Path $QwenRoot "config\qwen_chat.ps1"),
     (Join-Path $QwenRoot "config\watch_qwen_chat.ps1"),
+    (Join-Path $QwenRoot "config\qwen_chat_context_proxy.py"),
     (Join-Path $QwenRoot "config\benchmark_qwen.ps1")
 )) {
     if (-not (Test-Path -LiteralPath $requiredProductionFile -PathType Leaf)) {

@@ -28,7 +28,7 @@ The coding path automatically:
 6. releases the CLI lease;
 7. stops the shared runtime only when no CLI or chat client remains active.
 
-The chat path starts or reuses the same router, opens the built-in llama.cpp Web UI in a dedicated Chrome app window, and keeps a chat lease active until that window is closed.
+The chat path starts or reuses the same router and an independent loopback context proxy, opens the built-in llama.cpp Web UI in a dedicated Chrome app window, and keeps a chat lease active until that window is closed.
 
 Normal production coding use remains interactive.
 ## Initial repository configuration
@@ -67,6 +67,7 @@ AlgorithmReasoningEffort
 TestReasoningEffort
 ServerHost
 ServerPort
+ChatProxyPort
 ```
 
 The default example root is:
@@ -102,7 +103,7 @@ workflow_state.py
 
 into the configured Qwen user/orchestration directories.
 
-It also merges the Qwen Code settings required by this project.
+It also deploys the canonical runtime managers and launch helpers into the configured Qwen runtime root, including `qwen_chat.ps1`, `watch_qwen_chat.ps1`, and `qwen_chat_context_proxy.py`, then merges the Qwen Code settings required by this project.
 
 The installer:
 
@@ -155,6 +156,7 @@ The chat path:
 ```text
 browser
   -> built-in llama.cpp Web UI
+  -> qwen_chat_context_proxy.py
   -> shared llama.cpp router
   -> qwen3.8-27b-chat
 ```
@@ -183,6 +185,7 @@ with:
 ```text
 browser-profile\
 exports\
+context-proxy\
 ```
 
 The dedicated profile keeps llama.cpp Web UI browser storage separate from the user's ordinary browser profile.
@@ -332,39 +335,32 @@ ALGORITHM does not receive PROMPT/project memory wholesale.
 TEST does not inherit ALGORITHM rationale, verdict-like claims, or ALGORITHM-private memory. It independently chooses what to inspect and what checks are sufficient.
 
 Prompt-memory transport is also hidden from specialists: an eligible `<PROMPT_MEMORY>` carrier is processed by `PreToolUse` and stripped before the real `Agent` invocation.
-## Context management versus durable memory
+## Context management
 
-The reference model context window is:
-
-```text
-40960 tokens
-```
-
-Qwen Code session context still has normal context-window limits. Durable project memory and conversational compaction solve different problems.
-
-The local runtime compression optimization uses:
+The reference physical context window is `40960` tokens. Both normal entry points compact before that hard limit, using a `24888` soft threshold, but the mechanisms are independent.
 
 ```text
-COMPACT_MAX_OUTPUT_TOKENS = 2048
-AUTO_COMPACTION_THRESHOLD = 24888
-CONTEXT_WINDOW = 40960
+qwen
+  -> patched Qwen Code LlmChat context manager
+  -> 2048-token hard snapshot cap
+  -> 600-1000-token canonical target
+  -> up to 8 passes
+  -> stalled compaction: fresh LlmChat rollover
 
-<state_snapshot>
-  <goal>
-  <durable_constraints>
-  <current_state>
-  <open_issues>
-  <next_step>
-</state_snapshot>
+qwen chat
+  -> dedicated loopback qwen_chat_context_proxy.py
+  -> 2048-token hard snapshot cap
+  -> 600-1000-token canonical target
+  -> up to 8 passes
+  -> stalled compaction: canonical request-prefix rollover
+  -> exact-prefix snapshot reuse
 ```
 
-The canonical replacement snapshot has a soft target of roughly 600-1000 tokens and omits full messages, long code, routine tool calls, transient exploration, and superseded state.
+For both paths, a useful pass must reduce context by at least `max(128 tokens, 1%)`.
 
-The runtime manager accepts the previous optimized `4096` state as `legacy` and migrates it to the current `2048` state. Unknown or mixed compression structures fail closed.
+Durable orchestration memory is a separate Qwen Code concept. It persists selected stable project facts across sessions; context compaction preserves only the active continuation state needed to keep the current conversation moving. Plain chat does not use orchestration durable memory.
 
-Durable memory persists selected stable facts across sessions; compaction preserves only enough active execution state to continue the current conversation.
-
-Measured 4096/3072/2048 results and the semantic-retention checks are documented in [Compression tuning](compression_tuning.md).
+The complete Qwen Code and Qwen Chat flows, including snapshot contents, cache behavior, rollover semantics, and failure behavior, are documented in [Context Management, Compaction and Rollover](../README.md#context-management-compaction-and-rollover).
 ## Interactive versus headless execution
 
 This distinction matters for tool permissions.
@@ -451,6 +447,7 @@ qwen
 qwen chat
   -> chat lease
   -> dedicated browser Web UI
+  -> independent context proxy
 
 either lease active
   -> keep shared router/model alive
@@ -811,5 +808,5 @@ Do not start a second standalone llama.cpp server for the chat path. Both entry 
 <!-- LOCALAI_GROWTH_GUARD_BEGIN -->
 ### Per-turn context-growth guard
 
-The LocalAI coding profile sets `model.maxContextGrowthTokensPerTurn` to `8192`. The Qwen Code runtime default is `0`, so the guard is opt-in and plain chat remains unchanged. Compaction and same-session rollover do not refund already-consumed growth.
+The LocalAI coding profile sets `model.maxContextGrowthTokensPerTurn` to `8192`. The generic Qwen Code runtime default is `0`, so the Qwen Code growth guard is opt-in. Plain chat is bounded independently by `qwen_chat_context_proxy.py`. Qwen Code compaction and same-session rollover do not refund already-consumed growth.
 <!-- LOCALAI_GROWTH_GUARD_END -->

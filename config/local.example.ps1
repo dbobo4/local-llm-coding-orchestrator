@@ -21,6 +21,7 @@ $AlgorithmReasoningEffort = "xhigh"
 $TestReasoningEffort = "medium"
 $ServerHost = "127.0.0.1"
 $ServerPort = 8080
+$ChatProxyPort = 8081
 
 # Benchmark-tunable inference settings.
 # The unified benchmark may update only these local values after explicit approval.

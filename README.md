@@ -40,10 +40,10 @@ The objective is not simply to run a local coding model. The repository focuses 
 - Explicit bounded workflow and anti-loop state
 - Role-specific reasoning effort on one physical GGUF
 - Qwen Code lifecycle hooks
-- Two compatibility patches plus a separate compression optimization
-- Bounded compaction handoff using `<state_snapshot>`
+- Two Qwen Code compatibility patches plus separate bounded context management
+- Independent Qwen Code and Qwen Chat compaction/rollover paths
 - Automatic shared local inference router startup and idle-aware shutdown
-- Optional plain llama.cpp Web UI through `qwen chat`
+- Plain llama.cpp Web UI through `qwen chat` with a dedicated loopback context proxy
 - CLI/chat client leases so either interface can keep the shared model alive
 - Fail-closed listener/process ownership checks
 - Non-destructive, idempotent Qwen settings installation
@@ -310,6 +310,7 @@ local-llm-coding-orchestrator/
 │   ├── qwen.cmd
 │   ├── qwen.ps1
 │   ├── qwen_chat.ps1
+│   ├── qwen_chat_context_proxy.py
 │   ├── qwen_server.ps1
 │   ├── qwen_update.ps1
 │   └── watch_qwen_chat.ps1
@@ -485,6 +486,7 @@ The installer:
 - installs the ALGORITHM and TEST agent definitions;
 - installs the complete orchestration runtime: dispatcher, maintenance, memory protocol/store, project identity/registry, and workflow-state modules;
 - installs the managed lifecycle and maintenance hooks;
+- deploys the canonical runtime managers, coding/chat launchers, chat watcher, and independent chat context proxy;
 - configures three role-specific logical OpenAI-compatible providers for PROMPT, ALGORITHM, and TEST, including their reasoning profiles;
 - preserves unrelated existing providers, environment settings, permission deny rules, UI/settings fields, and third-party hooks;
 - backs up existing managed files and `settings.json` before replacement;
@@ -528,7 +530,7 @@ Use:
 .\scripts\qwen.cmd chat
 ```
 
-This path bypasses Qwen Code orchestration, hooks, project memory, and agent roles. It opens the built-in llama.cpp Web UI in a dedicated Chrome app window, with Edge as fallback.
+This path bypasses Qwen Code orchestration, hooks, project memory, and agent roles. It opens the built-in llama.cpp Web UI in a dedicated Chrome app window, with Edge as fallback. The Web UI origin remains on the llama.cpp listener, while the dedicated browser routes its HTTP traffic through the independent local chat context proxy before requests reach the backend.
 
 Chat browser data is isolated under:
 
@@ -536,7 +538,7 @@ Chat browser data is isolated under:
 %USERPROFILE%\.qwen\chat_ui\
 ```
 
-including the dedicated browser profile and export directory.
+including the dedicated browser profile, export directory, and `context-proxy` snapshot/state directory.
 
 The shared inference router uses:
 
@@ -711,9 +713,151 @@ The corresponding provider entry in `settings.json` controls the reasoning profi
 
 The server-level `--reasoning-effort xhigh` remains the reference fallback/default. Role-specific requests can override that default without loading another GGUF or another inference server.
 
+## Context Management, Compaction and Rollover
+
+The coding and plain-chat interfaces share the same physical GGUF and the same `40960`-token llama.cpp context, but they do **not** share one conversation-context implementation.
+
+`qwen` uses Qwen Code's patched `LlmChat` lifecycle. `qwen chat` remains independent of Qwen Code and uses `scripts/qwen_chat_context_proxy.py` in front of the llama.cpp chat-completions API. The two paths intentionally use aligned safety values while keeping their state, orchestration, and rollover mechanics separate.
+
+| Context policy | Qwen Code (`qwen`) | Qwen Chat (`qwen chat`) |
+| --- | --- | --- |
+| Context window | `40960` | `40960` |
+| Soft compaction threshold | `24888` | `24888` |
+| Compaction output hard cap | `2048` tokens | `2048` tokens |
+| Canonical snapshot target | `600-1000` tokens | `600-1000` tokens |
+| Maximum compaction/rollover passes | `8` | `8` |
+| Minimum accepted progress | `max(128 tokens, 1%)` | `max(128 tokens, 1%)` |
+| Context manager | patched Qwen Code runtime | independent loopback chat proxy |
+| Rollover mechanism | fresh `LlmChat` in the same logical Qwen session | replace the old request prefix with one canonical snapshot and preserve the newest unsummarized turn |
+| Coding orchestration | PROMPT / ALGORITHM / TEST | none |
+| Per-turn growth guard | coding profile: `8192` tokens | no Qwen Code growth guard; bounded by the chat proxy policy |
+
+The shared values are policy alignment, not shared conversation state. A coding session and a browser-chat conversation remain independent.
+
+### Qwen Code
+
+Qwen Code context management operates inside the patched Qwen Code runtime.
+
+The normal path is:
+
+```text
+active LlmChat
+    |
+    v
+count active context
+    |
+    +--> below 24888
+    |      -> continue normally
+    |
+    +--> at/above 24888
+           -> compact older active conversation state
+           -> emit canonical <state_snapshot>
+           -> recount
+           -> repeat while useful, up to 8 total passes
+```
+
+The canonical Qwen Code snapshot preserves only continuation state:
+
+```text
+<state_snapshot>
+  <goal>...</goal>
+  <durable_constraints>...</durable_constraints>
+  <current_state>...</current_state>
+  <open_issues>...</open_issues>
+  <next_step>...</next_step>
+</state_snapshot>
+```
+
+The snapshot has a `600-1000` token soft target and a `2048` token hard generation cap. A compaction pass is useful only if it reduces the active context by at least `max(128 tokens, 1%)`.
+
+If compaction can no longer make enough progress, the runtime does not keep growing the same `LlmChat` until llama.cpp rejects the request. It performs a **same-session rollover**:
+
+```text
+old LlmChat
+    -> canonical continuation snapshot
+    -> fresh LlmChat
+       + system/runtime instructions
+       + canonical snapshot
+       + current necessary state
+```
+
+The logical Qwen session and physical model remain the same; only the active conversation context is replaced. This removes obsolete history and tool structure that ordinary in-place compaction may no longer be able to discard safely.
+
+The LocalAI coding profile also limits context growth to `8192` tokens per turn. Compaction and rollover do not refund already-consumed growth budget.
+
+PROMPT, ALGORITHM, and TEST do not share one unlimited transcript. Their role-specific contexts and lifecycles remain separate, and specialist handoffs carry only the bounded task/context material needed for that specialist.
+
+Qwen Code compaction is part of the local runtime optimization managed by `patches/qwen_runtime_patches.ps1`; it is separate from the two compatibility patches. Historical cap tuning and semantic-retention measurements remain in [Compression tuning](docs/compression_tuning.md).
+
+### Qwen Chat
+
+Plain chat deliberately bypasses Qwen Code, orchestration hooks, project memory, PROMPT/ALGORITHM/TEST routing, and Qwen Code `LlmChat` state.
+
+The browser still opens the normal llama.cpp Web UI origin:
+
+```text
+http://127.0.0.1:8080/
+```
+
+but the dedicated chat browser is launched with a loopback HTTP proxy:
+
+```text
+browser Web UI origin : 127.0.0.1:8080
+chat context proxy    : 127.0.0.1:8081
+llama.cpp backend     : 127.0.0.1:8080
+```
+
+This preserves the Web UI origin and its browser-side conversation storage while allowing the local proxy to intercept outbound `/v1/chat/completions` requests before they reach llama.cpp.
+
+For each chat request the proxy:
+
+```text
+raw browser message history
+    -> reuse the best exact-prefix cached snapshot when available
+    -> count the effective request
+    -> below 24888: forward unchanged/cached effective request
+    -> at/above 24888: compact
+```
+
+Token counting uses llama.cpp's `/tokenize` endpoint when available, with a conservative fallback estimate and an additional safety reserve for the later chat-template expansion.
+
+Compaction preserves leading `system` / `developer` messages, replaces an older conversation prefix with one canonical snapshot, and keeps recent unsummarized messages. The plain-chat snapshot uses:
+
+```text
+<state_snapshot>
+  <current_thread>...</current_thread>
+  <durable_user_instructions>...</durable_user_instructions>
+  <established_facts_and_decisions>...</established_facts_and_decisions>
+  <open_items>...</open_items>
+  <continuation_state>...</continuation_state>
+</state_snapshot>
+```
+
+Each accepted pass must make at least `max(128 tokens, 1%)` progress. The proxy can use progressively more aggressive prefix replacement, with a maximum of `8` compaction/rollover passes.
+
+Snapshots are persisted under the dedicated chat state:
+
+```text
+%USERPROFILE%\.qwen\chat_ui\context-proxy\snapshots.json
+```
+
+The cache records the model, summarized prefix length, exact prefix hash, canonical snapshot, action, and before/after token counts. When the browser sends the same historical prefix again on a later turn, the proxy can reuse that snapshot instead of re-summarizing the same prefix.
+
+If ordinary compaction stalls, plain chat performs its own **rollover**. This is not a Qwen Code `LlmChat` rollover. The proxy creates a minimal canonical replacement state, discards the old request prefix for that outbound request, and preserves:
+
+```text
+leading system/developer messages
++ canonical rollover snapshot
++ newest unsummarized turn
+```
+
+The result must fall below the `24888` soft threshold before it is forwarded. If even the newest required turn plus canonical state cannot fit safely, the proxy fails closed rather than forwarding a request that is expected to overflow the configured context.
+
+This keeps `qwen chat` independent while giving it the same bounded-context objective as the coding path: compact before the `40960` hard context limit, detect ineffective compaction, and replace stale history with canonical continuation state before an overflow occurs.
+
 ## Qwen Code compatibility layer
 
-The runtime manager intentionally distinguishes **two compatibility patches** from a separate **compression optimization**.
+The runtime manager intentionally distinguishes **two compatibility patches**. Qwen Code context compaction and rollover are a separate runtime optimization documented under [Context Management, Compaction and Rollover](#context-management-compaction-and-rollover).
 
 ### SubagentStart context propagation
 
@@ -726,42 +870,6 @@ This is required for the role-specific handoff produced by the orchestration lay
 A rewritten `tool_input` returned through `PreToolUse` becomes the effective tool invocation input.
 
 This is required both for controlled maintenance behavior and for the prompt-memory carrier to be removed before the real `Agent` call.
-
-### Compression optimization
-
-Compression is a separate local optimization layer rather than a compatibility patch.
-
-For the current Qwen Code 0.22.3 runtime the production path is:
-
-```text
-COMPACT_MAX_OUTPUT_TOKENS
-  stock 2e4 / 20000
-  -> first production optimization 4096
-  -> final production 2048
-
-auto-compaction threshold at 40960 context
-  stock approximately 7960
-  -> 4096 cap: 23864
-  -> final 3072 cap: 24888
-
-compression directive
-  analysis + large historical summary
-  ->
-  direct compact <state_snapshot>
-
-state snapshot
-  goal
-  durable_constraints
-  current_state
-  open_issues
-  next_step
-```
-
-The target snapshot is roughly 800-1500 tokens and omits full messages, long source listings, routine tool calls, and transient exploration.
-
-The current production compression generation cap is `2048`. The earlier 4096/3072/2048 runs remain historical tuning evidence. Production keeps the 40960 context, 24888 auto-compaction threshold, canonical 600-1000-token snapshot target, and `xhigh` compression reasoning.
-
-See [Compression tuning](docs/compression_tuning.md) for the measured A/B/C results and final decision.
 
 ## Interactive and headless permission semantics
 
@@ -991,7 +1099,7 @@ compactions
 
 The cumulative-token metric repeats cached prefixes across requests, so it is not identical to unique uncached model work. In the final run the cached-input ratio was high and uncached input was substantially smaller than cumulative input.
 
-### Compression E2E
+### Historical Qwen Code compaction E2E
 
 The first fresh compression validation after the runtime optimization produced one visible compaction:
 
@@ -1128,14 +1236,3 @@ local inference
 ```
 
 The result is a reproducible local coding-agent workflow designed to behave like a controlled engineering system rather than a single unconstrained chat model.
-
-<!-- LOCALAI_CURRENT_RUNTIME_LIMITS_BEGIN -->
-### Current LocalAI runtime limits
-
-- context window: `40960`
-- auto-compaction threshold: `24888`
-- compression generation cap: `2048`
-- canonical snapshot soft target: `600-1000` tokens
-- LocalAI coding-profile growth budget: `model.maxContextGrowthTokensPerTurn = 8192`
-- generic Qwen Code growth default: `0` (plain chat remains unchanged)
-<!-- LOCALAI_CURRENT_RUNTIME_LIMITS_END -->
