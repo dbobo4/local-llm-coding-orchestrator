@@ -116,6 +116,16 @@ The current local inference backend has one active model slot, so unnecessary pa
 
 ## Orchestration execution discipline
 
+### Adaptive reasoning discipline
+
+`xhigh` is available reasoning depth, not a target response length. Scale deliberation to unresolved uncertainty, risk, and evidence rather than to the available token budget.
+
+- Do not perform a separate complexity-classification pass. If routing and the next useful action are already clear, act.
+- For bounded routine work, use only the deliberation needed to identify the next specialist or tool action.
+- Expand reasoning only when concrete ambiguity, conflicting evidence, material tradeoffs, failed validation, or high-risk constraints require it.
+- As evidence converges, narrow the search and stop considering alternatives that can no longer change the outcome.
+- Do not continue reasoning merely because token budget remains.
+
 Once routing is clear, act immediately. For the routine implementation fast path, stop deliberating and make the foreground algorithm-agent tool call the next assistant action; emit no user-visible prose before it.
 
 For routine delegated coding work:
@@ -156,6 +166,45 @@ When delegating, send only the task-specific delta needed for the current work.
 Every regular specialist delegation must explicitly select exactly `algorithm-agent` or `test-agent` and must run in the foreground (`run_in_background: false`). Never omit `subagent_type`, never use `general-purpose`, and never use a fork as a substitute for the configured specialist workflow.
 
 The orchestration hook applies a hard size ceiling to specialist prompts. If a handoff is rejected as oversized, resynthesize the existing task into a smaller delta; do not split the same restated user prompt across multiple agents or retry it unchanged.
+
+
+### Recoverable GROWTH_LIMIT
+
+Every `algorithm-agent` handoff must include one machine-only semantic scope carrier; the hook strips it before the specialist receives the task:
+
+```text
+<ALGORITHM_SCOPE>
+{"files":["path/or/<discover>"],"objectives":["stable_objective_id","another_id"]}
+</ALGORITHM_SCOPE>
+```
+
+PROMPT/root chooses the semantic objective IDs. Make them independently meaningful and granular enough that completed work can later be separated from residual work.
+
+An ALGORITHM `GROWTH_LIMIT` is a recoverable specialist interruption, not a terminal workflow result and not permission to retry the same full task.
+
+After `GROWTH_LIMIT`:
+
+1. Assume partial side effects are possible.
+2. Re-read every explicit file in the failed scope from actual repository state. If the scope used `<discover>`, read enough actual state to identify what may have changed.
+3. Semantically classify the original objective IDs into completed and residual work.
+4. Never resend the same full scope, even with different wording.
+5. The next ALGORITHM handoff must use a smaller `ALGORITHM_SCOPE` plus:
+
+```text
+<GROWTH_RECOVERY>
+{"completed":["done_id"],"residual":["remaining_a","remaining_b"],"final_slice":false}
+</GROWTH_RECOVERY>
+```
+
+`completed + residual` must exactly partition the original failed objective IDs, and completed IDs are monotonic.
+
+The new `ALGORITHM_SCOPE.objectives` is only the slice delegated now. It must be a residual ID or a semantic refinement such as `parent_id::child_id`.
+
+If residual work still contains several independent large objectives, PROMPT/root must split them semantically into multiple sequential foreground ALGORITHM calls. The hook does not invent this split. Do not run TEST between those residual implementation slices.
+
+Set `final_slice: true` only when the current delegation covers all semantic roots still listed in residual. After that ALGORITHM call succeeds, the recovery guard clears and normal TEST/finalization may continue.
+
+
 
 Do not restate:
 

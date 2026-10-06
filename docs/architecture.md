@@ -257,14 +257,22 @@ Participates in finalization and verification gating.
 
 Finalizes session state. A separate server-stop hook also participates in normal server cleanup.
 
-### PreToolUse
+### PreToolUse and post-tool evidence
 
-Two independent uses exist:
+`PreToolUse` has two normal responsibilities:
 
 1. shell-command maintenance;
-2. `agent` prompt-memory carrier handling.
+2. `agent` delegation enforcement, including `<PROMPT_MEMORY>`, `<ALGORITHM_SCOPE>`, and `<GROWTH_RECOVERY>` carriers.
 
-The second path processes an eligible `<PROMPT_MEMORY>` update and strips the carrier from `tool_input` before the specialist task is invoked.
+The Agent path validates the configured specialist type, foreground execution, bounded handoff size, implementation workflow selection, growth-recovery scope, and delayed PROMPT-memory transport. Machine-only carriers are stripped before the specialist receives the task.
+
+During active ALGORITHM growth recovery, `read_file` evidence is recorded only after execution:
+
+- `PostToolUse` success counts as an actual-state reread;
+- `PostToolUseFailure` counts only for a genuine file-not-found result;
+- interrupts and unrelated read failures do not count;
+- concurrent post-read hook processes serialize the state update with an inter-process lock.
+
 For the complete event-by-event execution path, see [Detailed Qwen Code session and hook data flow](session_hook_flow.md).
 
 ## Qwen Code runtime patch manager
@@ -294,6 +302,26 @@ Qwen Code compaction and same-session rollover are local runtime optimizations o
 The current coding policy uses a `40960` context, `24888` soft compaction threshold, `2048` hard snapshot output cap, `600-1000` token canonical snapshot target, at most `8` compaction/rollover passes, and a minimum accepted reduction of `max(128 tokens, 1%)`.
 
 If in-place compaction cannot return the active conversation to the safe range, the runtime creates a fresh `LlmChat` inside the same logical Qwen session and continues from canonical state rather than growing the old context to overflow.
+
+### Recoverable specialist growth
+
+The coding profile uses a `24576` cumulative per-turn context-growth guard. ALGORITHM `GROWTH_LIMIT` is recoverable and does not imply a root terminal abort.
+
+The recovery contract is:
+
+```text
+failed ALGORITHM
+    -> preserve failed semantic objective IDs and failed file scope
+    -> require root actual-state reread
+    -> completed + residual must exactly partition the original objective IDs
+    -> deny same/equivalent full-scope retry
+    -> allow sequential smaller residual ALGORITHM slices
+    -> keep the recovery guard active across intermediate slices
+    -> clear the guard only after the final residual slice succeeds
+    -> TEST/final completion remains blocked while the guard is active
+```
+
+The authoritative recovery state lives in `workflow_state.py`; `hook_dispatcher.py` exposes that state in denial messages so the root does not need to rediscover IDs from old conversation text.
 
 The detailed Qwen Code and independent Qwen Chat mechanisms are documented in [Context Management, Compaction and Rollover](../README.md#context-management-compaction-and-rollover). Historical cap tuning remains in [Compression tuning](compression_tuning.md).
 
@@ -737,6 +765,7 @@ agent frontmatter
 Qwen Code settings.json provider
     generationConfig.reasoning.effort
     generationConfig.extra_body.reasoning_effort
+    generationConfig.extra_body.thinking_budget_tokens
             |
             v
 llama.cpp router
@@ -775,7 +804,11 @@ threads-draft = 20
 threads-draft-batch = 20
 reasoning = on
 server default reasoning effort = xhigh
-reasoning budget = -1
+server reasoning budget = -1
+PROMPT thinking budget = 4608
+ALGORITHM thinking budget = 6144
+TEST thinking budget = 6144
+per-turn context-growth guard = 24576
 reasoning preserve = enabled
 ```
 
@@ -786,12 +819,23 @@ draft-mtp + ngram-mod
 
 draft n-max = 2
 p-min = 0.025
-ngram n-min = 32
+ngram n-min = 48
 ngram n-max = 64
 ngram n-match = 16
 ```
 
 These values are specific reference results for the tested hardware/model/runtime combination.
+
+Lifecycle validation status:
+
+```text
+compaction:        dynamic PASS
+growth recovery:   dynamic PASS
+terminal completion after tool use: PASS in the endurance run
+rollover:          source-verified, dynamic NOT_EXERCISED, non-blocking
+```
+
+The endurance result does not claim that rollover occurred; the tested sessions compacted successfully before rollover became necessary.
 ## Design principle
 
 The architecture separates the physical model, inference runtime, user interfaces, and coding orchestration:
@@ -835,7 +879,7 @@ qwen
   -> Qwen Code runtime
   -> in-LlmChat compaction
   -> stalled compaction: fresh LlmChat rollover
-  -> coding-profile growth guard: 8192 tokens/turn
+  -> coding-profile growth guard: 24576 tokens/turn
 
 qwen chat
   -> llama.cpp Web UI

@@ -35,6 +35,33 @@ if ([string]::IsNullOrWhiteSpace([string]$TestReasoningEffort)) {
     $TestReasoningEffort = "medium"
 }
 
+# Backward-compatible defaults for local.ps1 files created before
+# finite role reasoning budgets and the production growth budget were added.
+if (
+    $null -eq (Get-Variable -Name PromptReasoningBudgetTokens -ErrorAction SilentlyContinue) -or
+    [int]$PromptReasoningBudgetTokens -le 0
+) {
+    $PromptReasoningBudgetTokens = 4608
+}
+if (
+    $null -eq (Get-Variable -Name AlgorithmReasoningBudgetTokens -ErrorAction SilentlyContinue) -or
+    [int]$AlgorithmReasoningBudgetTokens -le 0
+) {
+    $AlgorithmReasoningBudgetTokens = 6144
+}
+if (
+    $null -eq (Get-Variable -Name TestReasoningBudgetTokens -ErrorAction SilentlyContinue) -or
+    [int]$TestReasoningBudgetTokens -le 0
+) {
+    $TestReasoningBudgetTokens = 6144
+}
+if (
+    $null -eq (Get-Variable -Name MaxContextGrowthTokensPerTurn -ErrorAction SilentlyContinue) -or
+    [int]$MaxContextGrowthTokensPerTurn -le 0
+) {
+    $MaxContextGrowthTokensPerTurn = 24576
+}
+
 $configuredAliases = @(
     $ModelAlias,
     $AlgorithmModelAlias,
@@ -231,7 +258,7 @@ $dispatcherCommand = 'python "' + $dispatcherPath + '"'
 $maintenanceCommand = 'python "' + $maintenancePath + '"'
 $stopServerCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $stopServerPath + '" -Action Stop -IfIdle'
 
-foreach ($eventName in @("SubagentStart","UserPromptSubmit","SessionStart","SessionEnd","SubagentStop","Stop")) {
+foreach ($eventName in @("SubagentStart","UserPromptSubmit","SessionStart","SessionEnd","SubagentStop","Stop","PostToolUse","PostToolUseFailure")) {
     foreach ($eventGroup in $template.hooks.$eventName) {
         foreach ($hook in $eventGroup.hooks) {
             if ($hook.name -eq "qwen-orchestration-dispatcher") {
@@ -282,7 +309,8 @@ function Set-RoleProvider {
         $Provider,
         [string]$Id,
         [string]$Name,
-        [string]$ReasoningEffort
+        [string]$ReasoningEffort,
+        [int]$ReasoningBudgetTokens
     )
 
     $Provider.id = $Id
@@ -291,25 +319,33 @@ function Set-RoleProvider {
 
     $Provider.generationConfig.reasoning.effort = $ReasoningEffort
     $Provider.generationConfig.extra_body.reasoning_effort = $ReasoningEffort
+    $Provider.generationConfig.extra_body |
+        Add-Member `
+            -NotePropertyName "thinking_budget_tokens" `
+            -NotePropertyValue $ReasoningBudgetTokens `
+            -Force
 }
 
 Set-RoleProvider `
     -Provider $promptProvider `
     -Id $ModelAlias `
     -Name "$ModelAlias Local" `
-    -ReasoningEffort $PromptReasoningEffort
+    -ReasoningEffort $PromptReasoningEffort `
+    -ReasoningBudgetTokens $PromptReasoningBudgetTokens
 
 Set-RoleProvider `
     -Provider $algorithmProvider `
     -Id $AlgorithmModelAlias `
     -Name "$AlgorithmModelAlias Algorithm" `
-    -ReasoningEffort $AlgorithmReasoningEffort
+    -ReasoningEffort $AlgorithmReasoningEffort `
+    -ReasoningBudgetTokens $AlgorithmReasoningBudgetTokens
 
 Set-RoleProvider `
     -Provider $testProvider `
     -Id $TestModelAlias `
     -Name "$TestModelAlias Test" `
-    -ReasoningEffort $TestReasoningEffort
+    -ReasoningEffort $TestReasoningEffort `
+    -ReasoningBudgetTokens $TestReasoningBudgetTokens
 
 $template.model.name = $ModelAlias
 $template.model.reasoningEffort = $PromptReasoningEffort
@@ -448,7 +484,7 @@ $modelSettings = Ensure-ObjectProperty $settings "model"
 $modelSettings |
     Add-Member `
         -NotePropertyName "maxContextGrowthTokensPerTurn" `
-        -NotePropertyValue 8192 `
+        -NotePropertyValue ([int]$MaxContextGrowthTokensPerTurn) `
         -Force
 
 $json = $settings | ConvertTo-Json -Depth 30
@@ -461,7 +497,7 @@ $json = $settings | ConvertTo-Json -Depth 30
 $verify = Get-Content $SettingsPath -Raw | ConvertFrom-Json
 
 if (
-    [int]$verify.model.maxContextGrowthTokensPerTurn -ne 8192
+    [int]$verify.model.maxContextGrowthTokensPerTurn -ne [int]$MaxContextGrowthTokensPerTurn
 ) {
     throw "Installation verification failed: maxContextGrowthTokensPerTurn"
 }
@@ -478,16 +514,19 @@ $expectedRoleProviders = @(
     [pscustomobject]@{
         Id = $ModelAlias
         Effort = $PromptReasoningEffort
+        Budget = [int]$PromptReasoningBudgetTokens
         Role = "PROMPT"
     },
     [pscustomobject]@{
         Id = $AlgorithmModelAlias
         Effort = $AlgorithmReasoningEffort
+        Budget = [int]$AlgorithmReasoningBudgetTokens
         Role = "ALGORITHM"
     },
     [pscustomobject]@{
         Id = $TestModelAlias
         Effort = $TestReasoningEffort
+        Budget = [int]$TestReasoningBudgetTokens
         Role = "TEST"
     }
 )
@@ -517,6 +556,13 @@ foreach ($expected in $expectedRoleProviders) {
 
     if ($provider.generationConfig.extra_body.reasoning_effort -ne $expected.Effort) {
         throw "Installation verification failed: $($expected.Role) wire reasoning effort"
+    }
+
+    if (
+        [int]$provider.generationConfig.extra_body.thinking_budget_tokens -ne
+        [int]$expected.Budget
+    ) {
+        throw "Installation verification failed: $($expected.Role) reasoning budget"
     }
 }
 
@@ -600,6 +646,28 @@ if ($carrierHookCount -ne 1) {
         "Installation verification failed: expected exactly one " +
         "agent PROMPT memory carrier PreToolUse hook."
     )
+}
+
+foreach ($eventName in @("PostToolUse","PostToolUseFailure")) {
+    $readDispatcherCount = 0
+
+    foreach ($eventGroup in @($verify.hooks.$eventName)) {
+        foreach ($hook in @($eventGroup.hooks)) {
+            if (
+                $eventGroup.matcher -eq "read_file" -and
+                $hook.name -eq "qwen-orchestration-dispatcher"
+            ) {
+                $readDispatcherCount++
+            }
+        }
+    }
+
+    if ($readDispatcherCount -ne 1) {
+        throw (
+            "Installation verification failed: expected exactly one " +
+            "$eventName read_file orchestration dispatcher hook."
+        )
+    }
 }
 
 Write-Host "ORCHESTRATOR_INSTALL=PASS"

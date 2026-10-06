@@ -38,9 +38,10 @@ The objective is not simply to run a local coding model. The repository focuses 
 - Delayed PROMPT-memory persistence through the `PreToolUse` carrier
 - Cross-project memory limited to `SessionStart` / PROMPT synthesis
 - Explicit bounded workflow and anti-loop state
+- Recoverable ALGORITHM `GROWTH_LIMIT` with actual-state reread and monotonic residual slicing
 - Role-specific reasoning effort on one physical GGUF
 - Qwen Code lifecycle hooks
-- Two Qwen Code compatibility patches plus separate bounded context management
+- Two Qwen Code compatibility patches plus bounded context, growth, and runtime-resilience hardening
 - Independent Qwen Code and Qwen Chat compaction/rollover paths
 - Automatic shared local inference router startup and idle-aware shutdown
 - Plain llama.cpp Web UI through `qwen chat` with a dedicated loopback context proxy
@@ -338,11 +339,10 @@ You can use another location by editing `config/local.ps1`.
 ### 1. Clone this repository
 
 ```powershell
-git clone https://github.com/<YOUR_USERNAME>/local-llm-coding-orchestrator.git
+git clone https://github.com/dbobo4/local-llm-coding-orchestrator.git
 cd local-llm-coding-orchestrator
 ```
 
-Replace the GitHub URL placeholder with the final repository URL after publishing.
 
 ### 2. Create the local runtime layout
 
@@ -671,7 +671,7 @@ model: qwen3.8-27b-algorithm
 model: qwen3.8-27b-test
 ```
 
-The corresponding provider entry in `settings.json` controls the reasoning profile. For example, the TEST role uses:
+The corresponding provider entry in `settings.json` controls both reasoning effort and the finite per-response reasoning budget. For example, the TEST role uses:
 
 ```json
 "generationConfig": {
@@ -679,39 +679,23 @@ The corresponding provider entry in `settings.json` controls the reasoning profi
     "effort": "medium"
   },
   "extra_body": {
-    "reasoning_effort": "medium"
+    "reasoning_effort": "medium",
+    "thinking_budget_tokens": 6144
   }
 }
 ```
 
-`generationConfig.reasoning.effort` represents the Qwen Code-side reasoning configuration. The explicit `extra_body.reasoning_effort` field is the wire-level override sent through the OpenAI-compatible request to `llama.cpp`.
+`generationConfig.reasoning.effort` is the Qwen Code-side reasoning profile. `extra_body.reasoning_effort` is the wire-level effort override, while `extra_body.thinking_budget_tokens` bounds one model response. The server-level `--reasoning-budget -1` remains unlimited as a server fallback and is intentionally separate from these per-role client budgets.
+
+Validated production role budgets:
+
+```text
+PROMPT     4608
+ALGORITHM  6144
+TEST       6144
+```
 
 The server-level `--reasoning-effort xhigh` remains the reference fallback/default. Role-specific requests can override that default without loading another GGUF or another inference router.
-# algorithm-agent.md
-model: qwen3.8-27b-algorithm
-```
-
-```yaml
-# test-agent.md
-model: qwen3.8-27b-test
-```
-
-The corresponding provider entry in `settings.json` controls the reasoning profile. For example, the TEST role uses:
-
-```json
-"generationConfig": {
-  "reasoning": {
-    "effort": "medium"
-  },
-  "extra_body": {
-    "reasoning_effort": "medium"
-  }
-}
-```
-
-`generationConfig.reasoning.effort` represents the Qwen Code-side reasoning configuration. The explicit `extra_body.reasoning_effort` field is the wire-level override sent through the OpenAI-compatible request to `llama.cpp`.
-
-The server-level `--reasoning-effort xhigh` remains the reference fallback/default. Role-specific requests can override that default without loading another GGUF or another inference server.
 
 ## Context Management, Compaction and Rollover
 
@@ -730,7 +714,7 @@ The coding and plain-chat interfaces share the same physical GGUF and the same `
 | Context manager | patched Qwen Code runtime | independent loopback chat proxy |
 | Rollover mechanism | fresh `LlmChat` in the same logical Qwen session | replace the old request prefix with one canonical snapshot and preserve the newest unsummarized turn |
 | Coding orchestration | PROMPT / ALGORITHM / TEST | none |
-| Per-turn growth guard | coding profile: `8192` tokens | no Qwen Code growth guard; bounded by the chat proxy policy |
+| Per-turn growth guard | coding profile: `24576` tokens | no Qwen Code growth guard; bounded by the chat proxy policy |
 | Legacy overfull-history recovery | not applicable to plain browser history | bounded fold: ~`14000`-token source chunks, ~`18000`-token internal-request ceiling, max `8` fold chunks |
 
 The shared values are policy alignment, not shared conversation state. A coding session and a browser-chat conversation remain independent.
@@ -784,9 +768,27 @@ old LlmChat
 
 The logical Qwen session and physical model remain the same; only the active conversation context is replaced. This removes obsolete history and tool structure that ordinary in-place compaction may no longer be able to discard safely.
 
-The LocalAI coding profile also limits context growth to `8192` tokens per turn. Compaction and rollover do not refund already-consumed growth budget.
+The LocalAI coding profile also limits context growth to `24576` tokens per turn. Compaction and rollover do not refund already-consumed growth budget.
 
 PROMPT, ALGORITHM, and TEST do not share one unlimited transcript. Their role-specific contexts and lifecycles remain separate, and specialist handoffs carry only the bounded task/context material needed for that specialist.
+
+### Recoverable ALGORITHM growth limit
+
+The `24576` growth guard is a per-turn cumulative context-growth safety boundary, not a per-response reasoning limit. When an ALGORITHM specialist reaches `GROWTH_LIMIT`, the root workflow treats it as recoverable:
+
+```text
+ALGORITHM GROWTH_LIMIT
+    -> partial side effects may exist
+    -> root re-reads the actual failed-scope files
+    -> successful reads and real file-not-found results count as actual-state evidence
+    -> root partitions the original semantic objective IDs into completed/residual work
+    -> same/equivalent full-scope retry is rejected
+    -> one or more strictly smaller residual ALGORITHM slices run sequentially
+    -> TEST is allowed only after the recovery guard clears
+```
+
+Post-execution `read_file` evidence is collected through `PostToolUse` / `PostToolUseFailure`; concurrent reread updates are serialized with an inter-process file lock. Arbitrary read failures and interrupted reads do not satisfy the reread gate.
+
 
 Qwen Code compaction is part of the local runtime optimization managed by `patches/qwen_runtime_patches.ps1`; it is separate from the two compatibility patches. Historical cap tuning and semantic-retention measurements remain in [Compression tuning](docs/compression_tuning.md).
 
@@ -1237,6 +1239,41 @@ approximately 34772 tokens
 
 Execution then continued successfully through independent TEST verification with 9 tests passing. This is evaluated separately from the no-compaction FastAPI efficiency benchmark.
 
+### Orchestration endurance validation
+
+The `2.5.0-live-orchestration-endurance` runner adds a dedicated production-style orchestration stress mode. The validated run at `40960 / P4608 / A6144 / T6144 / G24576` completed with:
+
+```text
+wall time:                       1119.955 s
+API responses:                  46
+tool calls:                     56
+GROWTH_LIMIT telemetry:         5
+growth-recovery results:        2
+recovery reread cycles:         2
+successful ALGORITHM after growth: 1
+ALGORITHM results:              3
+TEST results:                   1
+chat compactions:               2
+compaction continuation gaps:   0
+MAX_TOKENS:                     0
+NO_VISIBLE_PROGRESS:            0
+hook errors:                    0
+runtime fatal errors:           0
+top-level final after last tool: true
+```
+
+The dynamic recovery and compaction paths therefore passed under the tested workload. Rollover remained `NOT_EXERCISED_NON_BLOCKING` because compaction recovered sufficient context before rollover was required.
+
+Run that mode explicitly with:
+
+```powershell
+.\benchmark\benchmark_qwen.ps1 -OrchestrationEnduranceStress `
+  -ConfirmPromptReasoningBudget 4608 `
+  -ConfirmAlgorithmReasoningBudget 6144 `
+  -ConfirmTestReasoningBudget 6144 `
+  -ConfirmGrowthBudget 24576
+```
+
 ### Final p-min verification
 
 ```text
@@ -1264,7 +1301,7 @@ The repository exposes one optional benchmark entry point:
 .\benchmark\benchmark_qwen.ps1
 ```
 
-Running it without switches executes the complete adaptive pipeline sequentially:
+Running it without switches executes the full convergent pipeline sequentially:
 
 ```text
 preflight
@@ -1272,15 +1309,17 @@ preflight
 -> adaptive p-min comparison
 -> Q8/Q8 context/KV capacity scan + real-agent quality gate
 -> optional Q8/Q5 maximum-context capacity scan
+-> agentic harness validation
+-> shared reasoning-budget / growth-budget stress stage
 -> final recommendation
 -> explicit Y/N apply prompt
 ```
 
 The benchmark does not claim a universal or global optimum. It reports the recommended primary configuration within the tested candidate set for the current machine and software stack.
 
-No production configuration is changed during measurement. Only after an explicit `Y` does the benchmark transactionally update the benchmark-tunable values in Git-ignored `config/local.ps1` and synchronize the managed Qwen Code provider `contextWindowSize` metadata. A declined apply leaves production configuration unchanged.
+No production configuration is changed during measurement. Only after an explicit `Y` does the benchmark transactionally update the whitelisted values in `config/local.ps1` and synchronize the managed Qwen Code provider context, `thinking_budget_tokens`, and `maxContextGrowthTokensPerTurn` metadata. A declined apply leaves production configuration unchanged.
 
-Reasoning effort, thread counts, batch size, and ubatch size remain unchanged established settings. The unified benchmark does not auto-tune the PROMPT / ALGORITHM / TEST reasoning policy.
+Reasoning **effort**, thread counts, batch size, ubatch size, and the 5% context/output safety margin remain fixed established policies. The role reasoning **budgets** and per-turn growth budget are separate tunable values.
 
 A larger Q8/Q5 context may be reported as an optional capacity-only candidate. It is not treated as quality-gated and is not auto-applied as the primary configuration.
 

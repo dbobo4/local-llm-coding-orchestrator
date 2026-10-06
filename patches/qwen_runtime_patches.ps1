@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$PatchManagerRevision = 1
+$PatchManagerRevision = 2
 $Root = Split-Path $PSScriptRoot -Parent
 $ConfigPath = Join-Path $Root "config\local.ps1"
 
@@ -26,7 +26,9 @@ $RequiredRuntimeMarkers = @(
     "LOCALAI_CONTEXT_ROLLOVER",
     "LOCALAI_SPECIALIST_CONTEXT_ROLLOVER",
     "LOCALAI_TURN_GROWTH_BUDGET_V5",
+    "LOCALAI_GROWTH_ACTIVE_INFERENCE_DECOUPLED_V5_7",
     "LOCALAI_SPECIALIST_GROWTH_TERMINATION_V5_5",
+    "LOCALAI_SPECIALIST_PARTIAL_SIDE_EFFECTS_V5_12",
     "LOCALAI_TURN_GROWTH_LIMIT_REACHED",
     "LOCALAI_CONTEXT_ROLLOVER_REQUIRED",
     "COMPACT_MAX_OUTPUT_TOKENS",
@@ -58,6 +60,12 @@ function Test-QwenRuntimePatchState {
         if (-not $text.Contains($marker)) {
             throw "Runtime verification failed; marker missing: $marker"
         }
+    }
+    if ($text.Contains("localAiGrowthClampedMaxOutputTokens")) {
+        throw "Runtime verification failed; turn-growth remaining still clamps active inference output."
+    }
+    if (-not $text.Contains("maxOutputTokens: clampedMaxOutputTokens")) {
+        throw "Runtime verification failed; context-window output clamp assignment missing."
     }
     $docs = Join-Path $RuntimeRoot "lib\bundled\qc-helper\docs\configuration\settings.md"
     if (-not ([IO.File]::ReadAllText($docs)).Contains("model.maxContextGrowthTokensPerTurn")) {
@@ -3994,6 +4002,7 @@ LOADER = CHUNKS / "chunk-DJPASAUV.js"
 DOCS = ROOT / "lib" / "bundled" / "qc-helper" / "docs" / "configuration" / "settings.md"
 
 MARKER = "LOCALAI_TURN_GROWTH_BUDGET_V5"
+DECOUPLE_MARKER = "LOCALAI_GROWTH_ACTIVE_INFERENCE_DECOUPLED_V5_7"
 DEFAULT_LIMIT = 0
 BACKUP_SUFFIX = ".pre-localai-repo-growth-v5.bak"
 
@@ -4049,9 +4058,34 @@ def insert_after_line_containing(text: str, needle: str, new_line: str, label: s
     return "\n".join(lines) + trailing
 
 
+def decouple_active_inference_output(text: str) -> str:
+    if DECOUPLE_MARKER in text:
+        return text
+    old = '''      const localAiGrowthClampedMaxOutputTokens = Number.isFinite(localAiGrowthRemaining) ? Math.max(
+        1,
+        Math.min(clampedMaxOutputTokens, Math.floor(localAiGrowthRemaining))
+      ) : clampedMaxOutputTokens;
+      params = {
+        ...params,
+        config: {
+          ...params.config,
+          maxOutputTokens: localAiGrowthClampedMaxOutputTokens
+        }
+      };'''
+    new = '''      // LOCALAI_GROWTH_ACTIVE_INFERENCE_DECOUPLED_V5_7
+      params = {
+        ...params,
+        config: {
+          ...params.config,
+          maxOutputTokens: clampedMaxOutputTokens
+        }
+      };'''
+    return replace_once(text, old, new, "active inference growth clamp decouple")
+
+
 def patch_pz(text: str) -> str:
     if MARKER in text:
-        return text
+        return decouple_active_inference_output(text)
 
     old = '''function validateMaxToolCallsPerTurn(value) {
   const resolved = value ?? DEFAULT_MAX_TOOL_CALLS_PER_TURN;
@@ -4463,12 +4497,16 @@ var MAX_MODEL_FALLBACKS = 3;'''
         "specialist terminateModeMessage",
     )
 
-    return text
+    return decouple_active_inference_output(text)
 
 
 def patch_schema(text: str) -> str:
+    old_description = 'description: "Hard cumulative context-growth budget for one logical interaction. The first model send establishes the baseline; later model output plus newly appended tool-result, hook, steer, reminder, and other continuation input consumes the budget. Compaction and automatic context rollover do not refund consumed growth. The remaining budget also clamps model output independently of the context-window output clamp. Disabled by default so generic Qwen Code behavior is unchanged; set a positive integer to enable.",'
+    new_description = 'description: "Hard cumulative context-growth budget for one logical interaction. The first model send establishes the baseline; later model output plus newly appended tool-result, hook, steer, reminder, and other continuation input consumes the budget. Compaction and automatic context rollover do not refund consumed growth. An exhausted budget blocks a subsequent model send, but the remaining growth budget does not clamp an already-started model generation; active generation is limited only by the normal output ceiling and context-window safety clamp. Disabled by default so generic Qwen Code behavior is unchanged; set a positive integer to enable.",'
     if "maxContextGrowthTokensPerTurn:" in text:
-        return text
+        if new_description in text:
+            return text
+        return replace_once(text, old_description, new_description, "settings schema migration")
     old = '''      maxToolCallsPerTurn: {
         type: "integer",
         label: "Max Tool Calls Per Turn",
@@ -4485,7 +4523,7 @@ def patch_schema(text: str) -> str:
         category: "Model",
         requiresRestart: false,
         default: {DEFAULT_LIMIT},
-        description: "Hard cumulative context-growth budget for one logical interaction. The first model send establishes the baseline; later model output plus newly appended tool-result, hook, steer, reminder, and other continuation input consumes the budget. Compaction and automatic context rollover do not refund consumed growth. The remaining budget also clamps model output independently of the context-window output clamp. Disabled by default so generic Qwen Code behavior is unchanged; set a positive integer to enable.",
+        description: "Hard cumulative context-growth budget for one logical interaction. The first model send establishes the baseline; later model output plus newly appended tool-result, hook, steer, reminder, and other continuation input consumes the budget. Compaction and automatic context rollover do not refund consumed growth. An exhausted budget blocks a subsequent model send, but the remaining growth budget does not clamp an already-started model generation; active generation is limited only by the normal output ceiling and context-window safety clamp. Disabled by default so generic Qwen Code behavior is unchanged; set a positive integer to enable.",
         showInDialog: false
       }},'''
     return replace_once(text, old, new, "settings schema")
@@ -4506,13 +4544,19 @@ def patch_loader(text: str) -> str:
 
 
 def patch_docs(text: str) -> str:
+    stale_phrase = "Remaining budget also clamps model output."
+    current_phrase = "An exhausted budget blocks a subsequent model send; the remaining growth budget does not clamp an already-started model generation."
     if "`model.maxContextGrowthTokensPerTurn`" in text:
-        return text
+        if current_phrase in text:
+            return text
+        if stale_phrase not in text:
+            raise RuntimeError("settings docs migration: known growth-budget description not found")
+        return text.replace(stale_phrase, current_phrase, 1)
     row = (
         "| `model.maxContextGrowthTokensPerTurn`                  | integer | "
         "Hard cumulative context-growth budget for one logical interaction. The first model send establishes the baseline; "
         "later model output plus newly appended continuation input consumes the budget. Compaction and automatic rollover "
-        "do not refund consumed growth. Remaining budget also clamps model output. Disabled by default; set a positive integer to enable. "
+        "do not refund consumed growth. An exhausted budget blocks a subsequent model send; the remaining growth budget does not clamp an already-started model generation. Disabled by default; set a positive integer to enable. "
         f"| `{DEFAULT_LIMIT}`      |"
     )
     return insert_after_line_containing(text, "`model.maxToolCallsPerTurn`", row, "settings docs")
@@ -4542,22 +4586,27 @@ def verify():
     checks = {
         PZ: [
             MARKER,
+            DECOUPLE_MARKER,
             "maxContextGrowthTokensPerTurn",
             "interactionGrowthByPromptId",
             "LOCALAI_TURN_GROWTH_LIMIT_REACHED:",
             'type: "turn_growth_limit_exceeded"',
             'terminateMode = "GROWTH_LIMIT"',
             "growthBudgetState: localAiGrowthState",
+            "maxOutputTokens: clampedMaxOutputTokens",
         ],
-        SCHEMA: ["maxContextGrowthTokensPerTurn:", f"default: {DEFAULT_LIMIT}"],
+        SCHEMA: ["maxContextGrowthTokensPerTurn:", f"default: {DEFAULT_LIMIT}", "does not clamp an already-started model generation"],
         LOADER: ["maxContextGrowthTokensPerTurn: settings.model?.maxContextGrowthTokensPerTurn"],
-        DOCS: ["`model.maxContextGrowthTokensPerTurn`"],
+        DOCS: ["`model.maxContextGrowthTokensPerTurn`", "does not clamp an already-started model generation"],
     }
     for path, needles in checks.items():
         text, _ = read_text_preserve(path)
         for needle in needles:
             if needle not in text:
                 raise RuntimeError(f"verification failed: {needle!r} missing from {path}")
+    pz_text, _ = read_text_preserve(PZ)
+    if "localAiGrowthClampedMaxOutputTokens" in pz_text:
+        raise RuntimeError("verification failed: active inference is still clamped by remaining turn-growth budget")
     print("STATIC_VERIFY=PASS")
 
 
@@ -4650,6 +4699,7 @@ RUNTIME = (
     / "chunk-PZ66FRIC.js"
 )
 MARKER = "LOCALAI_SPECIALIST_GROWTH_TERMINATION_V5_5"
+HARDENING_MARKER = "LOCALAI_SPECIALIST_PARTIAL_SIDE_EFFECTS_V5_12"
 
 
 def read_preserve(path: Path):
@@ -4688,8 +4738,44 @@ def node_check(path: Path):
 
 
 def patch_runtime(rt: str) -> str:
-    if MARKER in rt:
+    legacy_parent = '''        if (terminateMode === "GROWTH_LIMIT") {
+          return {
+            llmContent: [{ text: (finalText || "Agent stopped: per-turn context growth limit reached.") + wtSuffix }],
+            returnDisplay: this.currentDisplay
+          };
+        }
+        const visibleFinalText = finalText || "(subagent produced no model-visible output)";
+        return {
+          llmContent: [{ text: visibleFinalText + wtSuffix }],
+          returnDisplay: this.currentDisplay
+        };'''
+
+    hardened_parent = '''        if (terminateMode === "GROWTH_LIMIT") {
+          // LOCALAI_SPECIALIST_PARTIAL_SIDE_EFFECTS_V5_12
+          const growthLimitWarning = "Agent stopped: per-turn context growth limit reached. Partial side effects are possible; re-read current files and state before continuing or summarizing.";
+          const growthLimitText = finalText ? `${growthLimitWarning}\\n\\nPartial agent output:\\n${finalText}` : growthLimitWarning;
+          return {
+            llmContent: [{ text: growthLimitText + wtSuffix }],
+            returnDisplay: this.currentDisplay
+          };
+        }
+        const visibleFinalText = finalText || "(subagent produced no model-visible output)";
+        return {
+          llmContent: [{ text: visibleFinalText + wtSuffix }],
+          returnDisplay: this.currentDisplay
+        };'''
+
+    if HARDENING_MARKER in rt:
         return rt
+
+    if MARKER in rt:
+        return replace_exact(
+            rt,
+            legacy_parent,
+            hardened_parent,
+            1,
+            "specialist partial-side-effects migration",
+        )
 
     old = '''  async fireSubagentStopEvent(agentId, agentType, agentTranscriptPath, lastAssistantMessage, stopHookActive, permissionMode, signal) {
     const input = {
@@ -4773,17 +4859,7 @@ def patch_runtime(rt: str) -> str:
           llmContent: [{ text: visibleFinalText + wtSuffix }],
           returnDisplay: this.currentDisplay
         };'''
-    new = '''        if (terminateMode === "GROWTH_LIMIT") {
-          return {
-            llmContent: [{ text: (finalText || "Agent stopped: per-turn context growth limit reached.") + wtSuffix }],
-            returnDisplay: this.currentDisplay
-          };
-        }
-        const visibleFinalText = finalText || "(subagent produced no model-visible output)";
-        return {
-          llmContent: [{ text: visibleFinalText + wtSuffix }],
-          returnDisplay: this.currentDisplay
-        };'''
+    new = hardened_parent
     rt = replace_exact(rt, old, new, 1, "parent-visible receipt")
 
     for needle in (
@@ -4792,6 +4868,8 @@ def patch_runtime(rt: str) -> str:
         "subagent.getTerminateMode()",
         'input["terminate_reason"] || void 0',
         'terminateMode === "GROWTH_LIMIT"',
+        HARDENING_MARKER,
+        "Partial side effects are possible",
     ):
         if needle not in rt:
             raise RuntimeError(f"verification missing: {needle}")
@@ -4842,7 +4920,7 @@ $PatchRegistry = @(
     [pscustomobject]@{ Id = "compatibility-and-compression"; Revision = 1; Kind = "powershell" },
     [pscustomobject]@{ Id = "runtime-resilience"; Revision = 1; Kind = "powershell" },
     [pscustomobject]@{ Id = "root-context-growth"; Revision = 1; Kind = "python" },
-    [pscustomobject]@{ Id = "specialist-growth-termination"; Revision = 1; Kind = "python" }
+    [pscustomobject]@{ Id = "specialist-growth-termination"; Revision = 2; Kind = "python" }
 )
 
 function Invoke-PatchBlock {

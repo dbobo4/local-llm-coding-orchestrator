@@ -367,6 +367,12 @@ The legacy plain-chat fold exists for conversations that were already overfull b
 Durable orchestration memory is a separate Qwen Code concept. It persists selected stable project facts across sessions; context compaction preserves only the active continuation state needed to keep the current conversation moving. Plain chat does not use orchestration durable memory.
 
 The complete Qwen Code and Qwen Chat flows, including snapshot contents, cache behavior, rollover semantics, and failure behavior, are documented in [Context Management, Compaction and Rollover](../README.md#context-management-compaction-and-rollover).
+
+### ALGORITHM growth-limit recovery
+
+For Qwen Code coding work, `GROWTH_LIMIT` on ALGORITHM is recoverable. The root must re-read the actual failed-scope files before delegating more implementation work. It then partitions the original semantic objective IDs into completed and residual work and delegates only smaller residual slices. A same/equivalent full-scope retry is rejected.
+
+`PostToolUse` success and genuine `PostToolUseFailure:file_not_found` events provide reread evidence. Interrupted or unrelated failed reads do not. TEST/final completion stays blocked until the final residual ALGORITHM slice succeeds and the recovery guard clears.
 ## Interactive versus headless execution
 
 This distinction matters for tool permissions.
@@ -542,21 +548,24 @@ canonical chat model
 PROMPT
   ModelAlias = qwen3.8-27b-local
   PromptReasoningEffort = xhigh
+  PromptReasoningBudgetTokens = 4608
 
 ALGORITHM
   AlgorithmModelAlias = qwen3.8-27b-algorithm
   AlgorithmReasoningEffort = xhigh
+  AlgorithmReasoningBudgetTokens = 6144
 
 TEST
   TestModelAlias = qwen3.8-27b-test
   TestReasoningEffort = medium
+  TestReasoningBudgetTokens = 6144
+
+MaxContextGrowthTokensPerTurn = 24576
 ```
 
 The canonical chat ID and all three role aliases resolve to the same physical GGUF.
 
-Each custom Qwen Code agent selects its role alias through the `model:` field in its Markdown frontmatter.
-
-For example:
+Each custom Qwen Code agent selects its role alias through the `model:` field in its Markdown frontmatter:
 
 ```yaml
 # algorithm-agent.md
@@ -568,7 +577,7 @@ model: qwen3.8-27b-algorithm
 model: qwen3.8-27b-test
 ```
 
-The installer creates corresponding Qwen Code provider entries in `settings.json`. A role provider contains both the Qwen Code-side reasoning value and the explicit request-body override:
+The installer creates corresponding Qwen Code provider entries in `settings.json`. A managed provider contains Qwen Code-side reasoning effort, the explicit wire-level effort override, and a finite per-response thinking budget:
 
 ```json
 "generationConfig": {
@@ -576,12 +585,11 @@ The installer creates corresponding Qwen Code provider entries in `settings.json
     "effort": "medium"
   },
   "extra_body": {
-    "reasoning_effort": "medium"
+    "reasoning_effort": "medium",
+    "thinking_budget_tokens": 6144
   }
 }
 ```
-
-For the local OpenAI-compatible provider, `extra_body.reasoning_effort` is the explicit wire-level value sent to `llama.cpp`.
 
 The server-level configuration enables:
 
@@ -592,49 +600,13 @@ The server-level configuration enables:
 --reasoning-preserve
 ```
 
-The server-level `xhigh` setting is the fallback/default. PROMPT and ALGORITHM currently use `xhigh` requests; TEST overrides the server default with `medium`.
+The server-level `xhigh` effort and `-1` reasoning budget are fallback/default server settings. Qwen Code role providers apply the validated finite client-side budgets above without loading a second model.
 
 Plain chat does not use the Qwen Code role-provider routing layer; it addresses the canonical `qwen3.8-27b-chat` router model directly.
-# algorithm-agent.md
-model: qwen3.8-27b-algorithm
-```
-
-```yaml
-# test-agent.md
-model: qwen3.8-27b-test
-```
-
-The installer creates corresponding provider entries in `settings.json`. A role provider contains both the Qwen Code-side reasoning value and the explicit request-body override:
-
-```json
-"generationConfig": {
-  "reasoning": {
-    "effort": "medium"
-  },
-  "extra_body": {
-    "reasoning_effort": "medium"
-  }
-}
-```
-
-For the local OpenAI-compatible provider, `extra_body.reasoning_effort` is the explicit wire-level value sent to `llama.cpp`.
-
-All role providers point to the same local endpoint. Only one physical GGUF is loaded.
-
-The corresponding `llama-server` configuration enables reasoning with:
-
-```text
---reasoning on
---reasoning-effort xhigh
---reasoning-budget -1
---reasoning-preserve
-```
-
-The server-level `xhigh` setting is the fallback/default. PROMPT and ALGORITHM currently use `xhigh` requests; TEST overrides the server default with `medium`.
 
 ## Updating Qwen Code
 
-The project depends on two Qwen Code compatibility behaviors and one separate compression optimization.
+The project depends on two Qwen Code compatibility behaviors plus separately managed context, growth, and runtime-resilience hardening.
 
 After upgrading Qwen Code, launch through:
 
@@ -699,13 +671,15 @@ There is one public benchmark entry point:
 .\benchmark\benchmark_qwen.ps1
 ```
 
-With no switches it runs the full adaptive sequence automatically: preflight, NGRAM screening and real-agent gate, adaptive `p-min` comparison, Q8/Q8 context/KV selection and quality gate, optional Q8/Q5 capacity exploration, then the final recommendation.
+With no switches it runs the full convergent sequence automatically: preflight, NGRAM screening and real-agent gate, adaptive `p-min` comparison, Q8/Q8 context/KV selection and quality gate, optional Q8/Q5 capacity exploration, agentic harness validation, shared reasoning/growth stress evidence, then the final recommendation.
 
 The result is a recommendation within the tested candidate set for the current machine; it is not a claim of a global optimum.
 
-The benchmark does not modify production configuration while testing. At the end it asks whether to apply the primary tested recommendation. Only an explicit `Y` transactionally updates the benchmark-tunable values in Git-ignored `config\local.ps1` and synchronizes the managed Qwen Code provider context-window metadata. Reasoning effort remains unchanged and is not auto-tuned.
+The benchmark does not modify production configuration while testing. At the end it asks whether to apply the primary tested recommendation. Only an explicit `Y` transactionally updates the whitelisted values in `config\local.ps1` and synchronizes the managed Qwen Code provider context, finite thinking budgets, and per-turn growth metadata. Reasoning effort and the 5% context/output margin remain fixed policy.
 
-Temporary benchmark servers and workspaces are cleaned up on completion and error paths.
+For a production-style lifecycle check, `-OrchestrationEnduranceStress` validates routing, recoverable ALGORITHM growth, reread/recovery sequencing, TEST ordering, compaction continuation, terminal completion, and runtime/hook failure counters. Rollover is reported separately and is non-blocking when not naturally exercised.
+
+Persistent endurance evidence is written under `Desktop\LocalAI-tests\orchestration-endurance\<timestamp>`. Temporary benchmark servers and workspaces are cleaned up on completion and error paths.
 
 Historical machine-readable reports from the earlier benchmark implementations remain under:
 
@@ -717,6 +691,16 @@ For a preflight-only environment check:
 
 ```powershell
 .\benchmark\benchmark_qwen.ps1 -PreflightOnly
+```
+
+For the validated orchestration endurance profile:
+
+```powershell
+.\benchmark\benchmark_qwen.ps1 -OrchestrationEnduranceStress `
+  -ConfirmPromptReasoningBudget 4608 `
+  -ConfirmAlgorithmReasoningBudget 6144 `
+  -ConfirmTestReasoningBudget 6144 `
+  -ConfirmGrowthBudget 24576
 ```
 
 See [Benchmarking](benchmarking.md) for methodology, candidate-selection rules, historical reference measurements, and interpretation.
@@ -814,5 +798,5 @@ Do not start a second standalone llama.cpp server for the chat path. Both entry 
 <!-- LOCALAI_GROWTH_GUARD_BEGIN -->
 ### Per-turn context-growth guard
 
-The LocalAI coding profile sets `model.maxContextGrowthTokensPerTurn` to `8192`. The generic Qwen Code runtime default is `0`, so the Qwen Code growth guard is opt-in. Plain chat is bounded independently by `qwen_chat_context_proxy.py`. Qwen Code compaction and same-session rollover do not refund already-consumed growth.
+The LocalAI coding profile sets `model.maxContextGrowthTokensPerTurn` to `24576`. The generic Qwen Code runtime default is `0`, so the Qwen Code growth guard is opt-in. Plain chat is bounded independently by `qwen_chat_context_proxy.py`. Qwen Code compaction and same-session rollover do not refund already-consumed growth.
 <!-- LOCALAI_GROWTH_GUARD_END -->

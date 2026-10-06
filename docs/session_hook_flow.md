@@ -89,6 +89,7 @@ PROMPT input
 qwen3.8-27b-local
         |
         | reasoning_effort = xhigh
+        | thinking_budget_tokens = 4608
         v
 llama.cpp
         |
@@ -132,17 +133,26 @@ AGENT TOOL CALL
 
 Agent matcher -> hook_dispatcher.py
         |
+        +--> require configured algorithm-agent / test-agent
+        +--> force foreground specialist execution
+        +--> enforce bounded task-delta size
+        |
+        +--> ALGORITHM:
+        |       require <ALGORITHM_SCOPE>
+        |       select implementation workflow
+        |       if growth recovery is active:
+        |         require <GROWTH_RECOVERY>
+        |         exact completed/residual partition
+        |         deny same/equivalent full-scope retry
+        |         require actual-state reread evidence
+        |
         +--> valid <PROMPT_MEMORY>:
         |       memory_protocol.py validates operation
         |       ownership must be PROMPT / Pxxx
         |       memory_store.py applies durable update
         |       workflow_state.prompt_memory_written updates
         |
-        +--> malformed or suspicious carrier:
-        |       no memory write
-        |       suspicious metadata removed
-        |
-        +--> carrier is always removed before specialist task
+        +--> machine-only carriers removed before specialist task
         |
         +--> compatibility Patch 2 makes rewritten tool_input
               the actual Agent invocation input
@@ -194,6 +204,7 @@ ALGORITHM input
 qwen3.8-27b-algorithm
         |
         | reasoning_effort = xhigh
+        | thinking_budget_tokens = 6144
         v
 llama.cpp
         |
@@ -214,17 +225,56 @@ llama.cpp
 
 hook_dispatcher.py
         |
-        +--> algorithm_completed = true
-        +--> update implementation state
-        +--> capture concrete receipt / warning / blocker facts
+        +--> if terminate_reason = GROWTH_LIMIT:
+        |       growth_recovery_required = true
+        |       growth_recovery_guard_active = true
+        |       preserve failed files + semantic objective IDs
+        |       partial side effects possible
+        |       return authoritative recovery state to PROMPT
+        |       do NOT mark the root workflow terminal
+        |
+        +--> otherwise:
+                algorithm_completed = true
+                update implementation state
+                clear recovery guard only after final residual slice
 
 =================== END HOOK: SubagentStop =====================
+
+        |
+        +--> if ALGORITHM hit GROWTH_LIMIT:
+        |       PROMPT re-reads each failed-scope file
+        |       |
+        |       +--> read_file success
+        |       |       -> PostToolUse
+        |       |
+        |       +--> real file-not-found
+        |               -> PostToolUseFailure
+        |
+        v
+
+================ POST-TOOL REREAD EVIDENCE =====================
+
+hook_dispatcher.py
+        |
+        +--> accept successful read_file only after execution
+        +--> accept file-not-found as actual-state evidence
+        +--> reject interrupts / arbitrary failed reads as evidence
+        +--> serialize concurrent state updates with msvcrt file lock
+        +--> append normalized reread path to workflow state
+
+============== END POST-TOOL REREAD EVIDENCE ==================
 
         |
         v
 PROMPT role
         |
-        +--> normalize ALGORITHM receipt
+        +--> after normal ALGORITHM success:
+        |       normalize ALGORITHM receipt
+        |
+        +--> after recoverable GROWTH_LIMIT:
+        |       classify original objective IDs as completed/residual
+        |       delegate one or more strictly smaller residual ALGORITHM slices
+        |       do not run TEST while recovery guard is active
         |
         +--> TEST receives only objective subset:
         |       changed-file claims
@@ -287,6 +337,7 @@ hook_dispatcher.py
 qwen3.8-27b-test
         |
         | reasoning_effort = medium
+        | thinking_budget_tokens = 6144
         v
 llama.cpp
         |
@@ -327,6 +378,7 @@ PROMPT role
 hook_dispatcher.py
         |
         +--> verify:
+        |       whether growth-recovery guard is clear
         |       whether final verification is required
         |       whether verification occurred after implementation
         |       whether blocker/failure remains open
@@ -343,6 +395,9 @@ hook_dispatcher.py
         |
         v
 USER receives final response
+
+The diagnostic `terminal_completion_trace_v5_14.jsonl` records Stop state before the Stop handler mutates it. Therefore a raw trace value `turn_closed=false` at Stop is observability-only; terminal correctness is determined by the actual Stop decision plus the resulting top-level completion.
+
         |
         v
 SessionEnd, when emitted by the Qwen Code path

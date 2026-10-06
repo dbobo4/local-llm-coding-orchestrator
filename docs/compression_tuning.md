@@ -13,9 +13,11 @@ cache sharing = enabled / preserved
 
 The Qwen Code provider `generationConfig.contextWindowSize` is synchronized with the `40960` llama.cpp server context because compression thresholds are computed from the provider context window.
 
-The current production output cap is `2048`. The earlier 4096/3072/2048 A/B/C measurements remain historical evidence; the current runtime uses a 40960-token context and an auto-compaction threshold of 24888.
+The current production snapshot-generation hard cap is `2048`. The earlier 4096/3072/2048 A/B/C measurements remain historical evidence; the current runtime uses a 40960-token context and an auto-compaction threshold of 24888.
 
-The compact state handoff contains `goal`, `durable_constraints`, `current_state`, `open_issues`, and `next_step`, targeting roughly 800-1500 tokens.
+There is a second, independent value that is also `2048` at the current `40960` context: the normal inference output safety margin is fixed at **5% of context**. That margin and `COMPACT_MAX_OUTPUT_TOKENS` are separate controls that only happen to have the same numeric value in the current configuration. Benchmark tuning must not conflate them.
+
+The compact state handoff contains `goal`, `durable_constraints`, `current_state`, `open_issues`, and `next_step`, with a canonical soft target of roughly `600-1000` tokens.
 
 ## Historical 49152-context tuning basis
 
@@ -91,13 +93,26 @@ patched:   optimized canonical prompt/directive + cap 2048
 incompatible: unknown/mixed state -> fail closed
 ```
 
-The validated production runtime SHA256 is:
-
-```text
-8854D92C278AD63603C1E2695A2BE74B198A7D3AB3358074E0FAEAA9CF36AA8D
-```
+Runtime-file hashes are version- and patch-state-specific, so this document does not treat one generated JavaScript hash as a permanent production identifier. `patches/qwen_runtime_patches.ps1` owns Detect/Apply/Verify and fails closed on unknown semantic structures.
 
 The 4096 optimized state is intentionally supported as a migration state.
+
+## Lifecycle validation status
+
+The bounded lifecycle has two distinct evidence levels:
+
+```text
+compaction
+  dynamic PASS
+  repeated production-style continuation after compaction observed
+
+rollover
+  source-verified
+  dynamic NOT_EXERCISED
+  non-blocking for the current validated configuration
+```
+
+The orchestration endurance run completed with two chat compactions and zero post-compaction continuation gaps. Rollover was not required because compaction recovered enough context.
 
 <!-- LOCALAI_CURRENT_COMPRESSION_DECISION_BEGIN -->
 ## Current production decision

@@ -116,16 +116,22 @@ preflight
    -> real-agent quality gate for the selected primary context
 -> Q8/Q5 extended-context candidates
    -> capacity-only optional result
+-> agentic harness validation
+-> shared reasoning-budget / growth-budget stress evidence
 -> final primary recommendation
 -> explicit Y/N apply prompt
 ```
 
 The primary result is the recommended quality-gated configuration within the tested candidate set. The runner does not claim a global optimum.
 
-During measurement, production configuration is read-only. After an explicit `Y`, only this tested whitelist is written transactionally to Git-ignored `config/local.ps1`:
+During measurement, production configuration is read-only. After an explicit `Y`, only this tested whitelist is written transactionally to `config/local.ps1`:
 
 ```text
 ContextWindowSize
+PromptReasoningBudgetTokens
+AlgorithmReasoningBudgetTokens
+TestReasoningBudgetTokens
+MaxContextGrowthTokensPerTurn
 SpecDraftPMin
 SpecNgramModNMin
 SpecNgramModNMax
@@ -134,9 +140,9 @@ CacheTypeK
 CacheTypeV
 ```
 
-The same transaction synchronizes the three managed Qwen Code provider `generationConfig.contextWindowSize` values so Qwen Code context accounting and compression use the same limit as llama.cpp.
+The same transaction synchronizes the three managed Qwen Code provider `generationConfig.contextWindowSize` values, their `extra_body.thinking_budget_tokens` values, and `model.maxContextGrowthTokensPerTurn`.
 
-Reasoning effort is report-only and unchanged. The runner does not auto-apply role-specific reasoning changes. Thread counts, batch size, and ubatch size likewise remain the established baseline.
+Reasoning **effort** is fixed and is not auto-tuned. The finite role reasoning **budgets** and the per-turn growth budget are separate tunable values. Thread counts, batch size, ubatch size, and the 5% context/output safety margin remain established fixed policy.
 
 The optional Q8/Q5 maximum-context result is capacity-only unless separately quality-gated; it is not auto-applied as the primary recommendation.
 
@@ -215,7 +221,7 @@ Selected settings:
 draft n-max = 2
 p-min = 0.025
 
-ngram n-min = 32
+ngram n-min = 48
 ngram n-max = 64
 ngram n-match = 16
 ```
@@ -297,6 +303,16 @@ PROMPT     -> xhigh
 ALGORITHM  -> xhigh
 TEST       -> medium
 ```
+
+The validated finite reasoning budgets are:
+
+```text
+PROMPT     -> 4608
+ALGORITHM  -> 6144
+TEST       -> 6144
+```
+
+The coding-profile cumulative per-turn context-growth guard is `24576`. These client-side limits are distinct from the llama.cpp server fallback `--reasoning-budget -1`.
 
 All roles use the same physical Qwen3.8-27B GGUF and the same `llama.cpp` process. The difference is request-level provider configuration.
 
@@ -393,6 +409,51 @@ approximately 34772
 Execution then continued to independent TEST PASS with 9 tests passing.
 
 This supports the local compression optimization as a fix for the prior low-threshold/re-compaction behavior, but it is not a raw inference-throughput benchmark.
+## Orchestration endurance benchmark
+
+Version `2.5.0-live-orchestration-endurance` adds an explicit production-style lifecycle stress mode:
+
+```powershell
+.\benchmark\benchmark_qwen.ps1 -OrchestrationEnduranceStress `
+  -ConfirmPromptReasoningBudget 4608 `
+  -ConfirmAlgorithmReasoningBudget 6144 `
+  -ConfirmTestReasoningBudget 6144 `
+  -ConfirmGrowthBudget 24576
+```
+
+The validated run produced:
+
+| Metric | Result |
+| --- | ---: |
+| Result | `PASS` |
+| Wall time | `1119.955 s` |
+| API responses | `46` |
+| Tool calls | `56` |
+| `MAX_TOKENS` | `0` |
+| `NO_VISIBLE_PROGRESS` | `0` |
+| GROWTH_LIMIT telemetry | `5` |
+| GROWTH_LIMIT result count | `2` |
+| Recovery reread cycles | `2` |
+| Successful ALGORITHM after growth | `1` |
+| ALGORITHM results | `3` |
+| TEST results | `1` |
+| Chat compactions | `2` |
+| Compaction continuation gaps | `0` |
+| Hook errors | `0` |
+| Runtime fatal errors | `0` |
+
+The run reached a top-level final response after the last tool result, the last pre-agent recovery/guard state was clear, and no terminal abort was observed.
+
+`ROLLOVER_REQUIRED=0` and `ROLLOVER_COMPLETED=0`, so rollover remains `NOT_EXERCISED_NON_BLOCKING`. This is deliberate: compaction recovered enough context that the rollover path was not naturally required. Do not interpret the endurance PASS as dynamic rollover proof.
+
+The dedicated mode stores persistent evidence under:
+
+```text
+$HOME\Desktop\LocalAI-tests\orchestration-endurance\<timestamp>\
+```
+
+Temporary benchmark workspaces remain isolated and are cleaned after the run.
+
 ## Historical final p-min comparison
 
 The historical dedicated p-min verification compared:
@@ -586,8 +647,16 @@ Role-specific request policy:
   ALGORITHM  xhigh
   TEST       medium
 
-Reasoning budget:
+Server reasoning budget:
   -1
+
+Role thinking budgets:
+  PROMPT 4608
+  ALGORITHM 6144
+  TEST 6144
+
+Per-turn context-growth guard:
+  24576
 
 Reasoning preserve:
   enabled

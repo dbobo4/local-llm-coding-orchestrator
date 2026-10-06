@@ -82,6 +82,29 @@ class WorkflowState:
     # the selected specialist phase completed successfully.
     terminal_abort_reason: str | None = None
 
+    # A runtime guard may stop a specialist after tools already changed state.
+    # Preserve this uncertainty explicitly for root-side recovery/summary.
+    partial_side_effects_possible: bool = False
+
+    # V5.14 recoverable specialist growth state.
+    # PROMPT/root owns semantic decomposition; code only enforces monotonic scope.
+    algorithm_scope_files: list[str] = field(default_factory=list)
+    algorithm_scope_objectives: list[str] = field(default_factory=list)
+
+    growth_recovery_required: bool = False
+    growth_recovery_guard_active: bool = False
+    growth_recovery_generation: int = 0
+
+    growth_recovery_anchor_objectives: list[str] = field(default_factory=list)
+    growth_recovery_failed_files: list[str] = field(default_factory=list)
+    growth_recovery_failed_objectives: list[str] = field(default_factory=list)
+    growth_recovery_reread_files: list[str] = field(default_factory=list)
+
+    growth_recovery_completed_objectives: list[str] = field(default_factory=list)
+    growth_recovery_residual_objectives: list[str] = field(default_factory=list)
+    growth_recovery_final_slice: bool = False
+
+
     # At most one successful PROMPT-owned durable-memory mutation may
     # be committed during one real root user turn.
     prompt_memory_written: bool = False
@@ -679,9 +702,109 @@ def unregister_agent_root_turn(
     )
 
 
+
+def set_algorithm_scope(
+    state: WorkflowState,
+    *,
+    files: list[str],
+    objectives: list[str],
+) -> None:
+    state.algorithm_scope_files = list(dict.fromkeys(files))
+    state.algorithm_scope_objectives = list(dict.fromkeys(objectives))
+    save_state(state)
+
+
+def mark_growth_recovery_required(
+    state: WorkflowState,
+) -> None:
+    failed_objectives = list(
+        dict.fromkeys(state.algorithm_scope_objectives)
+    )
+    if not failed_objectives:
+        failed_objectives = ["legacy_unscoped_work"]
+
+    if not state.growth_recovery_guard_active:
+        state.growth_recovery_anchor_objectives = list(failed_objectives)
+        state.growth_recovery_completed_objectives = []
+        state.growth_recovery_residual_objectives = list(failed_objectives)
+
+    state.growth_recovery_failed_files = list(
+        dict.fromkeys(state.algorithm_scope_files)
+    )
+    state.growth_recovery_failed_objectives = list(failed_objectives)
+    state.growth_recovery_reread_files = []
+    state.growth_recovery_required = True
+    state.growth_recovery_guard_active = True
+    state.growth_recovery_generation += 1
+    state.growth_recovery_final_slice = False
+
+    # A specialist growth stop is recoverable. It is not a terminal root abort.
+    state.terminal_abort_reason = None
+    state.partial_side_effects_possible = True
+    save_state(state)
+
+
+def record_growth_recovery_reread(
+    state: WorkflowState,
+    file_path: str,
+) -> None:
+    if not state.growth_recovery_required:
+        return
+    value = str(file_path).strip().replace("\\", "/").lower()
+    if value and value not in state.growth_recovery_reread_files:
+        state.growth_recovery_reread_files.append(value)
+        save_state(state)
+
+
+def set_growth_recovery_plan(
+    state: WorkflowState,
+    *,
+    completed: list[str],
+    residual: list[str],
+    delegate_files: list[str],
+    delegate_objectives: list[str],
+    final_slice: bool,
+) -> None:
+    state.growth_recovery_completed_objectives = list(completed)
+    state.growth_recovery_residual_objectives = list(residual)
+    state.algorithm_scope_files = list(delegate_files)
+    state.algorithm_scope_objectives = list(delegate_objectives)
+    state.growth_recovery_required = False
+    state.growth_recovery_guard_active = True
+    state.growth_recovery_final_slice = bool(final_slice)
+    state.partial_side_effects_possible = False
+    save_state(state)
+
+
+def mark_growth_recovery_algorithm_success(
+    state: WorkflowState,
+) -> None:
+    if not state.growth_recovery_guard_active:
+        return
+    if state.growth_recovery_required:
+        return
+    if not state.growth_recovery_final_slice:
+        save_state(state)
+        return
+
+    state.growth_recovery_required = False
+    state.growth_recovery_guard_active = False
+    state.growth_recovery_anchor_objectives = []
+    state.growth_recovery_failed_files = []
+    state.growth_recovery_failed_objectives = []
+    state.growth_recovery_reread_files = []
+    state.growth_recovery_completed_objectives = []
+    state.growth_recovery_residual_objectives = []
+    state.growth_recovery_final_slice = False
+    state.partial_side_effects_possible = False
+    save_state(state)
+
+
 def mark_terminal_abort(
     state: WorkflowState,
     reason: str,
+    *,
+    partial_side_effects_possible: bool = False,
 ) -> None:
     normalized = reason.strip()
 
@@ -691,6 +814,9 @@ def mark_terminal_abort(
         )
 
     state.terminal_abort_reason = normalized[:4000]
+    state.partial_side_effects_possible = bool(
+        partial_side_effects_possible
+    )
 
     save_state(
         state
@@ -1124,12 +1250,33 @@ def can_finish_turn(
         )
     )
 
-    if state.terminal_abort_reason:
+    if state.growth_recovery_guard_active:
+        if state.growth_recovery_required:
+            return (
+                False,
+                "ALGORITHM GROWTH_LIMIT recovery requires actual-state re-read and a strictly smaller residual delegation.",
+            )
         return (
-            True,
+            False,
+            "ALGORITHM GROWTH_LIMIT recovery still has residual implementation work; continue smaller ALGORITHM slices before TEST/final.",
+        )
+
+    if state.terminal_abort_reason:
+        reason = (
             "Workflow terminated by runtime guard without "
             "successful specialist completion: "
-            + state.terminal_abort_reason,
+            + state.terminal_abort_reason
+        )
+
+        if state.partial_side_effects_possible:
+            reason += (
+                ". Partial side effects are possible; current repository "
+                "state must be re-read before continuation or summary"
+            )
+
+        return (
+            True,
+            reason,
         )
 
     if workflow_kind == "prompt_only":

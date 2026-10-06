@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import msvcrt
 import re
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any
+
+import workflow_state as _localai_workflow_state
 
 from memory_protocol import (
     MemoryUpdate,
@@ -326,6 +330,380 @@ def _synthetic_qwen_turn_id(
     ).hexdigest()[:20]
 
     return f"qwen-{digest}"
+
+
+
+_LOCALAI_V514_SCOPE_RE = re.compile(
+    r"<ALGORITHM_SCOPE>\s*(.*?)\s*</ALGORITHM_SCOPE>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_LOCALAI_V514_SCOPE_MARKER_RE = re.compile(
+    r"<\s*/?\s*ALGORITHM_SCOPE\s*>",
+    flags=re.IGNORECASE,
+)
+_LOCALAI_V514_RECOVERY_RE = re.compile(
+    r"<GROWTH_RECOVERY>\s*(.*?)\s*</GROWTH_RECOVERY>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_LOCALAI_V514_RECOVERY_MARKER_RE = re.compile(
+    r"<\s*/?\s*GROWTH_RECOVERY\s*>",
+    flags=re.IGNORECASE,
+)
+
+
+def _localai_v514_carrier(
+    prompt: str,
+    *,
+    pattern: re.Pattern[str],
+    marker: re.Pattern[str],
+    label: str,
+    required: bool,
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    markers = list(marker.finditer(prompt))
+    matches = list(pattern.finditer(prompt))
+
+    if not markers:
+        if required:
+            return None, prompt, f"Missing required <{label}> JSON carrier."
+        return None, prompt, None
+
+    if len(markers) != 2 or len(matches) != 1:
+        return None, prompt, f"Malformed <{label}> carrier."
+
+    try:
+        value = json.loads(matches[0].group(1))
+    except Exception as exc:
+        return None, prompt, f"Invalid <{label}> JSON: {type(exc).__name__}: {exc}"
+
+    if not isinstance(value, dict):
+        return None, prompt, f"<{label}> must contain one JSON object."
+
+    return value, pattern.sub("", prompt, count=1), None
+
+
+def _localai_v514_list(
+    value: Any,
+    *,
+    label: str,
+    normalize_path: bool = False,
+) -> tuple[list[str] | None, str | None]:
+    if not isinstance(value, list):
+        return None, f"{label} must be a JSON list."
+
+    result: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw.strip():
+            return None, f"{label} entries must be non-empty strings."
+        item = raw.strip()
+        if normalize_path:
+            item = item.replace("\\", "/").lower()
+        else:
+            item = item.lower()
+        if item in result:
+            return None, f"{label} contains duplicate entry {raw!r}."
+        result.append(item)
+
+    return result, None
+
+
+def _localai_v514_file_matches(read_path: str, scoped_path: str) -> bool:
+    read_value = read_path.replace("\\", "/").lower().strip()
+    scope_value = scoped_path.replace("\\", "/").lower().strip()
+    if scope_value == "<discover>":
+        return bool(read_value)
+    return (
+        read_value == scope_value
+        or read_value.endswith("/" + scope_value)
+    )
+
+
+def _localai_v5141_authoritative_recovery_hint(
+    state: WorkflowState,
+) -> str:
+    payload = {
+        "generation": state.growth_recovery_generation,
+        "anchor_objectives": list(
+            state.growth_recovery_anchor_objectives
+        ),
+        "failed_files": list(
+            state.growth_recovery_failed_files
+        ),
+        "failed_objectives": list(
+            state.growth_recovery_failed_objectives
+        ),
+        "reread_files": list(
+            state.growth_recovery_reread_files
+        ),
+        "completed_objectives": list(
+            state.growth_recovery_completed_objectives
+        ),
+        "residual_objectives": list(
+            state.growth_recovery_residual_objectives
+        ),
+    }
+    return (
+        " AUTHORITATIVE_GROWTH_RECOVERY_STATE="
+        + json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _localai_v514_prepare_algorithm(
+    prompt: str,
+    state: WorkflowState,
+) -> tuple[str | None, str | None]:
+    scope, clean, error = _localai_v514_carrier(
+        prompt,
+        pattern=_LOCALAI_V514_SCOPE_RE,
+        marker=_LOCALAI_V514_SCOPE_MARKER_RE,
+        label="ALGORITHM_SCOPE",
+        required=True,
+    )
+    if error:
+        return None, error
+    assert scope is not None
+
+    files, error = _localai_v514_list(
+        scope.get("files"),
+        label="ALGORITHM_SCOPE.files",
+        normalize_path=True,
+    )
+    if error:
+        return None, error
+
+    objectives, error = _localai_v514_list(
+        scope.get("objectives"),
+        label="ALGORITHM_SCOPE.objectives",
+    )
+    if error:
+        return None, error
+
+    assert files is not None
+    assert objectives is not None
+
+    if not files or not objectives:
+        return None, "ALGORITHM_SCOPE requires non-empty files and objectives."
+
+    recovery, clean, error = _localai_v514_carrier(
+        clean,
+        pattern=_LOCALAI_V514_RECOVERY_RE,
+        marker=_LOCALAI_V514_RECOVERY_MARKER_RE,
+        label="GROWTH_RECOVERY",
+        required=bool(state.growth_recovery_guard_active),
+    )
+    if error:
+        return None, error
+
+    if not state.growth_recovery_guard_active:
+        if recovery is not None:
+            return None, "GROWTH_RECOVERY is valid only during active growth recovery."
+        _localai_workflow_state.set_algorithm_scope(
+            state,
+            files=files,
+            objectives=objectives,
+        )
+        return clean, None
+
+    assert recovery is not None
+
+    completed, error = _localai_v514_list(
+        recovery.get("completed"),
+        label="GROWTH_RECOVERY.completed",
+    )
+    if error:
+        return None, error
+
+    residual, error = _localai_v514_list(
+        recovery.get("residual"),
+        label="GROWTH_RECOVERY.residual",
+    )
+    if error:
+        return None, error
+
+    assert completed is not None
+    assert residual is not None
+
+    anchor = set(state.growth_recovery_anchor_objectives)
+    completed_set = set(completed)
+    residual_set = set(residual)
+
+    if completed_set & residual_set:
+        return None, "GROWTH_RECOVERY.completed and residual must be disjoint."
+    if completed_set | residual_set != anchor:
+        return None, (
+            "GROWTH_RECOVERY.completed + residual must exactly partition "
+            "the original failed semantic objective IDs."
+            + _localai_v5141_authoritative_recovery_hint(state)
+        )
+    if not set(state.growth_recovery_completed_objectives).issubset(completed_set):
+        return None, "Completed growth-recovery objectives are monotonic."
+
+    delegate_roots = {
+        item.split("::", 1)[0]
+        for item in objectives
+    }
+    if not delegate_roots.issubset(residual_set):
+        return None, (
+            "Delegated recovery objectives must be residual IDs or "
+            "semantic children parent_id::child_id."
+        )
+
+    if state.growth_recovery_required:
+        rereads = list(state.growth_recovery_reread_files)
+        explicit_failed = [
+            item
+            for item in state.growth_recovery_failed_files
+            if item != "<discover>"
+        ]
+
+        if explicit_failed:
+            missing = [
+                item
+                for item in explicit_failed
+                if not any(
+                    _localai_v514_file_matches(read, item)
+                    for read in rereads
+                )
+            ]
+            if missing:
+                return None, (
+                    "GROWTH_LIMIT recovery requires root re-read of every "
+                    "explicit failed-scope file. Missing: "
+                    + ", ".join(missing)
+                    + _localai_v5141_authoritative_recovery_hint(state)
+                )
+        elif not rereads:
+            return None, (
+                "GROWTH_LIMIT recovery requires at least one root read_file "
+                "of actual repository state."
+                + _localai_v5141_authoritative_recovery_hint(state)
+            )
+
+        failed_roots = {
+            item.split("::", 1)[0]
+            for item in state.growth_recovery_failed_objectives
+        }
+        failed_files = {
+            item
+            for item in state.growth_recovery_failed_files
+            if item != "<discover>"
+        }
+        delegate_files = {
+            item
+            for item in files
+            if item != "<discover>"
+        }
+        child_refinement = any("::" in item for item in objectives)
+
+        if (
+            delegate_roots == failed_roots
+            and (not failed_files or delegate_files == failed_files)
+            and not child_refinement
+        ):
+            return None, (
+                "GROWTH_LIMIT recovery denied same-scope retry. "
+                "Delegate a strictly smaller semantic residual slice."
+            )
+    elif (
+        files == state.algorithm_scope_files
+        and objectives == state.algorithm_scope_objectives
+    ):
+        return None, (
+            "GROWTH_LIMIT recovery denied repeated identical residual scope."
+        )
+
+    final_slice = recovery.get("final_slice")
+    if not isinstance(final_slice, bool):
+        return None, "GROWTH_RECOVERY.final_slice must be true or false."
+    if final_slice and delegate_roots != residual_set:
+        return None, (
+            "final_slice=true requires delegated semantic roots to cover "
+            "all currently residual objectives."
+        )
+
+    _localai_workflow_state.set_growth_recovery_plan(
+        state,
+        completed=completed,
+        residual=residual,
+        delegate_files=files,
+        delegate_objectives=objectives,
+        final_slice=final_slice,
+    )
+    return clean, None
+
+
+def _localai_v514_track_reread(
+    payload: dict[str, Any],
+) -> None:
+    if str(payload.get("tool_name") or "").strip().lower() != "read_file":
+        return
+    session_id = _get_required_string(payload, "session_id")
+    if session_id is None:
+        return
+    state = get_active_state(session_id)
+    if state is None or not state.growth_recovery_required:
+        return
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return
+    file_path = tool_input.get("file_path")
+    if not isinstance(file_path, str):
+        return
+    _localai_workflow_state.record_growth_recovery_reread(
+        state,
+        file_path,
+    )
+
+
+def _localai_v514_trace(
+    payload: dict[str, Any],
+) -> None:
+    # B is diagnostic only in V5.14: no terminal-completion behavior change.
+    try:
+        event = str(payload.get("hook_event_name") or "").strip()
+        tool = str(payload.get("tool_name") or "").strip()
+        if event == "PreToolUse" and tool.lower() not in {
+            "agent", "read_file", "glob", "grep_search"
+        }:
+            return
+        if event not in {"PreToolUse", "SubagentStop", "Stop"}:
+            return
+
+        session_id = str(payload.get("session_id") or "").strip()
+        state = get_active_state(session_id) if session_id else None
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "event": event,
+            "tool": tool,
+            "growth_recovery_required": (
+                state.growth_recovery_required if state else None
+            ),
+            "growth_recovery_guard_active": (
+                state.growth_recovery_guard_active if state else None
+            ),
+            "turn_closed": state.turn_closed if state else None,
+            "terminal_abort_reason": (
+                state.terminal_abort_reason if state else None
+            ),
+        }
+        ERROR_LOG_ROOT.mkdir(parents=True, exist_ok=True)
+        with (
+            ERROR_LOG_ROOT / "terminal_completion_trace_v5_14.jsonl"
+        ).open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
 
 
 def _normalize_agent_type(
@@ -980,9 +1358,8 @@ def _handle_algorithm_stop(
     if _is_growth_limit_stop(
         payload
     ):
-        mark_terminal_abort(
-            state,
-            "specialist_growth_limit",
+        _localai_workflow_state.mark_growth_recovery_required(
+            state
         )
 
         _unregister_subagent(
@@ -992,6 +1369,15 @@ def _handle_algorithm_stop(
         _write_json(
             {
                 "continue": True,
+                "systemMessage": (
+                    "Specialist stopped because the per-turn context growth "
+                    "limit was reached. GROWTH_RECOVERY_REQUIRED=YES. "
+                    "PARTIAL_SIDE_EFFECTS_POSSIBLE=YES. Re-read actual failed-scope "
+                    "files, classify completed versus residual semantic objectives, "
+                    "and delegate only a strictly smaller residual ALGORITHM slice. "
+                    "Never retry the same full scope, even with different wording."
+                    + _localai_v5141_authoritative_recovery_hint(state)
+                ),
             }
         )
         return
@@ -1025,6 +1411,10 @@ def _handle_algorithm_stop(
     )
 
     mark_algorithm_completed(
+        state
+    )
+
+    _localai_workflow_state.mark_growth_recovery_algorithm_success(
         state
     )
 
@@ -1116,6 +1506,7 @@ def _handle_test_stop(
         mark_terminal_abort(
             state,
             "specialist_growth_limit",
+            partial_side_effects_possible=True,
         )
 
         _unregister_subagent(
@@ -1125,6 +1516,12 @@ def _handle_test_stop(
         _write_json(
             {
                 "continue": True,
+                "systemMessage": (
+                    "Specialist stopped because the per-turn context growth "
+                    "limit was reached. PARTIAL_SIDE_EFFECTS_POSSIBLE=YES. "
+                    "Do not assume the workspace is unchanged; re-read the "
+                    "current files and state before continuing or summarizing."
+                ),
             }
         )
         return
@@ -1620,6 +2017,25 @@ def _handle_prompt_memory_pre_tool_use(
                 require_test=True,
             )
 
+        prepared_prompt, scope_error = _localai_v514_prepare_algorithm(
+            prompt,
+            state,
+        )
+        if scope_error is not None:
+            _write_json(
+                {
+                    "continue": True,
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": scope_error,
+                    },
+                }
+            )
+            return
+        assert prepared_prompt is not None
+        prompt = prepared_prompt
+
     elif workflow_choice is not None:
         _write_json(
             {
@@ -1814,6 +2230,156 @@ def _handle_prompt_memory_pre_tool_use(
         }
     )
 
+# LOCALAI_GROWTH_RECOVERY_POST_READ_EVIDENCE_V5_14_1
+_LOCALAI_V5141_REREAD_LOCK_PATH = (
+    ORCHESTRATION_ROOT
+    / "state"
+    / ".growth_recovery_reread_v5_14_1.lock"
+)
+_LOCALAI_V5141_REREAD_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _localai_v5141_is_valid_read_evidence(
+    payload: dict[str, Any],
+) -> bool:
+    if str(payload.get("tool_name") or "").strip().lower() != "read_file":
+        return False
+
+    event_name = str(
+        payload.get("hook_event_name") or ""
+    ).strip()
+
+    if event_name == "PostToolUse":
+        return True
+
+    if event_name != "PostToolUseFailure":
+        return False
+
+    if payload.get("is_interrupt") is True:
+        return False
+
+    error_type_candidates: list[Any] = [
+        payload.get("error_type"),
+        payload.get("errorType"),
+    ]
+
+    tool_result = payload.get("tool_result")
+    if isinstance(tool_result, dict):
+        error_type_candidates.extend(
+            (
+                tool_result.get("error_type"),
+                tool_result.get("errorType"),
+            )
+        )
+
+    for candidate in error_type_candidates:
+        if (
+            isinstance(candidate, str)
+            and candidate.strip().lower() == "file_not_found"
+        ):
+            return True
+
+    error_value = payload.get("error")
+    if isinstance(error_value, dict):
+        nested_type = (
+            error_value.get("error_type")
+            or error_value.get("errorType")
+            or error_value.get("type")
+        )
+        if (
+            isinstance(nested_type, str)
+            and nested_type.strip().lower() == "file_not_found"
+        ):
+            return True
+        error_text = json.dumps(
+            error_value,
+            ensure_ascii=False,
+        ).casefold()
+    else:
+        error_text = str(error_value or "").casefold()
+
+    missing_markers = (
+        "enoent",
+        "no such file or directory",
+        "file_not_found",
+        "file not found",
+        "cannot find the file specified",
+        "cannot find the path specified",
+    )
+    return any(
+        marker in error_text
+        for marker in missing_markers
+    )
+
+
+def _localai_v5141_acquire_reread_lock():
+    _LOCALAI_V5141_REREAD_LOCK_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    handle = _LOCALAI_V5141_REREAD_LOCK_PATH.open(
+        "a+b"
+    )
+    handle.seek(0, 2)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+
+    deadline = (
+        time.monotonic()
+        + _LOCALAI_V5141_REREAD_LOCK_TIMEOUT_SECONDS
+    )
+    while True:
+        try:
+            handle.seek(0)
+            msvcrt.locking(
+                handle.fileno(),
+                msvcrt.LK_NBLCK,
+                1,
+            )
+            return handle
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise TimeoutError(
+                    "Timed out acquiring growth-recovery reread state lock."
+                )
+            time.sleep(0.02)
+
+
+def _localai_v5141_release_reread_lock(
+    handle: Any,
+) -> None:
+    try:
+        handle.seek(0)
+        msvcrt.locking(
+            handle.fileno(),
+            msvcrt.LK_UNLCK,
+            1,
+        )
+    finally:
+        handle.close()
+
+
+def _localai_v5141_record_read_evidence(
+    payload: dict[str, Any],
+) -> None:
+    if not _localai_v5141_is_valid_read_evidence(payload):
+        return
+
+    lock_handle = _localai_v5141_acquire_reread_lock()
+    try:
+        tracking_payload = dict(payload)
+        tracking_payload["hook_event_name"] = "PreToolUse"
+        _localai_v514_track_reread(
+            tracking_payload
+        )
+    finally:
+        _localai_v5141_release_reread_lock(
+            lock_handle
+        )
+
+
 def _dispatch(
     payload: dict[str, Any],
 ) -> None:
@@ -1889,7 +2455,23 @@ def main() -> None:
                 "hook_event_name"
             )
             or "unknown"
+        ).strip()
+
+        _localai_v514_trace(
+            payload
         )
+
+        if event_name in {
+            "PostToolUse",
+            "PostToolUseFailure",
+        }:
+            _localai_v5141_record_read_evidence(
+                payload
+            )
+            _write_json(
+                {"continue": True}
+            )
+            return
 
         _dispatch(
             payload
@@ -1901,7 +2483,11 @@ def main() -> None:
             error,
         )
 
-        if event_name == "PreToolUse":
+        if event_name in {
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+        }:
             _write_json(
                 {
                     "continue": True,

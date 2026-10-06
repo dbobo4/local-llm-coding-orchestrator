@@ -26,6 +26,10 @@ $ChatProxyPort = 8081
 # Benchmark-tunable inference settings.
 # The unified benchmark may update only these local values after explicit approval.
 $ContextWindowSize = 40960
+$PromptReasoningBudgetTokens = 4608
+$AlgorithmReasoningBudgetTokens = 6144
+$TestReasoningBudgetTokens = 6144
+$MaxContextGrowthTokensPerTurn = 24576
 $SpecDraftPMin = "0.025"
 $SpecNgramModNMin = 48
 $SpecNgramModNMax = 64
