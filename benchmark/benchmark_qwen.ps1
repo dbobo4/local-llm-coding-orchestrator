@@ -73,9 +73,9 @@ elseif ([string]::IsNullOrWhiteSpace([string]$QwenUserRoot)) {
 
 $BenchmarkDefaults = [ordered]@{
     ContextWindowSize = 40960
-    PromptReasoningBudgetTokens = 8192
-    AlgorithmReasoningBudgetTokens = 8192
-    TestReasoningBudgetTokens = 8192
+    PromptReasoningBudgetTokens = 4608
+    AlgorithmReasoningBudgetTokens = 6144
+    TestReasoningBudgetTokens = 6144
     MaxContextGrowthTokensPerTurn = 24576
     SpecDraftPMin = "0.025"
     SpecNgramModNMin = 48

@@ -4,6 +4,7 @@ config/qwen_models.ini
 
 # Generated benchmark output
 results/generated/
+benchmark-state/
 
 # Python cache
 __pycache__/
