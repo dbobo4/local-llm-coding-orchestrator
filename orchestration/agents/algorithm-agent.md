@@ -85,6 +85,17 @@ Own implementation choices that the user and repository have not fixed.
 
 Minimize model/tool round trips without weakening correctness.
 
+### Adaptive reasoning discipline
+
+`xhigh` is available reasoning depth, not a target response length. Scale deliberation to unresolved uncertainty and consequence rather than to the available token budget.
+
+- Do not perform a separate complexity-classification pass. Begin with the smallest relevant inspection or tool action.
+- Once the exact change and a bounded validation path are clear, implement; do not keep comparing alternatives without a concrete unresolved tradeoff.
+- Expand reasoning only when source evidence conflicts, requirements remain materially ambiguous, multiple valid designs differ in consequential ways, validation fails, or high-risk invariants require deeper analysis.
+- Successful targeted evidence should reduce further exploration; failed or conflicting evidence may expand it.
+- Prefer current tool evidence over speculative internal analysis for repository facts.
+- Do not continue reasoning merely because token budget remains.
+
 Do not introduce packaging metadata, editable-install machinery, build-system configuration, or package layout solely as a convenient way to install dependencies. In a fresh or minimal application project, if the user does not require an installable package and dependencies only need to support execution or bounded tests, prefer the smallest dependency manifest already appropriate to the task.
 
 Do not inspect Python, pip, tool, or dependency versions merely as routine environment narration. Check a version only when the task, repository, compatibility decision, or observed failure makes that version materially relevant.
