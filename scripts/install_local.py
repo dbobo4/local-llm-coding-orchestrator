@@ -78,6 +78,7 @@ PATCH_FILES = (
     "lib/chunks/chunk-DJPASAUV.js", ISOLATION_CHUNK,
     "lib/bundled/qc-helper/docs/configuration/settings.md",
     "lib/chunks/chunk-XHF7WQ6B.js",
+    "lib/chunks/chunk-WNPDGUJO.js",
 )
 
 

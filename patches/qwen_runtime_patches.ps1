@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$PatchManagerRevision = 2
+$PatchManagerRevision = 3
 $Root = Split-Path $PSScriptRoot -Parent
 $ConfigPath = Join-Path $Root ".localai\config\local.ps1"
 
@@ -22,6 +22,7 @@ $ManagedRelativeFiles = @(
     "lib\chunks\chunk-DJPASAUV.js",
     "lib\chunks\chunk-MZCJWS5Y.js",
     "lib\chunks\chunk-XHF7WQ6B.js",
+    "lib\chunks\chunk-WNPDGUJO.js",
     "lib\bundled\qc-helper\docs\configuration\settings.md"
 )
 
@@ -59,6 +60,10 @@ function Assert-ManagedRuntimeFiles {
 
 function Test-QwenRuntimePatchState {
     Assert-ManagedRuntimeFiles
+    $findings = [IO.File]::ReadAllText((Join-Path $RuntimeRoot "lib\chunks\chunk-WNPDGUJO.js"))
+    if ((Get-ReportFindingsGrammarState $findings) -ne "patched") {
+        throw "Runtime verification failed; report-findings grammar compatibility is missing or unapproved."
+    }
     $isolation = [IO.File]::ReadAllText((Join-Path $RuntimeRoot "lib\chunks\chunk-MZCJWS5Y.js"))
     if (-not $isolation.Contains("LOCALAI_INSTALLATION_PATH_ISOLATION_V1")) {
         throw "Runtime verification failed; installation path isolation is missing."
@@ -90,6 +95,58 @@ function Test-QwenRuntimePatchState {
         if ($LASTEXITCODE -ne 0) { throw "node --check failed: $path" }
     }
     Write-Host "QWEN_RUNTIME_PATCH_VERIFY=PASS"
+}
+
+function Get-ReportFindingsGrammarState {
+    param([Parameter(Mandatory=$true)][string]$Text)
+    $normalized = $Text.Replace("`r`n", "`n")
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($normalized))
+        $hash = [BitConverter]::ToString($digest).Replace("-", "").ToLowerInvariant()
+    } finally { $sha.Dispose() }
+    # Official 0.22.3 chunk, and that same chunk with only summary 2000 -> 1999.
+    switch ($hash) {
+        "47526881f73cf8ca67162f33b14a8bbd66fc8fb2dc9d126a717ac9bbfc60abbc" { return "unpatched" }
+        "7bfdbe9a3dfa984d99da53d041b82c32c00489f80aaf8ccf63e48e82a8babb65" { return "patched" }
+        default { return "incompatible" }
+    }
+}
+
+function Apply-ReportFindingsGrammarCompatibility {
+    param([Parameter(Mandatory=$true)][string]$Text)
+    $state = Get-ReportFindingsGrammarState $Text
+    if ($state -eq "patched") { return $Text }
+    if ($state -ne "unpatched") { throw "Unapproved report-findings schema; refusing compatibility patch." }
+    $old = @'
+    summary: {
+      type: "string",
+      maxLength: 2e3,
+      description: "One sentence stating the defect."
+    },
+'@
+    $newline = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $old = $old.Replace("`r`n", "`n").Replace("`n", $newline)
+    $index = $Text.IndexOf($old, [StringComparison]::Ordinal)
+    if ($index -lt 0 -or $Text.IndexOf($old, $index + $old.Length, [StringComparison]::Ordinal) -ge 0) {
+        throw "report-findings summary anchor is not unique."
+    }
+    # b10636 rejects the exact {0,2000} repetition; larger maxima are unbounded upstream.
+    $patched = $Text.Replace($old, $old.Replace("maxLength: 2e3", "maxLength: 1999"))
+    if ((Get-ReportFindingsGrammarState $patched) -ne "patched") { throw "report-findings patch integrity failed." }
+    return $patched
+}
+
+function Invoke-ReportFindingsGrammarPatch {
+    $path = Join-Path $RuntimeRoot "lib\chunks\chunk-WNPDGUJO.js"
+    Assert-LocalPath $path
+    $text = [IO.File]::ReadAllText($path)
+    $patched = Apply-ReportFindingsGrammarCompatibility $text
+    if ($patched -cne $text) {
+        $bytes = [IO.File]::ReadAllBytes($path)
+        $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
+        [IO.File]::WriteAllText($path, $patched, [Text.UTF8Encoding]::new($bom))
+    }
 }
 
 # PATCH BLOCK: compatibility-and-compression
@@ -4960,7 +5017,8 @@ $PatchRegistry = @(
     [pscustomobject]@{ Id = "compatibility-and-compression"; Revision = 1; Kind = "powershell" },
     [pscustomobject]@{ Id = "runtime-resilience"; Revision = 1; Kind = "powershell" },
     [pscustomobject]@{ Id = "root-context-growth"; Revision = 1; Kind = "python" },
-    [pscustomobject]@{ Id = "specialist-growth-termination"; Revision = 2; Kind = "python" }
+    [pscustomobject]@{ Id = "specialist-growth-termination"; Revision = 2; Kind = "python" },
+    [pscustomobject]@{ Id = "report-findings-grammar"; Revision = 1; Kind = "powershell" }
 )
 
 function Invoke-PatchBlock {
@@ -4973,6 +5031,7 @@ function Invoke-PatchBlock {
         }
         "compatibility-and-compression" { Invoke-CompatibilityAndCompressionPatch }
         "runtime-resilience" { Invoke-RuntimeResiliencePatch -QwenRoot $QwenRoot }
+        "report-findings-grammar" { Invoke-ReportFindingsGrammarPatch }
         "root-context-growth" {
             $path = Join-Path $TempRoot "root-context-growth.py"
             Assert-LocalPath $path
