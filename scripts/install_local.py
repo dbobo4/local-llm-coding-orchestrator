@@ -158,7 +158,7 @@ def check_prerequisites() -> None:
     if driver is None:
         raise RuntimeError("NVIDIA driver tools were not found. Install a driver supporting CUDA 13.3.")
     result = subprocess.run([driver], capture_output=True, text=True, timeout=20, check=False)
-    match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", result.stdout)
+    match = re.search(r"\bCUDA(?:\s+UMD)?\s+Version:\s*(\d+)\.(\d+)(?=\s|\||$)", result.stdout)
     if result.returncode or not match or tuple(map(int, match.groups())) < (13, 3):
         raise RuntimeError("The NVIDIA driver must advertise CUDA 13.3 or newer; no driver is installed automatically.")
 

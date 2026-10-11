@@ -25,6 +25,58 @@ def archive(files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+class NvidiaCudaBannerTests(unittest.TestCase):
+    """Accept both published NVIDIA-SMI CUDA labels, without weakening the minimum."""
+
+    def setUp(self) -> None:
+        spec = importlib.util.spec_from_file_location("cuda_banner_installer", REPO / "scripts" / "install_local.py")
+        self.installer = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = self.installer
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(self.installer)
+
+    def check_banner(self, output: str, returncode: int = 0) -> None:
+        def find_program(name: str) -> str | None:
+            return name if name in {"powershell.exe", "nvidia-smi.exe"} else None
+
+        result = SimpleNamespace(stdout=output, returncode=returncode)
+        with patch.object(self.installer.shutil, "which", side_effect=find_program), \
+             patch.object(self.installer.platform, "machine", return_value="AMD64"), \
+             patch.object(self.installer.subprocess, "run", return_value=result):
+            self.installer.check_prerequisites()
+
+    def test_standard_cuda_banner(self) -> None:
+        self.check_banner("NVIDIA-SMI 610.88  Driver Version: 610.88  CUDA Version: 13.3")
+
+    def test_windows_cuda_umd_banner(self) -> None:
+        self.check_banner("NVIDIA-SMI 610.88  KMD Version: 610.88  CUDA UMD Version: 13.3")
+
+    def test_cuda_umd_below_required_version_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "CUDA 13.3"):
+            self.check_banner("CUDA UMD Version: 13.2")
+
+    def test_missing_cuda_version_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "CUDA 13.3"):
+            self.check_banner("NVIDIA-SMI unknown version")
+
+    def test_failed_nvidia_smi_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "CUDA 13.3"):
+            self.check_banner("CUDA UMD Version: 13.3", returncode=1)
+
+    def test_malformed_cuda_versions_are_rejected(self) -> None:
+        for banner in (
+            "CUDA Version: 13.3.4",
+            "CUDA UMD Version: 13.3.",
+            "CUDA Version:",
+            "CUDA UMD Version: 13",
+            "CUDA Version: 13.x",
+            "CUDA UMD Version: 13.3beta",
+        ):
+            with self.subTest(banner=banner):
+                with self.assertRaisesRegex(RuntimeError, "CUDA 13.3"):
+                    self.check_banner(banner)
+
+
 class BootstrapTests(FixtureTest):
     def setUp(self) -> None:
         super().setUp()
