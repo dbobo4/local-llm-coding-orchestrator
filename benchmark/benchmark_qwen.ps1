@@ -8569,6 +8569,97 @@ function Get-ContextLifecycleTurnUsage {
         Source = $Source; Status = $Status; PromptTokens = $PromptTokens; CompletionTokens = $CompletionTokens
         CumulativePromptTokens = $Cumulative.PromptTokens; CumulativeCompletionTokens = $Cumulative.CompletionTokens
         UsageFileCount = $Audit.UsageFileCount
+        RequestFileCount = $Audit.RequestLikeFileCount
+    }
+}
+
+function Get-ContextLifecycleCliProof {
+    param([AllowEmptyString()][string]$Text, [string]$SessionId, [string]$Model,
+        [int]$RequestFiles, [int]$ApiResponseDelta, [string]$ExpectedAck = '')
+    function Test-ScalarField {
+        param($Object, [string]$Name, [type]$Kind)
+        if ($null -eq $Object) { return $false }
+        $Property = $Object.PSObject.Properties[$Name]
+        return ($null -ne $Property -and $Kind.IsInstanceOfType($Property.Value))
+    }
+    $Results = @(); $AssistantText = ''; $Malformed = $false; $ToolOutput = $false; $TerminalSeen = $false
+    $TypeCounts = [ordered]@{ system=0; user=0; assistant=0; result=0; stream_event=0; control_request=0; control_response=0; UNKNOWN=0 }
+    foreach ($Line in [regex]::Split($Text, '\r?\n')) {
+        if (-not $Line.TrimStart().StartsWith('{')) { continue }
+        try { $Event = $Line | ConvertFrom-Json -ErrorAction Stop }
+        catch {
+            $TypeCounts.UNKNOWN++
+            if ($Line -match '"type"\s*:\s*"(?:result|assistant)"') { $Malformed = $true }
+            continue
+        }
+        $TypeProperty = $Event.PSObject.Properties['type']
+        if ($null -ne $TypeProperty -and -not (Test-ScalarField $Event 'type' ([string]))) { $Malformed = $true; $TypeCounts.UNKNOWN++; continue }
+        $Type = Get-ObjectPropertyValue $Event 'type'
+        $CountType = if ($Type -is [string] -and $TypeCounts.Keys -ccontains $Type) { $Type } else { 'UNKNOWN' }
+        $TypeCounts[$CountType]++
+        if ($Type -ceq 'result') { $Results += $Event; $TerminalSeen = $true; continue }
+        $Message = Get-ObjectPropertyValue $Event 'message'
+        if ($Type -ceq 'assistant' -and (-not (Test-ScalarField $Event 'session_id' ([string])) -or
+            -not (Test-ScalarField $Event 'message' ([pscustomobject])) -or -not (Test-ScalarField $Message 'role' ([string])) -or
+            -not (Test-ScalarField $Message 'model' ([string])) -or -not (Test-ScalarField $Message 'content' ([array])))) { $Malformed = $true; continue }
+        if ($Type -cne 'assistant' -or (Get-ObjectPropertyValue $Event 'session_id') -cne $SessionId -or
+            $null -eq $Event.PSObject.Properties['parent_tool_use_id'] -or $null -ne $Event.parent_tool_use_id -or
+            (Get-ObjectPropertyValue $Message 'role') -cne 'assistant' -or (Get-ObjectPropertyValue $Message 'model') -cne $Model) { continue }
+        if ($TerminalSeen) { $Malformed = $true }
+        $Parts = @()
+        foreach ($Block in @(Get-ObjectPropertyValue $Message 'content')) {
+            if (-not (Test-ScalarField $Block 'type' ([string]))) { $Malformed = $true; continue }
+            if ((Get-ObjectPropertyValue $Block 'type') -ceq 'tool_use') { $ToolOutput = $true }
+            if ((Get-ObjectPropertyValue $Block 'type') -ceq 'text') {
+                if (Test-ScalarField $Block 'text' ([string])) { $Parts += $Block.text } else { $Malformed = $true }
+            }
+        }
+        $AssistantText = ($Parts -join '').Trim()
+    }
+    $Failure = $null; $Status = 'MISSING'; $Subtype = 'UNKNOWN'; $IsErrorToken = 'UNKNOWN'; $NumTurns = 0; $ErrorText = ''
+    if ($Results.Count -eq 1 -and (Test-ScalarField $Results[0] 'is_error' ([bool]))) { $IsErrorToken = if ($Results[0].is_error) { 'TRUE' } else { 'FALSE' } }
+    if ($Malformed) { $Failure = 'CLI_RESULT_MALFORMED'; $Status = 'MALFORMED' }
+    elseif ($Results.Count -eq 0) { $Failure = 'CLI_RESULT_MISSING' }
+    elseif ($Results.Count -ne 1) { $Failure = 'CLI_RESULT_AMBIGUOUS'; $Status = 'AMBIGUOUS' }
+    else {
+        $Result = $Results[0]
+        $RawSubtype = Get-ObjectPropertyValue $Result 'subtype'
+        if ((Test-ScalarField $Result 'subtype' ([string])) -and $RawSubtype -cin @('success','error_during_execution','error_max_turns','error_max_budget_usd')) { $Subtype = $RawSubtype }
+        $IsError = Get-ObjectPropertyValue $Result 'is_error'
+        $NumTurns = Get-ObjectPropertyValue $Result 'num_turns'
+        $ErrorText = [string](Get-ObjectPropertyValue (Get-ObjectPropertyValue $Result 'error') 'message')
+        if (-not (Test-ScalarField $Result 'session_id' ([string])) -or (Get-ObjectPropertyValue $Result 'session_id') -cne $SessionId -or
+            -not (Test-ScalarField $Result 'is_error' ([bool])) -or
+            (-not (Test-ScalarField $Result 'num_turns' ([int])) -and -not (Test-ScalarField $Result 'num_turns' ([long]))) -or $Subtype -eq 'UNKNOWN') {
+            $Failure = 'CLI_RESULT_MALFORMED'; $Status = 'MALFORMED'; $NumTurns = 0
+        }
+        elseif ($IsError -or $Subtype -ne 'success') { $Failure = 'CLI_RESULT_ERROR'; $Status = 'ERROR' }
+        elseif ($NumTurns -le 0) { $Failure = 'CLI_RESULT_NO_MODEL_TURN'; $Status = 'EMPTY' }
+        elseif (-not (Test-ScalarField $Result 'result' ([string]))) { $Failure = 'CLI_RESULT_MALFORMED'; $Status = 'MALFORMED' }
+        elseif ($AssistantText.Length -gt 0 -and -not $Result.result.Trim().Equals($AssistantText, [StringComparison]::Ordinal)) { $Failure = 'CLI_RESULT_MALFORMED'; $Status = 'MALFORMED' }
+        else { $Status = 'SUCCESS' }
+    }
+    # Never expose provider error text; stdout success can still contain an API error.
+    $ErrorCategory = switch -Regex ($ErrorText + "`n" + $AssistantText) {
+        '(?i)context.{0,40}(?:length|window|size|exceed)|(?:too many|maximum).{0,20}tokens' { 'CONTEXT_LIMIT'; break }
+        '(?i)unauthorized|authentication|invalid api key' { 'AUTHENTICATION'; break }
+        '(?i)rate.?limit|too many requests' { 'RATE_LIMIT'; break }
+        default { if ($Status -eq 'ERROR') { 'OTHER' } else { 'NONE' } }
+    }
+    $RequestSource = if ($RequestFiles -gt 0) { 'FRESH_OPENAI_REQUEST_LOG' }
+        elseif ($ApiResponseDelta -gt 0) { 'API_RESPONSE_TELEMETRY_DELTA' } else { 'MISSING' }
+    if ($null -eq $Failure) {
+        if ($ToolOutput) { $Failure = 'CLI_UNEXPECTED_TOOL_OUTPUT' }
+        elseif ([string]::IsNullOrWhiteSpace($AssistantText)) { $Failure = 'CLI_ASSISTANT_TEXT_MISSING' }
+        elseif ($ErrorCategory -ne 'NONE') { $Failure = 'CLI_ASSISTANT_ERROR' }
+        elseif ($RequestSource -eq 'MISSING') { $Failure = 'CLI_NO_NEW_MODEL_REQUEST' }
+        elseif ($ExpectedAck.Length -gt 0 -and -not $AssistantText.Equals($ExpectedAck, [StringComparison]::Ordinal)) { $Failure = 'CLI_ACK_MISMATCH' }
+    }
+    return [pscustomobject]@{
+        FailureReason = $Failure; ResultStatus = $Status; ResultSubtype = $Subtype; NumTurns = $NumTurns
+        ErrorCategory = $ErrorCategory; AssistantText = $AssistantText; RequestSource = $RequestSource
+        IsError = $IsErrorToken; AssistantTextPresent = ($AssistantText.Length -gt 0)
+        EventTypes = ($TypeCounts.GetEnumerator() | ForEach-Object { $_.Key + ':' + $_.Value }) -join ','
     }
 }
 
@@ -8662,6 +8753,10 @@ function Invoke-ContextLifecycleRolloverStress {
     $MaxDiscoveryTurns = 7
     $DiscoveryTurns = 0
     $ExecutedTurns = 0
+    $ProcessedTurns = 0
+    $ProcessedPressureAttempts = 0
+    $PreviousCumulativePrompt = $null
+    $PreviousCumulativeCompletion = $null
     $RetentionCalls = 0
     $NotExercisedReason = $null
     $RequiredPostRolloverTurns = 2
@@ -8859,6 +8954,7 @@ function Invoke-ContextLifecycleRolloverStress {
             Push-Location $TempRoot
 
             try {
+                $ApiResponsesBefore = (Get-RoleAwareTelemetrySummary -Files @(Get-ChangedQwenJsonlFiles -Before $BeforeJsonl)).ApiResponses
                 $OldPreference = $ErrorActionPreference
                 $ErrorActionPreference = "Continue"
 
@@ -8884,10 +8980,17 @@ function Invoke-ContextLifecycleRolloverStress {
             }
 
             $Usage = Get-ContextLifecycleTurnUsage -Text $QwenOutput -Path $TurnOpenAiDir
+            $CumulativeChange = if ($null -eq $Usage.CumulativePromptTokens -and $null -eq $Usage.CumulativeCompletionTokens) { 'MISSING' }
+                elseif ($null -eq $PreviousCumulativePrompt -and $null -eq $PreviousCumulativeCompletion) { 'INITIAL' }
+                elseif ($Usage.CumulativePromptTokens -ne $PreviousCumulativePrompt -or $Usage.CumulativeCompletionTokens -ne $PreviousCumulativeCompletion) { 'CHANGED' } else { 'UNCHANGED' }
+            $PreviousCumulativePrompt = $Usage.CumulativePromptTokens
+            $PreviousCumulativeCompletion = $Usage.CumulativeCompletionTokens
 
             if ($ExitCode -ne 0) {
                 Write-Host ("ROLLOVER_TURN index=$Turn phase=$Phase exit_code=$ExitCode usage_source=$($Usage.Source) usage_status=$($Usage.Status)" +
-                    " prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.PromptTokens) completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CompletionTokens)")
+                    " prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.PromptTokens) completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CompletionTokens)" +
+                    " openai_request_files=$($Usage.RequestFileCount) openai_usage_files=$($Usage.UsageFileCount)" +
+                    " cli_cumulative_prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CumulativePromptTokens) cli_cumulative_completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CumulativeCompletionTokens) cumulative_usage_change=$CumulativeChange")
                 $FailureReason = (
                     "QWEN_EXIT_CODE_" +
                     $ExitCode +
@@ -8895,20 +8998,8 @@ function Invoke-ContextLifecycleRolloverStress {
                     $Turn
                 )
 
-                if ($QwenOutput.Length -gt 0) {
-                    Write-Host "=== QWEN OUTPUT TAIL ==="
-                    $TailLength = [Math]::Min(
-                        3500,
-                        $QwenOutput.Length
-                    )
-                    Write-Host (
-                        $QwenOutput.Substring(
-                            $QwenOutput.Length - $TailLength,
-                            $TailLength
-                        )
-                    )
-                }
-
+                $Cli = Get-ContextLifecycleCliProof -Text $QwenOutput -SessionId $SessionId -Model $ModelAlias -RequestFiles $Usage.RequestFileCount -ApiResponseDelta 0
+                Write-Host "ROLLOVER_CLI_ERROR result_status=$($Cli.ResultStatus) result_subtype=$($Cli.ResultSubtype) is_error=$($Cli.IsError) event_types=$($Cli.EventTypes) assistant_text_present=$($Cli.AssistantTextPresent) error_category=$($Cli.ErrorCategory) request_evidence=$($Cli.RequestSource) api_response_delta=UNKNOWN"
                 break
             }
 
@@ -8954,6 +9045,18 @@ function Invoke-ContextLifecycleRolloverStress {
                 -Files $ChangedJsonl
 
             $FinalTelemetry = $Telemetry
+            $ApiDelta = [Math]::Max(0, $Telemetry.ApiResponses - $ApiResponsesBefore)
+            $ExpectedAck = 'ACK T' + $Turn.ToString('D2') + ' ' + $Packet.Sentinel
+            $Cli = Get-ContextLifecycleCliProof -Text $QwenOutput -SessionId $SessionId -Model $ModelAlias `
+                -RequestFiles $Usage.RequestFileCount -ApiResponseDelta $ApiDelta -ExpectedAck $ExpectedAck
+            Write-Host ("ROLLOVER_CLI_PROOF index=$Turn phase=$Phase result_status=$($Cli.ResultStatus) result_subtype=$($Cli.ResultSubtype) num_turns=$($Cli.NumTurns)" +
+                " is_error=$($Cli.IsError) event_types=$($Cli.EventTypes) assistant_text_present=$($Cli.AssistantTextPresent)" +
+                " request_evidence=$($Cli.RequestSource) api_response_delta=$ApiDelta error_category=$($Cli.ErrorCategory) verified=$($null -eq $Cli.FailureReason)")
+            if ($null -ne $Cli.FailureReason) { $FailureReason = $Cli.FailureReason }
+            else {
+                $ProcessedTurns++
+                if ($UsingPendingPressure) { $ProcessedPressureAttempts++ }
+            }
 
             $Evidence = Get-ContextLifecycleRolloverEvidence `
                 -Text $QwenOutput `
@@ -8967,11 +9070,11 @@ function Invoke-ContextLifecycleRolloverStress {
             if ($Evidence.RequiredObserved -or $Telemetry.ContextRolloverRequiredCount -gt 0) { $RolloverRequired = $true }
             # Historical markers remain in resumed JSONL; only new turn evidence
             # or an increase in cumulative telemetry indicates another rollover.
-            if (-not $RolloverCompleted -and ($TurnEvidence.RequiredCount -gt 1 -or $TurnEvidence.CompletedCount -gt 1 -or
+            if ($null -eq $FailureReason -and -not $RolloverCompleted -and ($TurnEvidence.RequiredCount -gt 1 -or $TurnEvidence.CompletedCount -gt 1 -or
                 $Telemetry.ContextRolloverCompletedCount -gt 1)) {
                 $FailureReason = 'MULTIPLE_ROLLOVERS_ON_FIRST_COMPLETED_TURN'
             }
-            elseif ($RolloverCompleted -and ($TurnEvidence.RequiredObserved -or $TurnEvidence.CompletedObserved -or
+            elseif ($null -eq $FailureReason -and $RolloverCompleted -and ($TurnEvidence.RequiredObserved -or $TurnEvidence.CompletedObserved -or
                 $Telemetry.ContextRolloverRequiredCount -gt $PreviousRequiredCount -or
                 $Telemetry.ContextRolloverCompletedCount -gt $PreviousCompletedCount)) {
                 $FailureReason = 'ROLLOVER_REPEATED_DURING_CONTINUATION'
@@ -9036,6 +9139,9 @@ function Invoke-ContextLifecycleRolloverStress {
                 " cli_cumulative_prompt_tokens=" + (Convert-ContextLifecycleAuditValue $Usage.CumulativePromptTokens) +
                 " cli_cumulative_completion_tokens=" + (Convert-ContextLifecycleAuditValue $Usage.CumulativeCompletionTokens) +
                 " openai_usage_files=" + $Usage.UsageFileCount +
+                " openai_request_files=" + $Usage.RequestFileCount +
+                " cumulative_usage_change=" + $CumulativeChange +
+                " exit_code=" + $ExitCode +
                 " required_marker=" +
                 $Evidence.RequiredObserved +
                 " completed_marker=" +
@@ -9142,6 +9248,7 @@ function Invoke-ContextLifecycleRolloverStress {
             Push-Location $TempRoot
 
             try {
+                $ApiResponsesBefore = (Get-RoleAwareTelemetrySummary -Files @(Get-ChangedQwenJsonlFiles -Before $BeforeJsonl)).ApiResponses
                 $OldPreference = $ErrorActionPreference
                 $ErrorActionPreference = "Continue"
 
@@ -9163,10 +9270,18 @@ function Invoke-ContextLifecycleRolloverStress {
             }
 
             $Usage = Get-ContextLifecycleTurnUsage -Text $RecallOutput -Path $RecallOpenAiDir
+            $CumulativeChange = if ($null -eq $Usage.CumulativePromptTokens -and $null -eq $Usage.CumulativeCompletionTokens) { 'MISSING' }
+                elseif ($null -eq $PreviousCumulativePrompt -and $null -eq $PreviousCumulativeCompletion) { 'INITIAL' }
+                elseif ($Usage.CumulativePromptTokens -ne $PreviousCumulativePrompt -or $Usage.CumulativeCompletionTokens -ne $PreviousCumulativeCompletion) { 'CHANGED' } else { 'UNCHANGED' }
+            $RecallTelemetry = Get-RoleAwareTelemetrySummary -Files @(Get-ChangedQwenJsonlFiles -Before $BeforeJsonl)
+            $ApiDelta = [Math]::Max(0, $RecallTelemetry.ApiResponses - $ApiResponsesBefore)
+            $Cli = Get-ContextLifecycleCliProof -Text $RecallOutput -SessionId $SessionId -Model $ModelAlias `
+                -RequestFiles $Usage.RequestFileCount -ApiResponseDelta $ApiDelta
             Write-Host ("ROLLOVER_RETENTION phase=RETENTION exit_code=$RecallExit usage_source=$($Usage.Source) usage_status=$($Usage.Status)" +
                 " prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.PromptTokens) completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CompletionTokens)" +
                 " cli_cumulative_prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CumulativePromptTokens) cli_cumulative_completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CumulativeCompletionTokens)" +
-                " openai_usage_files=$($Usage.UsageFileCount)")
+                " openai_usage_files=$($Usage.UsageFileCount) openai_request_files=$($Usage.RequestFileCount) cumulative_usage_change=$CumulativeChange")
+            Write-Host "ROLLOVER_CLI_PROOF phase=RETENTION result_status=$($Cli.ResultStatus) result_subtype=$($Cli.ResultSubtype) is_error=$($Cli.IsError) event_types=$($Cli.EventTypes) assistant_text_present=$($Cli.AssistantTextPresent) request_evidence=$($Cli.RequestSource) api_response_delta=$ApiDelta error_category=$($Cli.ErrorCategory) verified=$($null -eq $Cli.FailureReason)"
             if ($RecallExit -ne 0) {
                 $FailureReason = (
                     "RETENTION_RECALL_EXIT_CODE_" +
@@ -9174,17 +9289,18 @@ function Invoke-ContextLifecycleRolloverStress {
                 )
             }
             else {
+                if ($null -ne $Cli.FailureReason) { $FailureReason = $Cli.FailureReason }
                 $Missing = @(
                     $Sentinels.ToArray() |
                     Where-Object {
-                        $RecallOutput.IndexOf(
+                        $Cli.AssistantText.IndexOf(
                             [string]$_,
                             [System.StringComparison]::Ordinal
                         ) -lt 0
                     }
                 )
 
-                if ($Missing.Count -gt 0) {
+                if ($null -eq $FailureReason -and $Missing.Count -gt 0) {
                     Write-Host (
                         "MISSING_SENTINELS=" +
                         ($Missing -join ",")
@@ -9285,6 +9401,8 @@ function Invoke-ContextLifecycleRolloverStress {
     )
     Write-Host "ROLLOVER_REQUIRED_OBSERVED=$RolloverRequired"
     Write-Host "EXECUTED_STRESS_TURNS=$ExecutedTurns"
+    Write-Host "PROCESSED_STRESS_TURNS=$ProcessedTurns"
+    Write-Host "PROCESSED_PRESSURE_ATTEMPTS=$ProcessedPressureAttempts"
     Write-Host "EXECUTED_RETENTION_CALLS=$RetentionCalls"
     Write-Host "DISCOVERY_TURNS=$DiscoveryTurns"
     Write-Host "STRESS_TURN_LIMIT=$MaxTurns"

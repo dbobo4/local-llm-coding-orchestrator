@@ -1,9 +1,14 @@
-"""Finite rollover scheduling and evidence checks; no native/model execution."""
+"""Finite rollover scheduling and evidence checks; no inference/model execution."""
 
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+from pathlib import Path
 import shutil
+import subprocess
+import zipfile
 
 import test_local_installation as fixtures
 
@@ -21,7 +26,8 @@ class RolloverStressTests(fixtures.FixtureTest):
         values = dict(compaction=5, rollover=8, required=True, completed=True,
                       failed_turn=0, retention=True, usage='logs', safety='',
                       repeat_turn=0, recall_rollover=False, recall_safety='', safety_turn=0,
-                      same_turn_repeat=False, historical=False)
+                      same_turn_repeat=False, historical=False, silent_turn=0,
+                      reply='valid', reply_turn=0, silent_retention=False, retention_reply='valid')
         values.update(scenario)
         trace = self.base / 'stress trace.json'
         benchmark = self.clone / 'benchmark' / 'benchmark_qwen.ps1'
@@ -30,7 +36,7 @@ Set-StrictMode -Version 2.0
 . {fixtures.ps_quote(self.clone / 'scripts' / 'local_environment.ps1')}
 $SettingsPath=Join-Path $QwenUserRoot 'settings.json'
 $scenario=ConvertFrom-Json {fixtures.ps_quote(json.dumps(values))}
-$script:turn=0; $script:recalls=0; $script:stops=0; $script:cleanups=0
+$script:turn=0; $script:recalls=0; $script:stops=0; $script:cleanups=0; $script:apiResponses=0
 $script:trace=New-Object 'Collections.Generic.List[object]'
 $script:sentinels=New-Object 'Collections.Generic.List[string]'
 $script:stateFile=Join-Path $env:TEMP ('fake-rollover-'+[Guid]::NewGuid().ToString('N')+'.jsonl')
@@ -43,7 +49,8 @@ $ast=[Management.Automation.Language.Parser]::ParseFile({fixtures.ps_quote(bench
 $names=@('Get-ContextLifecycleDigest','New-ContextLifecyclePacket','New-ContextLifecyclePendingPressurePacket',
  'New-ContextLifecycleRecallPrompt','Get-ContextLifecycleRolloverMechanismContext',
  'Get-ContextLifecycleRolloverEvidence','Get-ContextLifecycleCumulativeMetrics','Get-ContextLifecycleOpenAiAudit','Get-ContextLifecycleTurnUsage',
- 'Get-ContextLifecycleOpenAiCompactionEvents','Convert-ContextLifecycleAuditValue','Invoke-ContextLifecycleRolloverStress')
+ 'Get-ContextLifecycleOpenAiCompactionEvents','Convert-ContextLifecycleAuditValue','Get-ObjectPropertyValue',
+ 'Get-ContextLifecycleCliProof','Invoke-ContextLifecycleRolloverStress')
 foreach ($f in $ast.FindAll({{param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $names}},$true)) {{ Invoke-Expression $f.Extent.Text }}
 function Assert-BenchmarkIdle {{ }}
 function Test-PortListener {{ return $false }}
@@ -64,6 +71,7 @@ function Start-Sleep {{ param($Milliseconds) }}
 function Get-RoleAwareTelemetrySummary {{ param($Files)
  $safetyActive=($scenario.safety_turn -eq 0 -or $script:turn -ge $scenario.safety_turn)
  return [pscustomobject]@{{
+  ApiResponses=$script:apiResponses
   ContextRolloverRequiredCount=([int]($scenario.required -and $scenario.rollover -gt 0 -and $script:turn -ge $scenario.rollover)+[int]($scenario.repeat_turn -gt 0 -and $script:turn -ge $scenario.repeat_turn)+[int]($scenario.recall_rollover -and $script:recalls -gt 0))
   ContextRolloverCompletedCount=([int]($scenario.completed -and $scenario.rollover -gt 0 -and $script:turn -ge $scenario.rollover)+[int]($scenario.repeat_turn -gt 0 -and $script:turn -ge $scenario.repeat_turn)+[int]($scenario.recall_rollover -and $script:recalls -gt 0))
   MaxTokensCount=[int](($scenario.safety -eq 'max_tokens' -and $safetyActive) -or ($scenario.recall_safety -eq 'max_tokens' -and $script:recalls -gt 0))
@@ -71,30 +79,67 @@ function Get-RoleAwareTelemetrySummary {{ param($Files)
   ToolCalls=[int](($scenario.safety -eq 'tools' -and $safetyActive) -or ($scenario.recall_safety -eq 'tools' -and $script:recalls -gt 0))
  }}
 }}
+function Write-FixtureReply {{ param($text,$mode,$session,$prompt)
+ $assistant=@{{type='assistant';session_id=$session;parent_tool_use_id=$null;message=@{{role='assistant';model=$ModelAlias;content=@(@{{type='text';text=$text}})}}}}
+ $result=@{{type='result';session_id=$session;subtype='success';is_error=$false;num_turns=1;result=$text}}
+ if ($scenario.usage -ne 'none') {{ $result.usage=@{{input_tokens=99000;output_tokens=700}} }}
+ switch ($mode) {{
+  'empty' {{ $assistant.message.content[0].text=''; $result.result='' }}
+  'wrong_ack' {{ $assistant.message.content[0].text='ACK WRONG'; $result.result='ACK WRONG' }}
+  'stream_error' {{ $assistant.message.content[0].text='maximum context length exceeded'; $result.result='maximum context length exceeded' }}
+  'error' {{ $result.subtype='error_during_execution'; $result.is_error=$true; $result.error=@{{message='maximum context length exceeded'}} }}
+  'malformed' {{ $result.is_error='false' }}
+  'zero_turns' {{ $result.num_turns=0 }}
+  'result_mismatch' {{ $result.result='old transcript' }}
+  'assistant_session_array' {{ $assistant.session_id=@($session) }}
+  'assistant_role_array' {{ $assistant.message.role=@('assistant') }}
+  'assistant_model_array' {{ $assistant.message.model=@($ModelAlias) }}
+  'result_session_array' {{ $result.session_id=@($session) }}
+  'result_type_array' {{ $result.type=@('result') }}
+  'result_error_array' {{ $result.is_error=@($false) }}
+  'result_num_array' {{ $result.num_turns=@(1) }}
+  'result_text_array' {{ $result.result=@($text) }}
+  'wrong_session' {{ $assistant.session_id='other-session' }}
+  'subagent' {{ $assistant.parent_tool_use_id='agent-tool' }}
+ }}
+ if ($mode -eq 'assistant_after_result') {{ $result | ConvertTo-Json -Depth 6 -Compress; $assistant | ConvertTo-Json -Depth 6 -Compress; return }}
+ if ($mode -eq 'user_echo') {{ @{{type='user';session_id=$session;message=@{{role='user';content=@(@{{type='text';text=$prompt}})}}}} | ConvertTo-Json -Depth 6 -Compress }}
+ else {{ $assistant | ConvertTo-Json -Depth 6 -Compress }}
+ if ($mode -eq 'broken_json') {{ '{{"type":"result"' }}
+ elseif ($mode -ne 'missing_result') {{ $result | ConvertTo-Json -Depth 6 -Compress }}
+ if ($mode -eq 'multiple_results') {{ $result | ConvertTo-Json -Depth 6 -Compress }}
+}}
 function Invoke-FixtureQwen {{
  $prompt=$input -join "`n"
  $logDir=[string]$args[([Array]::IndexOf($args,'--openai-logging-dir')+1)]
  if ($args[([Array]::IndexOf($args,'--max-tool-calls')+1)] -ne '0') {{ throw 'Tools were allowed' }}
+ $sessionFlag=if ($args -contains '--session-id') {{ '--session-id' }} else {{ '--resume' }}
+ $session=[string]$args[([Array]::IndexOf($args,$sessionFlag)+1)]
  if ($logDir.EndsWith('openai-rollover-recall')) {{
   $script:recalls++; $global:LASTEXITCODE=0
-  if ($scenario.retention) {{ $script:sentinels.ToArray() -join "`n" }} else {{ 'missing retention' }}
+  if (-not $scenario.silent_retention) {{ $script:apiResponses++; [IO.File]::WriteAllText((Join-Path $logDir 'request.json'),'{{"messages":[]}}') }}
+  $reply=if ($scenario.retention) {{ $script:sentinels.ToArray() -join "`n" }} else {{ 'missing retention' }}
+  Write-FixtureReply $reply $scenario.retention_reply $session $prompt
   if ($scenario.recall_rollover) {{ '[LOCALAI_CONTEXT_ROLLOVER_V4] same-session fresh-chat rollover completed; passes=8; history_entries=7' }}
   return
  }}
  $script:turn++
+ $requestMade=$script:turn -ne $scenario.silent_turn
+ if ($requestMade) {{ $script:apiResponses++ }}
  $sentinel=[regex]::Match($prompt,'KEEP_T\d+=INV-[A-F0-9]+').Value
  if ([string]::IsNullOrEmpty($sentinel)) {{ throw 'Actual packet was not supplied' }}
  [void]$script:sentinels.Add($sentinel)
  $pressure=$prompt.Contains('OPAQUE_PENDING_PAYLOAD_BEGIN')
  [void]$script:trace.Add([pscustomobject]@{{turn=$script:turn; pressure=$pressure; chars=$prompt.Length; logDir=$logDir}})
- if ($script:turn -eq $scenario.compaction) {{
+ if ($requestMade -and $script:turn -eq $scenario.compaction) {{
   [IO.File]::WriteAllText((Join-Path $logDir 'compaction.json'),'{{"messages":[{{"content":"Produce the compact <state_snapshot> XML directly"}}],"usage":{{"prompt_tokens":21000,"completion_tokens":500}}}}')
  }}
- if ($scenario.usage -eq 'logs') {{
+ if ($requestMade -and $scenario.usage -eq 'logs') {{
   [IO.File]::WriteAllText((Join-Path $logDir 'normal.json'),'{{"messages":[],"usage":{{"prompt_tokens":12345,"completion_tokens":17}}}}')
  }}
- if ($scenario.usage -eq 'partial') {{ [IO.File]::WriteAllText((Join-Path $logDir 'normal.json'),'{{"usage":{{"prompt_tokens":12345}}}}') }}
- if ($scenario.usage -ne 'none') {{ '{{"usage":{{"prompt_tokens":99000,"completion_tokens":700}}}}' }}
+ if ($requestMade -and $scenario.usage -eq 'partial') {{ [IO.File]::WriteAllText((Join-Path $logDir 'normal.json'),'{{"usage":{{"prompt_tokens":12345}}}}') }}
+ $mode=if ($scenario.reply_turn -eq 0 -or $scenario.reply_turn -eq $script:turn) {{ $scenario.reply }} else {{ 'valid' }}
+ Write-FixtureReply ('ACK T'+$script:turn.ToString('D2')+' '+$sentinel) $mode $session $prompt
  if ($script:turn -eq $scenario.rollover -or $script:turn -eq $scenario.repeat_turn) {{
   if ($scenario.historical) {{ [IO.File]::WriteAllText($script:stateFile,"LOCALAI_CONTEXT_ROLLOVER_REQUIRED: reason=max_compaction_passes; prompt_id=fixture; before=24000; after=23000; safe_target=22000; passes=8`n[LOCALAI_CONTEXT_ROLLOVER_V4] same-session fresh-chat rollover completed; passes=8; history_entries=7") }}
   if ($scenario.required) {{ 'LOCALAI_CONTEXT_ROLLOVER_REQUIRED: reason=max_compaction_passes; prompt_id=fixture; before=24000; after=23000; safe_target=22000; passes=8' }}
@@ -170,6 +215,9 @@ Restore-LocalEnvironment
                 self.assertIn('CONTEXT_LIFECYCLE_ROLLOVER_STRESS=FAIL reason=' + reason, output)
                 self.assertNotIn('CONTEXT_LIFECYCLE_ROLLOVER_STRESS=PASS', output)
                 self.assertIsNotNone(data['failure'])
+                if 'failed_turn' in scenario:
+                    self.assertIn('request_evidence=FRESH_OPENAI_REQUEST_LOG api_response_delta=UNKNOWN', output)
+                    self.assertNotIn('QWEN OUTPUT TAIL', output)
 
     def test_usage_diagnostics_distinguish_logged_cumulative_and_missing_tokens(self):
         for usage, source in (('logs', 'OPENAI_LOG_MAX_PER_REQUEST'),
@@ -194,6 +242,9 @@ Restore-LocalEnvironment
                 self.assertIn('ROLLOVER_REQUIRED_TOKEN_SOURCE=RUNTIME_EFFECTIVE_CONTEXT_ESTIMATE', output)
                 self.assertIn('EXECUTED_RETENTION_CALLS=1', output)
                 self.assertIn('ROLLOVER_RETENTION phase=RETENTION', output)
+                retention = next(line for line in output.splitlines() if line.startswith('ROLLOVER_RETENTION '))
+                self.assertIn('openai_request_files=1', retention)
+                self.assertIn('cumulative_usage_change=' + ('MISSING' if usage == 'none' else 'UNCHANGED'), retention)
                 self.assertEqual(len(data['turns']), 4)
 
     def test_existing_telemetry_safety_guards_stop_immediately(self):
@@ -231,3 +282,70 @@ Restore-LocalEnvironment
                 self.assertEqual(data['recalls'], 0)
                 self.assertIn('POST_ROLLOVER_TURNS=0', output)
                 self.assertIn('CONTEXT_LIFECYCLE_ROLLOVER_STRESS=FAIL', output)
+
+    def test_zero_api_exit_zero_and_unchanged_cumulative_are_not_processed(self):
+        output, data = self.run_stress(compaction=3, rollover=0, silent_turn=5)
+        self.assertIn('CONTEXT_LIFECYCLE_ROLLOVER_STRESS=FAIL reason=CLI_NO_NEW_MODEL_REQUEST', output)
+        self.assertIn('PENDING_PRESSURE_ATTEMPTS=2', output)
+        self.assertIn('PROCESSED_PRESSURE_ATTEMPTS=1', output)
+        self.assertEqual(len(data['turns']), 5)
+        self.assertEqual(data['recalls'], 0)
+        failed = next(line for line in output.splitlines() if line.startswith('ROLLOVER_TURN index=5 '))
+        self.assertIn('openai_usage_files=0', failed)
+        self.assertIn('cumulative_usage_change=UNCHANGED', failed)
+        self.assertIn('exit_code=0', failed)
+        self.assertIn('cli_cumulative_prompt_tokens=99000', failed)
+
+    def test_terminal_result_and_current_root_assistant_are_required(self):
+        for reply, reason in (('missing_result', 'CLI_RESULT_MISSING'), ('malformed', 'CLI_RESULT_MALFORMED'),
+                              ('broken_json', 'CLI_RESULT_MALFORMED'), ('error', 'CLI_RESULT_ERROR'),
+                              ('zero_turns', 'CLI_RESULT_NO_MODEL_TURN'), ('multiple_results', 'CLI_RESULT_AMBIGUOUS'),
+                              ('assistant_after_result', 'CLI_RESULT_MALFORMED'), ('result_mismatch', 'CLI_RESULT_MALFORMED'),
+                              *[(name, 'CLI_RESULT_MALFORMED') for name in ('assistant_session_array', 'assistant_role_array',
+                                'assistant_model_array', 'result_session_array', 'result_type_array', 'result_error_array',
+                                'result_num_array', 'result_text_array')],
+                              ('empty', 'CLI_ASSISTANT_TEXT_MISSING'), ('wrong_ack', 'CLI_ACK_MISMATCH'),
+                              ('stream_error', 'CLI_ASSISTANT_ERROR'), ('user_echo', 'CLI_ASSISTANT_TEXT_MISSING'),
+                              ('wrong_session', 'CLI_ASSISTANT_TEXT_MISSING'), ('subagent', 'CLI_ASSISTANT_TEXT_MISSING')):
+            with self.subTest(reply=reply):
+                output, data = self.run_stress(reply=reply, reply_turn=1)
+                self.assertIn('CONTEXT_LIFECYCLE_ROLLOVER_STRESS=FAIL reason=' + reason, output)
+                self.assertEqual(len(data['turns']), 1)
+                self.assertEqual(data['recalls'], 0)
+
+    def test_silent_continuation_and_retention_cannot_pass(self):
+        for scenario in ({'silent_turn': 9}, {'silent_retention': True}, {'retention_reply': 'user_echo'}):
+            with self.subTest(scenario=scenario):
+                output, data = self.run_stress(**scenario)
+                self.assertIn('CONTEXT_LIFECYCLE_ROLLOVER_STRESS=FAIL reason=CLI_', output)
+                self.assertNotIn('CONTEXT_LIFECYCLE_ROLLOVER_STRESS=PASS', output)
+
+    def test_pinned_public_stdin_reader_accepts_complete_pressure_packet(self):
+        archive = os.environ.get('LOCALAI_TEST_QWEN_ARCHIVE')
+        if not archive:
+            self.skipTest('Set LOCALAI_TEST_QWEN_ARCHIVE for the bounded pinned stdin check')
+        digest = hashlib.sha256()
+        with Path(archive).open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        self.assertEqual(digest.hexdigest(), 'd331418c8779e5e709e0f772e0b69a4233c4d2ee2f43edd4a7466debdfc840ff')
+        executable = self.base / 'public node.exe'
+        with zipfile.ZipFile(archive) as bundle:
+            executable.write_bytes(bundle.read('qwen-code/node/node.exe'))
+            source = bundle.read('qwen-code/lib/chunks/llm-NSAVK5V3.js').decode()
+        start = source.index('function takeUtf8Prefix(')
+        end = source.index('\n__name(readStdin, "readStdin");', start)
+        script = self.base / 'pinned stdin.cjs'
+        script.write_text('const __name=(fn)=>fn; const writeStderrLine=(s)=>console.error(s);\n' +
+                          source[start:end] + '\nreadStdin().then(text=>process.stdout.write(text));\n', encoding='utf-8')
+        environment = {**self.env, 'NODE_OPTIONS': '',
+                       'NODE_COMPILE_CACHE': str(self.clone / '.localai' / 'cache' / 'stdin'),
+                       'TEMP': str(self.clone / '.localai' / 'tmp'), 'TMP': str(self.clone / '.localai' / 'tmp'),
+                       'APPDATA': str(self.clone / '.localai' / 'home'), 'LOCALAPPDATA': str(self.clone / '.localai' / 'home')}
+        prompt = ('LOCALAI PENDING PRESSURE\n' + '0123456789ABCDEF' * 2755 + '\nACK T01 KEEP_T01=INV-0123456789ABCDEF').encode()
+        result = subprocess.run([str(executable), str(script)], input=prompt, capture_output=True,
+                                cwd=self.project, env=environment, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout, prompt)
+        self.assertEqual(result.stderr, b'')
+        self.assert_external_unchanged()
