@@ -137,83 +137,179 @@ function Get-ActiveFree {
     return "FREE"
 }
 
-function Get-SingleFlagValue {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $Pattern = (
-        "(?mi)^[ \t]*--" +
-        [regex]::Escape($Name) +
-        "[ \t]+([^ \t`r`n]+)"
-    )
-
-    $Matches = [regex]::Matches(
-        $Text,
-        $Pattern
-    )
-
-    if ($Matches.Count -ne 1) {
-        throw (
-            "FLAG_COUNT_FAIL --" +
-            $Name +
-            " count=" +
-            $Matches.Count
-        )
-    }
-
-    return $Matches[0].Groups[1].Value
+function Test-BenchmarkJoinPathAst {
+    param($Command, [string]$Variable, [string]$Path)
+    return ($Command -is [Management.Automation.Language.CommandAst] -and
+        $Command.GetCommandName() -ceq 'Join-Path' -and $Command.InvocationOperator -eq 'Unknown' -and
+        $Command.Redirections.Count -eq 0 -and $Command.CommandElements.Count -eq 3 -and
+        $Command.CommandElements[1] -is [Management.Automation.Language.VariableExpressionAst] -and $Command.CommandElements[1].VariablePath.UserPath -ceq $Variable -and
+        $Command.CommandElements[2] -is [Management.Automation.Language.StringConstantExpressionAst] -and $Command.CommandElements[2].Value -ceq $Path)
 }
 
-function Get-SwitchOnlyCount {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $Count = 0
-    $Expected = "--" + $Name
-    $Backtick = [string][char]96
-
-    $Lines = [regex]::Split(
-        $Text,
-        "\r?\n"
-    )
-
-    foreach ($Line in $Lines) {
-        $Normalized = $Line.Trim()
-
-        if (
-            $Normalized.EndsWith(
-                $Backtick,
-                [System.StringComparison]::Ordinal
-            )
-        ) {
-            $Normalized = $Normalized.Substring(
-                0,
-                $Normalized.Length - 1
-            ).TrimEnd()
+function Resolve-BenchmarkArgumentAst {
+    param($Node, [hashtable]$Values)
+    switch ($Node.GetType().Name) {
+        'StringConstantExpressionAst' { return $Node.Value }
+        'ConstantExpressionAst' { return [string]$Node.Value }
+        'VariableExpressionAst' {
+            $name = $Node.VariablePath.UserPath
+            if (-not $Values.ContainsKey($name)) { throw "Unsupported server argument variable: $name" }
+            return [string]$Values[$name]
         }
+        'ConvertExpressionAst' {
+            if ($Node.Type.TypeName.FullName -ine 'string') { throw 'Unsupported server argument conversion.' }
+            return Resolve-BenchmarkArgumentAst $Node.Child $Values
+        }
+        'ParenExpressionAst' { return Resolve-BenchmarkArgumentAst $Node.Pipeline $Values }
+        'ArrayExpressionAst' {
+            if ($Node.SubExpression.Statements.Count -ne 1 -or $null -ne $Node.SubExpression.Traps) { throw 'Ambiguous server argument array.' }
+            return Resolve-BenchmarkArgumentAst $Node.SubExpression.Statements[0] $Values
+        }
+        'ArrayLiteralAst' {
+            foreach ($element in $Node.Elements) { Resolve-BenchmarkArgumentAst $element $Values }
+            return
+        }
+        'PipelineAst' {
+            if ($Node.PipelineElements.Count -ne 1) { throw 'Unsupported server argument pipeline.' }
+            $element = $Node.PipelineElements[0]
+            if ($element.Redirections.Count -ne 0) { throw 'Server argument redirection is unsupported.' }
+            if ($element -is [Management.Automation.Language.CommandExpressionAst]) {
+                return Resolve-BenchmarkArgumentAst $element.Expression $Values
+            }
+            if (Test-BenchmarkJoinPathAst $element 'QwenRoot' '.localai\config\qwen_models.ini') {
+                return Join-Path $Values.QwenRoot '.localai\config\qwen_models.ini'
+            }
+            throw 'Unsupported server argument command.'
+        }
+        default { throw "Unsupported server argument syntax: $($Node.GetType().Name)" }
+    }
+}
 
-        if (
-            [string]::Equals(
-                $Normalized,
-                $Expected,
-                [System.StringComparison]::OrdinalIgnoreCase
-            )
-        ) {
-            $Count++
+function Get-BenchmarkServerOptions {
+    param([string]$Text)
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0) { throw 'Server launcher syntax is invalid.' }
+    $builders = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-QwenServerArguments' }, $true))
+    $launchers = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QwenServerStart' }, $true))
+    if ($builders.Count -ne 1 -or $launchers.Count -ne 1) { throw 'Server argument builder/launcher is missing or ambiguous.' }
+    $builder = $builders[0].Body
+    $start = $launchers[0].Body
+    $statements = @($start.EndBlock.Statements)
+    if ($statements.Count -lt 2 -or
+        ($statements[-2].Extent.Text -replace '\s', '') -cne '$ServerArguments=@(Get-QwenServerArguments)' -or
+        ($statements[-1].Extent.Text -replace '\s', '') -cne '&$ServerExe@ServerArguments') {
+        throw 'Server argument builder is not directly linked to the executable invocation.'
+    }
+    $references = @($start.FindAll({ param($n) $n -is [Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath.Split(':')[-1] -eq 'ServerArguments' }, $true))
+    $builderCalls = @($start.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-QwenServerArguments' }, $true))
+    $exeAssignments = @($start.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath.Split(':')[-1] -eq 'ServerExe' }, $true))
+    if ($references.Count -ne 2 -or $builderCalls.Count -ne 1 -or $exeAssignments.Count -ne 1 -or
+        ($exeAssignments[0].Extent.Text -replace '\s', '') -cne '$ServerExe=$LlamaServerExe') {
+        throw 'Server executable/argument bindings are ambiguous or modified.'
+    }
+    $loaders = @($start.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.InvocationOperator -eq 'Dot' }, $true))
+    $loaderCommand = if ($loaders.Count -eq 1 -and $loaders[0].CommandElements.Count -eq 1 -and
+        $loaders[0].CommandElements[0] -is [Management.Automation.Language.ParenExpressionAst] -and $loaders[0].CommandElements[0].Pipeline.PipelineElements.Count -eq 1) { $loaders[0].CommandElements[0].Pipeline.PipelineElements[0] } else { $null }
+    $roots = @($start.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath.Split(':')[-1] -eq 'RepoRoot' }, $true))
+    $rootCommand = if ($roots.Count -eq 1 -and $roots[0].Right -is [Management.Automation.Language.PipelineAst] -and $roots[0].Right.PipelineElements.Count -eq 1) { $roots[0].Right.PipelineElements[0] } else { $null }
+    if (-not (Test-BenchmarkJoinPathAst $loaderCommand 'RepoRoot' 'scripts\local_environment.ps1') -or
+        $roots.Count -ne 1 -or $roots[0].Left.Extent.Text -cne '$RepoRoot' -or $roots[0].Operator -ne 'Equals' -or
+        $rootCommand -isnot [Management.Automation.Language.CommandAst] -or $rootCommand.GetCommandName() -cne 'Split-Path' -or
+        $rootCommand.InvocationOperator -ne 'Unknown' -or $rootCommand.Redirections.Count -ne 0 -or $rootCommand.CommandElements.Count -ne 3 -or
+        $rootCommand.CommandElements[1] -isnot [Management.Automation.Language.VariableExpressionAst] -or $rootCommand.CommandElements[1].VariablePath.UserPath -cne 'PSScriptRoot' -or
+        $rootCommand.CommandElements[2] -isnot [Management.Automation.Language.CommandParameterAst] -or $rootCommand.CommandElements[2].ParameterName -cne 'Parent' -or $null -ne $rootCommand.CommandElements[2].Argument) {
+        throw 'Server launcher configuration is not linked to this clone.'
+    }
+    $values = @{}
+    foreach ($name in @('QwenRoot','ServerHost','ServerPort','ContextWindowSize','SpecDraftPMin',
+        'SpecNgramModNMin','SpecNgramModNMax','SpecNgramModNMatch','CacheTypeK','CacheTypeV')) {
+        $value = Get-Variable -Name $name -ValueOnly -ErrorAction Stop
+        if ($value -is [array]) { throw "Server configuration must be scalar: $name" }
+        $values[$name] = $value
+    }
+    foreach ($assignment in @($start.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] }, $true))) {
+        if ($assignment.Left -is [Management.Automation.Language.VariableExpressionAst] -and $values.ContainsKey($assignment.Left.VariablePath.UserPath.Split(':')[-1])) {
+            throw 'Server launcher overrides configuration before constructing its arguments.'
         }
     }
-
-    return $Count
+    $setters = @($start.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Set-Variable' }, $true))
+    if ($setters.Count -ne 1) { throw 'Server defaults assignment is missing or ambiguous.' }
+    $defaultsLoop = $setters[0].Parent
+    while ($null -ne $defaultsLoop -and $defaultsLoop -isnot [Management.Automation.Language.ForEachStatementAst]) { $defaultsLoop = $defaultsLoop.Parent }
+    $expectedLoop = 'foreach($Entryin$BenchmarkDefaults.GetEnumerator()){if($null-eq(Get-Variable-Name$Entry.Key-ErrorActionSilentlyContinue)){Set-Variable-Name$Entry.Key-Value$Entry.Value}}'
+    if ($null -eq $defaultsLoop -or ($defaultsLoop.Extent.Text -replace '\s', '') -cne $expectedLoop) {
+        throw 'Server defaults must apply only to missing configuration variables.'
+    }
+    # Older configs must receive the same defaults in both callers.
+    $defaults = @($start.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath.Split(':')[-1] -eq 'BenchmarkDefaults' }, $true))
+    if ($defaults.Count -ne 1 -or $defaults[0].Left.Extent.Text -cne '$BenchmarkDefaults' -or $defaults[0].Operator -ne 'Equals' -or
+        $defaults[0].Right -isnot [Management.Automation.Language.CommandExpressionAst] -or $defaults[0].Right.Redirections.Count -ne 0 -or
+        $defaults[0].Right.Expression -isnot [Management.Automation.Language.ConvertExpressionAst] -or $defaults[0].Right.Expression.Type.TypeName.FullName -cne 'ordered' -or
+        $defaults[0].Right.Expression.Child -isnot [Management.Automation.Language.HashtableAst]) {
+        throw 'Unsupported server fallback defaults structure.'
+    }
+    $expectedDefaults = [ordered]@{
+        ContextWindowSize = '40960'; SpecDraftPMin = '0.025'; SpecNgramModNMin = '48'; SpecNgramModNMax = '64'
+        SpecNgramModNMatch = '16'; CacheTypeK = 'q8_0'; CacheTypeV = 'q8_0'
+    }
+    $seenDefaults = @{}
+    foreach ($pair in $defaults[0].Right.Expression.Child.KeyValuePairs) {
+        if ($pair.Item1 -isnot [Management.Automation.Language.StringConstantExpressionAst] -or
+            $expectedDefaults.Keys -cnotcontains $pair.Item1.Value -or $seenDefaults.ContainsKey($pair.Item1.Value)) { throw 'Unknown or duplicate server fallback default.' }
+        $name = $pair.Item1.Value
+        $value = @(Resolve-BenchmarkArgumentAst $pair.Item2 @{})
+        if ($value.Count -ne 1 -or $value[0] -cne $expectedDefaults[$name]) { throw "Server fallback default mismatch: $name" }
+        $seenDefaults[$name] = $true
+    }
+    if ($seenDefaults.Count -ne $expectedDefaults.Count) { throw 'Required server fallback defaults are missing.' }
+    foreach ($command in @($start.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true))) {
+        if ($command.GetCommandName() -in @('Clear-Variable','Remove-Variable','Invoke-Expression')) {
+            throw 'Unsupported dynamic server configuration mutation.'
+        }
+    }
+    $body = @($builder.EndBlock.Statements)
+    if ($null -ne $builder.BeginBlock -or $null -ne $builder.ProcessBlock -or $null -ne $builder.DynamicParamBlock -or
+        ($builder.ParamBlock.Extent.Text -replace '\s', '') -cne 'param([switch]$Legacy)' -or $body.Count -ne 2 -or
+        $body[0] -isnot [Management.Automation.Language.AssignmentStatementAst] -or $body[0].Operator -ne 'Equals' -or $body[0].Left.Extent.Text -cne '$modelArguments' -or
+        $body[0].Right -isnot [Management.Automation.Language.IfStatementAst] -or $body[0].Right.Clauses.Count -ne 1 -or
+        $body[0].Right.Clauses[0].Item1.Extent.Text.Trim() -cne '$Legacy' -or $body[0].Right.ElseClause.Statements.Count -ne 1 -or
+        $body[1] -isnot [Management.Automation.Language.ReturnStatementAst]) {
+        throw 'Unsupported server argument builder structure.'
+    }
+    $expression = $body[1].Pipeline.PipelineElements[0].Expression
+    if ($body[1].Pipeline.PipelineElements.Count -ne 1 -or $expression -isnot [Management.Automation.Language.BinaryExpressionAst] -or
+        $expression.Operator -ne 'Plus' -or $expression.Left.Extent.Text -cne '$modelArguments') {
+        throw 'Unsupported server argument return expression.'
+    }
+    $arguments = @(Resolve-BenchmarkArgumentAst $body[0].Right.ElseClause.Statements[0] $values) +
+        @(Resolve-BenchmarkArgumentAst $expression.Right $values)
+    $expected = [ordered]@{
+        'models-preset' = Join-Path $QwenRoot '.localai\config\qwen_models.ini'; 'models-max' = '1'; 'host' = [string]$ServerHost; 'port' = [string]$ServerPort
+        'ctx-size' = [string]$ContextWindowSize; 'parallel' = '1'; 'n-gpu-layers' = '99'; 'fit' = 'off'
+        'spec-type' = 'draft-mtp,ngram-mod'; 'spec-draft-n-max' = '2'; 'spec-draft-p-min' = [string]$SpecDraftPMin
+        'spec-ngram-mod-n-min' = [string]$SpecNgramModNMin; 'spec-ngram-mod-n-max' = [string]$SpecNgramModNMax
+        'spec-ngram-mod-n-match' = [string]$SpecNgramModNMatch
+        'threads' = '20'; 'threads-batch' = '20'; 'spec-draft-threads' = '20'; 'spec-draft-threads-batch' = '20'
+        'flash-attn' = 'on'; 'cache-type-k' = $CacheTypeK; 'cache-type-v' = $CacheTypeV
+        'batch-size' = '1024'; 'ubatch-size' = '512'; 'jinja' = $null; 'reasoning' = 'on'
+        'reasoning-effort' = 'xhigh'; 'reasoning-budget' = '-1'; 'reasoning-preserve' = $null
+    }
+    $options = [ordered]@{}
+    for ($i = 0; $i -lt $arguments.Count; $i++) {
+        $flag = [string]$arguments[$i]
+        if (-not $flag.StartsWith('--')) { throw "Unexpected server argument: $flag" }
+        $name = $flag.Substring(2)
+        if ($expected.Keys -cnotcontains $name -or $options.Contains($name)) { throw "Unknown or duplicate server option: $flag" }
+        if ($null -eq $expected[$name]) { $options[$name] = 1; continue }
+        if (++$i -ge $arguments.Count) { throw "Missing server option value: $flag" }
+        $value = [string]$arguments[$i]
+        $comparison = if ($name -eq 'models-preset') { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        if (-not $value.Equals([string]$expected[$name], $comparison)) { throw "Configured server option mismatch: $flag" }
+        $options[$name] = $value
+    }
+    if ($options.Count -ne $expected.Count) { throw 'Required server options are missing.' }
+    return $options
 }
 
 function Get-LeaseState {
@@ -13230,8 +13326,8 @@ function Set-SingleBenchmarkFlagValue {
         [string]$Value
     )
 
-    # Match the same prefix/value shape as Get-SingleFlagValue and
-    # replace only the value token. Preserve whitespace, continuation
+    # Replace only the value token after each line's flag prefix.
+    # Preserve whitespace, continuation
     # backticks, and newline formatting.
     $Pattern = (
         "(?mi)^([ \t]*--" +
@@ -14358,6 +14454,15 @@ if ($Failures.Count -gt 0) {
 $StartText = [System.IO.File]::ReadAllText(
     $StartScript
 )
+try {
+    $ServerOptions = Get-BenchmarkServerOptions -Text $StartText
+    Write-Output 'SERVER_ARGUMENT_LINKAGE=PASS'
+}
+catch {
+    Write-Output 'BENCHMARK_PREFLIGHT=FAIL'
+    Write-Output ('ERROR=' + $_.Exception.Message)
+    exit 1
+}
 
 $ParameterNames = @(
     "ctx-size",
@@ -14389,13 +14494,6 @@ $ParameterNames = @(
 )
 
 $TunableMap = [ordered]@{
-    "ctx-size" = "ContextWindowSize"
-    "spec-draft-p-min" = "SpecDraftPMin"
-    "spec-ngram-mod-n-min" = "SpecNgramModNMin"
-    "spec-ngram-mod-n-max" = "SpecNgramModNMax"
-    "spec-ngram-mod-n-match" = "SpecNgramModNMatch"
-    "cache-type-k" = "CacheTypeK"
-    "cache-type-v" = "CacheTypeV"
     "prompt-reasoning-budget" = "PromptReasoningBudgetTokens"
     "algorithm-reasoning-budget" = "AlgorithmReasoningBudgetTokens"
     "test-reasoning-budget" = "TestReasoningBudgetTokens"
@@ -14415,9 +14513,7 @@ foreach ($Name in $ParameterNames) {
             $Value = [string]$Variable.Value
         }
         else {
-            $Value = Get-SingleFlagValue `
-                -Text $StartText `
-                -Name $Name
+            $Value = [string]$ServerOptions[$Name]
         }
 
         $Parameters[$Name] = $Value
@@ -14468,9 +14564,7 @@ $RequiredSwitchOnly = @(
 )
 
 foreach ($Name in $RequiredSwitchOnly) {
-    $Count = Get-SwitchOnlyCount `
-        -Text $StartText `
-        -Name $Name
+    $Count = [int]$ServerOptions[$Name]
 
     Write-Output (
         "--" +

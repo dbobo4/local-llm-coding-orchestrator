@@ -282,6 +282,121 @@ if ($env:USERPROFILE -ne $original -or $env:QWEN_HOME -ne {ps_quote(self.old)}) 
 """)
         self.assert_external_unchanged()
 
+    def test_strict_environment_snapshot_lifecycle_in_script_and_function(self) -> None:
+        self.prepare_config()
+        lifecycle = f"""
+Set-StrictMode -Version 2.0
+if ($null -ne (Get-Variable -Name LocalAiOriginalEnvironment -Scope Script -ErrorAction SilentlyContinue)) {{ throw 'Fixture snapshot already exists' }}
+$names=@('LOCALAI_INSTALL_ROOT','USERPROFILE','HOME','APPDATA','LOCALAPPDATA','TEMP','TMP','TMPDIR',
+ 'QWEN_HOME','QWEN_RUNTIME_DIR','QWEN_CODE_MCP_APPROVALS_PATH','QWEN_CODE_TRUSTED_FOLDERS_PATH',
+ 'QWEN_CODE_SYSTEM_SETTINGS_PATH','QWEN_CODE_SYSTEM_DEFAULTS_PATH','PYTHONDONTWRITEBYTECODE',
+ 'NODE_COMPILE_CACHE','CUDA_CACHE_PATH','NPM_CONFIG_CACHE','LOCALAI_ORIGINAL_USERPROFILE','NODE_OPTIONS')
+$before=@{{}}
+for ($i=0;$i -lt $names.Count;$i++) {{
+ $name=$names[$i]
+ if ($name -notin @('USERPROFILE','LOCALAI_ORIGINAL_USERPROFILE')) {{
+  $value=if ($i % 2) {{ 'fixture-'+$i }} else {{ $null }}
+  [Environment]::SetEnvironmentVariable($name,$value,'Process')
+ }}
+ $before[$name]=[Environment]::GetEnvironmentVariable($name,'Process')
+}}
+. {ps_quote(self.clone / 'scripts' / 'local_environment.ps1')}
+$first=$script:LocalAiOriginalEnvironment
+if ($first.Count -ne $LocalAiEnvironment.Count -or $env:USERPROFILE -ne {ps_quote(self.clone / '.localai' / 'home')}) {{ throw 'First snapshot/scoping failed' }}
+foreach ($name in $LocalAiEnvironment.Keys) {{ if ($first[$name] -cne $before[$name]) {{ throw ('Original value not captured: '+$name) }} }}
+. {ps_quote(self.clone / 'scripts' / 'local_environment.ps1')}
+if (-not [object]::ReferenceEquals($first,$script:LocalAiOriginalEnvironment)) {{ throw 'Repeated load replaced active snapshot' }}
+Restore-LocalEnvironment
+Restore-LocalEnvironment
+foreach ($name in $names) {{ if ([Environment]::GetEnvironmentVariable($name,'Process') -cne $before[$name]) {{ throw ('Value not restored: '+$name) }} }}
+if ($null -ne $script:LocalAiOriginalEnvironment) {{ throw 'Restore did not clear snapshot' }}
+[Environment]::SetEnvironmentVariable('QWEN_HOME','fixture-new-cycle','Process')
+. {ps_quote(self.clone / 'scripts' / 'local_environment.ps1')}
+if ([object]::ReferenceEquals($first,$script:LocalAiOriginalEnvironment) -or $script:LocalAiOriginalEnvironment['QWEN_HOME'] -ne 'fixture-new-cycle') {{ throw 'Fresh cycle reused old snapshot' }}
+Restore-LocalEnvironment
+if ($env:QWEN_HOME -ne 'fixture-new-cycle') {{ throw 'Fresh cycle did not restore its caller' }}
+"""
+        for scope in ("script", "function"):
+            with self.subTest(scope=scope):
+                source = lifecycle if scope == "script" else "function Test-FunctionCaller {\n" + lifecycle + "\n}\nTest-FunctionCaller"
+                self.powershell(source)
+        self.assert_external_unchanged()
+
+    def test_strict_environment_failures_preserve_caller_and_original_error(self) -> None:
+        self.prepare_config()
+        config = self.clone / ".localai" / "config" / "local.ps1"
+        original_config = config.read_text()
+        cases = (("config", "throw 'fixture config failure'", "fixture config failure", ""),
+                 ("path", f"$QwenUserRoot={ps_quote(self.old)}", "Installation paths must remain", ""),
+                 ("workspace", "", "working directory cannot safely", ""),
+                 ("initialize", "", "initialization failed", "-Initialize"),
+                 ("missing", "", "Local installation is missing", ""))
+        for name, config_tail, error, arguments in cases:
+            with self.subTest(failure=name):
+                config.write_text(original_config + "\n" + config_tail, encoding="utf-8")
+                if name == "missing":
+                    config.unlink()
+                self.powershell(f"""
+Set-StrictMode -Version 2.0
+$original=$env:USERPROFILE; $originalQwen=$env:QWEN_HOME
+function python {{
+ if ($args -contains 'check-workspace') {{
+  $global:LASTEXITCODE={1 if name == 'workspace' else 0}
+  {ps_quote(self.user)}
+ }} else {{ $global:LASTEXITCODE=7 }}
+}}
+$failed=$false
+try {{ . {ps_quote(self.clone / 'scripts' / 'local_environment.ps1')} {arguments} }}
+catch {{ if ($_.Exception.Message -notlike '*{error}*') {{ throw }}; $failed=$true }}
+if (-not $failed -or $env:USERPROFILE -ne $original -or $env:QWEN_HOME -ne $originalQwen) {{ throw 'Failure changed caller environment' }}
+if ($null -ne (Get-Command Restore-LocalEnvironment -ErrorAction SilentlyContinue)) {{ Restore-LocalEnvironment; Restore-LocalEnvironment }}
+if ($null -ne $script:LocalAiOriginalEnvironment) {{ throw 'Failed load retained an active snapshot' }}
+""")
+        self.assert_external_unchanged()
+
+    def test_strict_nested_script_owns_snapshot_without_changing_parent(self) -> None:
+        self.prepare_config()
+        child = self.base / "child owner.ps1"
+        child.write_text(f"""
+param($ParentSnapshot)
+Set-StrictMode -Version 2.0
+if ($null -ne (Get-Variable -Name LocalAiOriginalEnvironment -Scope Script -ErrorAction SilentlyContinue)) {{ throw 'Child inherited snapshot ownership' }}
+$original=$env:USERPROFILE
+. {ps_quote(self.clone / 'scripts' / 'local_environment.ps1')}
+if ([object]::ReferenceEquals($ParentSnapshot,$script:LocalAiOriginalEnvironment) -or $script:LocalAiOriginalEnvironment['USERPROFILE'] -ne $original) {{ throw 'Child snapshot does not own current caller values' }}
+Restore-LocalEnvironment
+Restore-LocalEnvironment
+if ($env:USERPROFILE -ne $original) {{ throw 'Child restored parent original profile instead of scoped profile' }}
+""", encoding="utf-8")
+        self.powershell(f"""
+Set-StrictMode -Version 2.0
+$original=$env:USERPROFILE
+. {ps_quote(self.clone / 'scripts' / 'local_environment.ps1')}
+$parentSnapshot=$script:LocalAiOriginalEnvironment
+& {ps_quote(child)} -ParentSnapshot $parentSnapshot
+if (-not [object]::ReferenceEquals($parentSnapshot,$script:LocalAiOriginalEnvironment) -or $env:USERPROFILE -ne {ps_quote(self.clone / '.localai' / 'home')}) {{ throw 'Child changed parent snapshot/environment' }}
+Restore-LocalEnvironment
+if ($env:USERPROFILE -ne $original) {{ throw 'Parent snapshot was lost' }}
+""")
+        self.assert_external_unchanged()
+
+    def test_strict_benchmark_caller_reaches_isolated_missing_file_preflight(self) -> None:
+        self.prepare_config()
+        result = self.powershell(f"""
+$original=$env:USERPROFILE
+function python {{ {ps_quote(self.user)}; $global:LASTEXITCODE=0 }}
+& {ps_quote(self.clone / 'benchmark' / 'benchmark_qwen.ps1')} -PreflightOnly
+if ($env:USERPROFILE -ne $original) {{ throw 'Benchmark caller environment was not restored' }}
+exit $LASTEXITCODE
+""", check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(" PREFLIGHT", result.stdout)
+        self.assertIn("SERVER_EXE=MISSING", result.stdout)
+        self.assertIn("MODEL=MISSING", result.stdout)
+        self.assertIn("BENCHMARK_PREFLIGHT=FAIL", result.stdout)
+        self.assertNotIn("LocalAiOriginalEnvironment", result.stderr)
+        self.assert_external_unchanged()
+
     def test_nested_environment_loader_requires_original_locator(self) -> None:
         self.prepare_config()
         self.env["USERPROFILE"] = str(self.clone / ".localai" / "home")

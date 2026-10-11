@@ -1,5 +1,9 @@
 param([switch]$Initialize)
 
+if ($null -eq (Get-Variable -Name LocalAiOriginalEnvironment -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:LocalAiOriginalEnvironment = $null
+}
+
 $RepoRoot = Split-Path $PSScriptRoot -Parent
 $ConfigPath = Join-Path $RepoRoot ".localai\config\local.ps1"
 
