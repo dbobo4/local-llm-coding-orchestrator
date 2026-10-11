@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import msvcrt
+import os
 import re
+import stat
 import sys
 import time
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from local_paths import assert_local_path
@@ -409,15 +412,70 @@ def _localai_v514_list(
     return result, None
 
 
-def _localai_v514_file_matches(read_path: str, scoped_path: str) -> bool:
-    read_value = read_path.replace("\\", "/").lower().strip()
-    scope_value = scoped_path.replace("\\", "/").lower().strip()
-    if scope_value == "<discover>":
-        return bool(read_value)
-    return (
-        read_value == scope_value
-        or read_value.endswith("/" + scope_value)
-    )
+def _localai_v514_project_path(root: Path, value: str) -> Path:
+    path = Path(value)
+    if path.drive and not path.is_absolute():
+        raise ValueError("Drive-relative paths are ambiguous.")
+    path = Path(os.path.abspath(path if path.is_absolute() else root / path))
+    if not path.is_relative_to(root):
+        raise ValueError("Scope path escapes the project root.")
+    candidate = path
+    while candidate != root.parent:
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ValueError("Redirected scope paths cannot prove recovery coverage.")
+        candidate = candidate.parent
+    return path
+
+
+def _localai_v514_scope_files(
+    files: list[str], project_root: str, *, require_coverage: bool = True,
+) -> list[str]:
+    root = Path(project_root).absolute()
+    resolved: set[str] = set()
+    entries = 0
+    for item in files:
+        if item == '<discover>':
+            continue
+        subtree = item.endswith('/**')
+        value = item[:-3] if subtree else item
+        if not value or '<discover>' in value or any(char in value for char in '*?[]'):
+            raise ValueError("Only concrete files or directory/** subtrees are supported; <discover> must be a whole entry.")
+        path = _localai_v514_project_path(root, value)
+        if not subtree:
+            if path.is_dir():
+                raise ValueError("A directory is not a concrete file.")
+            resolved.add(path.as_posix().lower())
+            continue
+        if not path.is_dir():
+            if not require_coverage and not path.exists():
+                continue
+            raise ValueError("The declared subtree does not exist.")
+        pending = [path]
+        subtree_files = set()
+        while pending:
+            with os.scandir(pending.pop()) as children:
+                for child in children:
+                    entries += 1
+                    if entries > 2048:
+                        raise ValueError("Scope enumeration exceeds the 2048-entry limit.")
+                    child_path = _localai_v514_project_path(root, child.path)
+                    if child.is_dir(follow_symlinks=False):
+                        pending.append(child_path)
+                    elif child.is_file(follow_symlinks=False):
+                        subtree_files.add(child_path.as_posix().lower())
+                    else:
+                        raise ValueError("A subtree entry is not a regular file or directory.")
+        if require_coverage and not subtree_files:
+            raise ValueError("The declared subtree contains no concrete files.")
+        resolved.update(subtree_files)
+        if len(resolved) > 256:
+            raise ValueError("Scope enumeration exceeds the 256-file limit.")
+    return sorted(resolved)
 
 
 def _localai_v5141_authoritative_recovery_hint(
@@ -457,6 +515,7 @@ def _localai_v5141_authoritative_recovery_hint(
 def _localai_v514_prepare_algorithm(
     prompt: str,
     state: WorkflowState,
+    project_root: str,
 ) -> tuple[str | None, str | None]:
     scope, clean, error = _localai_v514_carrier(
         prompt,
@@ -489,6 +548,18 @@ def _localai_v514_prepare_algorithm(
 
     if not files or not objectives:
         return None, "ALGORITHM_SCOPE requires non-empty files and objectives."
+    try:
+        resolved_files = _localai_v514_scope_files(
+            files, project_root, require_coverage=state.growth_recovery_guard_active,
+        )
+        failed_files = _localai_v514_scope_files(state.growth_recovery_failed_files, project_root) if state.growth_recovery_required else []
+        previous_files = _localai_v514_scope_files(state.algorithm_scope_files, project_root) if state.growth_recovery_guard_active else []
+    except (OSError, ValueError) as error:
+        return None, (
+            f"Cannot establish complete file coverage: {error} "
+            "Use concrete project files or <discover>; saved recovery remains guarded."
+            + _localai_v5141_authoritative_recovery_hint(state)
+        )
 
     recovery, clean, error = _localai_v514_carrier(
         clean,
@@ -556,18 +627,14 @@ def _localai_v514_prepare_algorithm(
 
     if state.growth_recovery_required:
         rereads = list(state.growth_recovery_reread_files)
-        explicit_failed = [
-            item
-            for item in state.growth_recovery_failed_files
-            if item != "<discover>"
-        ]
+        explicit_failed = failed_files
 
         if explicit_failed:
             missing = [
                 item
                 for item in explicit_failed
                 if not any(
-                    _localai_v514_file_matches(read, item)
+                    read.replace('\\', '/').lower() == item
                     for read in rereads
                 )
             ]
@@ -576,6 +643,7 @@ def _localai_v514_prepare_algorithm(
                     "GROWTH_LIMIT recovery requires root re-read of every "
                     "explicit failed-scope file. Missing: "
                     + ", ".join(missing)
+                    + ". Obtain valid file contents; skipped binary responses do not satisfy recovery."
                     + _localai_v5141_authoritative_recovery_hint(state)
                 )
         elif not rereads:
@@ -589,16 +657,8 @@ def _localai_v514_prepare_algorithm(
             item.split("::", 1)[0]
             for item in state.growth_recovery_failed_objectives
         }
-        failed_files = {
-            item
-            for item in state.growth_recovery_failed_files
-            if item != "<discover>"
-        }
-        delegate_files = {
-            item
-            for item in files
-            if item != "<discover>"
-        }
+        failed_files = set(failed_files)
+        delegate_files = set(resolved_files)
         child_refinement = any("::" in item for item in objectives)
 
         if (
@@ -611,7 +671,7 @@ def _localai_v514_prepare_algorithm(
                 "Delegate a strictly smaller semantic residual slice."
             )
     elif (
-        files == state.algorithm_scope_files
+        set(resolved_files) == set(previous_files)
         and objectives == state.algorithm_scope_objectives
     ):
         return None, (
@@ -646,6 +706,9 @@ def _localai_v514_track_reread(
     session_id = _get_required_string(payload, "session_id")
     if session_id is None:
         return
+    # Pinned child tool hooks share the root session and may omit agent_id.
+    if _localai_workflow_state.has_registered_agents(session_id):
+        return
     state = get_active_state(session_id)
     if state is None or not state.growth_recovery_required:
         return
@@ -655,9 +718,21 @@ def _localai_v514_track_reread(
     file_path = tool_input.get("file_path")
     if not isinstance(file_path, str):
         return
+    identity = _project_identity(payload)
+    if identity.project_id != state.project_id:
+        return
+    try:
+        path = _localai_v514_project_path(Path(identity.canonical_project_root), file_path)
+        expected = _localai_v514_scope_files(state.growth_recovery_failed_files, identity.canonical_project_root)
+    except (OSError, ValueError):
+        return
+    if '<discover>' not in state.growth_recovery_failed_files and path.as_posix().lower() not in expected:
+        return
+    if payload.get('hook_event_name') == 'PostToolUseFailure' and path.as_posix().lower() not in expected:
+        return
     _localai_workflow_state.record_growth_recovery_reread(
         state,
-        file_path,
+        path.as_posix(),
     )
 
 
@@ -1208,6 +1283,12 @@ def _handle_test_start(
     identity: ProjectIdentity,
     state: WorkflowState,
 ) -> None:
+    if state.growth_recovery_guard_active:
+        _write_json({
+            "continue": False,
+            "stopReason": "GROWTH_LIMIT recovery still has residual ALGORITHM work; TEST must wait for successful final_slice completion.",
+        })
+        return
     _register_subagent(
         payload,
         state,
@@ -1430,7 +1511,13 @@ def _handle_algorithm_stop(
         "continue": True,
     }
 
-    if (
+    if state.growth_recovery_guard_active:
+        response["systemMessage"] = (
+            "Residual GROWTH_LIMIT recovery remains active. Delegate the next smaller ALGORITHM slice; "
+            "TEST must wait for successful final_slice completion."
+            + _localai_v5141_authoritative_recovery_hint(state)
+        )
+    elif (
         state.test_selected
         and not state.final_test_completed
     ):
@@ -1938,6 +2025,15 @@ def _handle_prompt_memory_pre_tool_use(
             }
         )
         return
+    if agent_type == "test_agent":
+        session_id = _get_required_string(payload, "session_id")
+        state = get_active_state(session_id) if session_id else None
+        if state is not None and state.growth_recovery_guard_active:
+            _write_json({"continue": True, "hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": "GROWTH_LIMIT recovery still has residual ALGORITHM work; TEST must wait for successful final_slice completion.",
+            }})
+            return
 
     workflow_marker_pattern = re.compile(
         r"<\s*/?\s*ORCHESTRATION_WORKFLOW\s*>",
@@ -1990,7 +2086,7 @@ def _handle_prompt_memory_pre_tool_use(
             identity,
         )
 
-        if state is None:
+        if state is None or state.project_id != identity.project_id:
             _write_json(
                 {
                     "continue": True,
@@ -1999,7 +2095,7 @@ def _handle_prompt_memory_pre_tool_use(
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
                             "Implementation delegation requires active "
-                            "workflow state; retry the algorithm-agent "
+                            "workflow state for this project; retry the algorithm-agent "
                             "delegation after routing state is available."
                         ),
                     },
@@ -2024,6 +2120,7 @@ def _handle_prompt_memory_pre_tool_use(
         prepared_prompt, scope_error = _localai_v514_prepare_algorithm(
             prompt,
             state,
+            identity.canonical_project_root,
         )
         if scope_error is not None:
             _write_json(
@@ -2248,15 +2345,39 @@ def _localai_v5141_is_valid_read_evidence(
 ) -> bool:
     if str(payload.get("tool_name") or "").strip().lower() != "read_file":
         return False
+    if payload.get('agent_id'):
+        return False
+    tool_input = payload.get('tool_input')
+    file_path = tool_input.get('file_path') if isinstance(tool_input, dict) else None
+    if not isinstance(file_path, str) or not Path(file_path).is_absolute() or any(char in file_path for char in '*?[]'):
+        return False
+    try:
+        identity = _project_identity(payload)
+        path = _localai_v514_project_path(Path(identity.canonical_project_root), file_path)
+        info = path.stat()
+        missing = False
+    except FileNotFoundError:
+        missing = True
+        info = None
+    except (OSError, ValueError):
+        return False
 
     event_name = str(
         payload.get("hook_event_name") or ""
     ).strip()
 
     if event_name == "PostToolUse":
-        return True
+        response = payload.get("tool_response")
+        if isinstance(response, dict):
+            # Pinned read_file reports skipped binary content as ordinary success.
+            display = response.get("returnDisplay")
+            if isinstance(display, str) and display.startswith("Skipped binary file:"):
+                return False
+        return info is not None and stat.S_ISREG(info.st_mode)
 
     if event_name != "PostToolUseFailure":
+        return False
+    if not missing:
         return False
 
     if payload.get("is_interrupt") is True:
@@ -2295,25 +2416,16 @@ def _localai_v5141_is_valid_read_evidence(
             and nested_type.strip().lower() == "file_not_found"
         ):
             return True
-        error_text = json.dumps(
-            error_value,
-            ensure_ascii=False,
-        ).casefold()
+        error_text = str(error_value.get("message") or "").casefold()
     else:
         error_text = str(error_value or "").casefold()
 
-    missing_markers = (
-        "enoent",
-        "no such file or directory",
-        "file_not_found",
-        "file not found",
-        "cannot find the file specified",
-        "cannot find the path specified",
-    )
-    return any(
-        marker in error_text
-        for marker in missing_markers
-    )
+    # Error names in an echoed filename are not evidence of a missing-file error.
+    return re.match(
+        r"^\s*(?:error:\s*)?(?:file not found\s*:|enoent\b|"
+        r"no such file or directory\b|cannot find the (?:file|path) specified\b|file_not_found\s*$)",
+        error_text,
+    ) is not None
 
 
 def _localai_v5141_acquire_reread_lock():
@@ -2374,10 +2486,8 @@ def _localai_v5141_record_read_evidence(
 
     lock_handle = _localai_v5141_acquire_reread_lock()
     try:
-        tracking_payload = dict(payload)
-        tracking_payload["hook_event_name"] = "PreToolUse"
         _localai_v514_track_reread(
-            tracking_payload
+            payload
         )
     finally:
         _localai_v5141_release_reread_lock(

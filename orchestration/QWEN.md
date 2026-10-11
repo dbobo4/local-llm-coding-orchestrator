@@ -179,6 +179,7 @@ Every `algorithm-agent` handoff must include one machine-only semantic scope car
 ```
 
 PROMPT/root chooses the semantic objective IDs. Make them independently meaningful and granular enough that completed work can later be separated from residual work.
+Use concrete project files, `<discover>` as a whole entry, or `directory/**` subtrees. Initial subtrees may be missing or empty so ALGORITHM can create them; existing subtree enumeration is limited to 256 files and 2048 entries and refuses redirects. Other wildcards, bare directories, embedded `<discover>`, and paths outside the project are rejected.
 
 An ALGORITHM `GROWTH_LIMIT` is a recoverable specialist interruption, not a terminal workflow result and not permission to retry the same full task.
 
@@ -186,6 +187,7 @@ After `GROWTH_LIMIT`:
 
 1. Assume partial side effects are possible.
 2. Re-read every explicit file in the failed scope from actual repository state. If the scope used `<discover>`, read enough actual state to identify what may have changed.
+   A missing concrete file counts only after its root `read_file` failure and independently verified absence. A missing or empty wildcard subtree cannot satisfy recovery. Existing saved subtree scopes keep their original objective partition and require complete current subtree coverage, including generated and nontext files, before continuation; files without valid read evidence keep recovery blocked.
 3. Semantically classify the original objective IDs into completed and residual work.
 4. Never resend the same full scope, even with different wording.
 5. The next ALGORITHM handoff must use a smaller `ALGORITHM_SCOPE` plus:

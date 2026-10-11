@@ -660,6 +660,10 @@ def get_agent_root_turn_id(
     return None
 
 
+def has_registered_agents(session_id: str) -> bool:
+    return bool(_load_routing_state(session_id)["agent_root_turns"])
+
+
 def get_agent_state(
     session_id: str,
     agent_id: str,
