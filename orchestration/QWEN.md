@@ -202,6 +202,19 @@ After `GROWTH_LIMIT`:
 
 The new `ALGORITHM_SCOPE.objectives` is only the slice delegated now. It must be a residual ID or a semantic refinement such as `parent_id::child_id`.
 
+`completed` means no remaining ALGORITHM work, including required implementation-side checks. Implemented but unchecked code stays under its original parent in `residual`; the later independent TEST is a separate workflow phase. For original objectives `orders_validation`, `apply_transactional`, and `report_cmd`, if only the transactional smoke check remains, use:
+
+```text
+<ALGORITHM_SCOPE>
+{"files":["stockflow/orders.py","stockflow/cli.py"],"objectives":["apply_transactional::smoke_check"]}
+</ALGORITHM_SCOPE>
+<GROWTH_RECOVERY>
+{"completed":["orders_validation","report_cmd"],"residual":["apply_transactional"],"final_slice":true}
+</GROWTH_RECOVERY>
+```
+
+An active recovery handoff with `residual: []` is denied even if root claims every objective completed. If all code appears done, retain a genuinely unverified original parent and perform a bounded final ALGORITHM check before its normal successful completion clears the guard. Denied carriers do not persist completion claims. Accepted completed IDs remain monotonic; a malformed saved state claiming all parents completed requires review, not reopening IDs or resetting the guard. Completing this interrupted scope does not complete any remaining user-task work or replace independent TEST.
+
 If residual work still contains several independent large objectives, PROMPT/root must split them semantically into multiple sequential foreground ALGORITHM calls. The hook does not invent this split. Do not run TEST between those residual implementation slices.
 
 Set `final_slice: true` only when the current delegation covers all semantic roots still listed in residual. After that ALGORITHM call succeeds, the recovery guard clears and normal TEST/finalization may continue.

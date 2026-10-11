@@ -619,10 +619,15 @@ def _localai_v514_prepare_algorithm(
         item.split("::", 1)[0]
         for item in objectives
     }
-    if not delegate_roots.issubset(residual_set):
+    missing_parents = sorted(delegate_roots - residual_set)
+    if not residual_set or missing_parents:
         return None, (
-            "Delegated recovery objectives must be residual IDs or "
-            "semantic children parent_id::child_id."
+            ("Empty residual cannot close active GROWTH_LIMIT recovery. " if not residual_set else "")
+            + "Delegated parent IDs missing from residual: " + ", ".join(missing_parents) + ". "
+            "Keep genuinely unverified original parents in residual and delegate a bounded "
+            "parent_id::child_id check; set final_slice=true only when it covers all residual parents. "
+            "Implemented but unchecked work is not completed. Already accepted completed IDs cannot be reopened."
+            + _localai_v5141_authoritative_recovery_hint(state)
         )
 
     if state.growth_recovery_required:

@@ -23,7 +23,7 @@ class GrowthRecoveryTests(fixtures.FixtureTest):
             path.write_text('fixture content\n')
         self.reset_state(['stockflow/**', 'tests/**', 'README.md'])
 
-    def reset_state(self, files, recovery=True):
+    def reset_state(self, files, recovery=True, *, objectives=None):
         self.python(f"""
 import project_identity as identity, workflow_state as w
 p=identity.identify_project()
@@ -31,7 +31,7 @@ s=w.create_state('growth-session','growth-turn',p.project_id,overwrite=True)
 w.set_active_root_turn(s.session_id,s.turn_id)
 w.mark_contract_ready(s)
 w.select_implementation_workflow(s,require_test=True)
-w.set_algorithm_scope(s,files={files!r},objectives=['model','tests'])
+w.set_algorithm_scope(s,files={files!r},objectives={objectives or ['model','tests']!r})
 if {recovery!r}: w.mark_growth_recovery_required(s)
 """)
 
@@ -71,6 +71,105 @@ print(json.dumps(asdict(w.get_active_state('growth-session'))))
         for path in self.paths:
             self.read(path)
         self.read('README.md', failure=True)
+
+    def prepare_second_orders_growth(self):
+        self.paths = tuple('stockflow/' + name for name in
+                           ('__init__.py','__main__.py','catalog.py','orders.py','apply.py','report.py','cli.py'))
+        for relative in self.paths:
+            (self.project / relative).write_text('synthetic order-ledger file\n')
+        anchors = ['orders_validation','apply_transactional','report_cmd']
+        self.reset_state(list(self.paths), recovery=False, objectives=anchors)
+        self.hook('SubagentStart', agent_type='algorithm-agent', agent_id='first-growth')
+        self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='first-growth', terminate_reason='GROWTH_LIMIT')
+        for path in self.paths:
+            self.read(path)
+        accepted = self.delegate(list(self.paths), ['apply_transactional::implement'],
+                                 completed=['orders_validation','report_cmd'], residual=['apply_transactional'])
+        self.assertEqual(accepted['permissionDecision'], 'allow', accepted)
+        self.hook('SubagentStart', agent_type='algorithm-agent', agent_id='second-growth')
+        self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='second-growth', terminate_reason='GROWTH_LIMIT')
+        self.assertEqual(self.state()['growth_recovery_generation'], 2)
+        return anchors
+
+    def test_second_growth_keeps_unverified_parent_until_final_smoke_success(self):
+        anchors = self.prepare_second_orders_growth()
+        for path in self.paths[:-1]:
+            self.read(path)
+        plan = dict(completed=['orders_validation','report_cmd'], residual=['apply_transactional'], final_slice=True)
+        partial = self.delegate(['stockflow/apply.py'], ['apply_transactional::smoke_check'], **plan)
+        self.assertEqual(partial['permissionDecision'], 'deny', partial)
+        self.assertIn('stockflow/cli.py', partial['permissionDecisionReason'])
+        self.read(self.paths[-1])
+        before = self.state()
+        bad = self.delegate(['stockflow/apply.py'], ['apply_transactional::smoke_check'],
+                            completed=anchors, residual=[], final_slice=True)
+        self.assertEqual(bad['permissionDecision'], 'deny', bad)
+        self.assertIn('empty residual', bad['permissionDecisionReason'].lower())
+        self.assertIn('apply_transactional', bad['permissionDecisionReason'])
+        self.assertEqual(self.state(), before)
+        accepted = self.delegate(['stockflow/apply.py'], ['apply_transactional::smoke_check'], **plan)
+        self.assertEqual(accepted['permissionDecision'], 'allow', accepted)
+        self.assertTrue(self.state()['growth_recovery_guard_active'])
+        blocked_test = self.hook('PreToolUse', tool_name='agent', tool_input={
+            'subagent_type':'test-agent','run_in_background':False,'prompt':'Verify the final implementation.',
+        })['hookSpecificOutput']
+        self.assertEqual(blocked_test['permissionDecision'], 'deny', blocked_test)
+        self.assertEqual(self.hook('Stop')['decision'], 'block')
+        self.hook('SubagentStart', agent_type='algorithm-agent', agent_id='smoke-child')
+        incomplete = self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='smoke-child',
+                               last_assistant_message='Smoke check finished without a valid receipt.')
+        self.assertEqual(incomplete['decision'], 'block')
+        self.assertTrue(self.state()['growth_recovery_guard_active'])
+        self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='smoke-child',
+                  last_assistant_message='Synthetic implementation smoke check passed.\nMEMORY: NONE')
+        self.assertFalse(self.state()['growth_recovery_guard_active'])
+        self.assertEqual(self.hook('Stop')['decision'], 'block')
+        self.hook('SubagentStart', agent_type='test-agent', agent_id='final-orders-test')
+        self.hook('SubagentStop', agent_type='test-agent', agent_id='final-orders-test',
+                  last_assistant_message='PASS\nMEMORY: NONE')
+        self.assertTrue(self.hook('Stop')['continue'])
+
+    def test_empty_residual_claim_and_another_growth_stop_cannot_close_recovery(self):
+        anchors = self.prepare_second_orders_growth()
+        for path in self.paths:
+            self.read(path)
+        before = self.state()
+        for final in (False, True):
+            denied = self.delegate(['stockflow/apply.py'], ['apply_transactional::smoke_check'],
+                                   completed=anchors, residual=[], final_slice=final)
+            self.assertEqual(denied['permissionDecision'], 'deny', denied)
+            self.assertIn('empty residual', denied['permissionDecisionReason'].lower())
+            self.assertEqual(self.state(), before)
+        test_start = self.hook('SubagentStart', agent_type='test-agent', agent_id='premature-orders-test')
+        self.assertFalse(test_start['continue'])
+        self.assertEqual(self.hook('Stop')['decision'], 'block')
+        accepted = self.delegate(['stockflow/apply.py'], ['apply_transactional::smoke_check'],
+                                 completed=['orders_validation','report_cmd'], residual=['apply_transactional'], final_slice=True)
+        self.assertEqual(accepted['permissionDecision'], 'allow', accepted)
+        self.hook('SubagentStart', agent_type='algorithm-agent', agent_id='interrupted-smoke')
+        self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='interrupted-smoke',
+                  terminate_reason='GROWTH_LIMIT', last_assistant_message='No verified final result.\nMEMORY: NONE')
+        state = self.state()
+        self.assertTrue(state['growth_recovery_guard_active'])
+        self.assertTrue(state['growth_recovery_required'])
+        self.assertFalse(state['growth_recovery_final_slice'])
+        self.assertEqual(state['growth_recovery_completed_objectives'], ['orders_validation','report_cmd'])
+        denied = self.delegate(['stockflow/apply.py'], ['apply_transactional::verify_actual_state'],
+                               completed=anchors, residual=[], final_slice=True)
+        self.assertEqual(denied['permissionDecision'], 'deny', denied)
+        self.assertTrue(self.state()['growth_recovery_guard_active'])
+
+    def test_missing_parent_diagnostic_names_exact_residual_mismatch(self):
+        anchors = ['orders_validation','apply_transactional','report_cmd']
+        self.reset_state(['stockflow/core.py'], objectives=anchors)
+        self.read('stockflow/core.py')
+        before = self.state()
+        denied = self.delegate(['stockflow/core.py'], ['apply_transactional::smoke_check'],
+                               completed=['orders_validation','apply_transactional'], residual=['report_cmd'])
+        self.assertEqual(denied['permissionDecision'], 'deny', denied)
+        self.assertIn('apply_transactional', denied['permissionDecisionReason'])
+        self.assertIn('missing from residual', denied['permissionDecisionReason'])
+        self.assertEqual(self.state(), before)
 
     def test_legacy_wildcards_require_every_current_file_and_concrete_absence(self):
         self.read('stockflow/core.py')
