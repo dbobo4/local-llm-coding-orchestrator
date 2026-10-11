@@ -1,16 +1,17 @@
-# Local machine configuration example. Copy this file to local.ps1 and adjust paths as needed.
+# CONFIG: setup copies this template to .localai/config/local.ps1.
+# Installation paths always follow this clone; inference values below are editable.
 
-$QwenRoot = if ($env:QWEN_ROOT) { $env:QWEN_ROOT } else { "C:\LocalAI\qwen" }
-$QwenCodeRoot = if ($env:QWEN_CODE_ROOT) { $env:QWEN_CODE_ROOT } else { Join-Path $QwenRoot "runtime\qwen-code\standalone\qwen-code" }
-$LlamaCppRoot = if ($env:LLAMA_CPP_ROOT) { $env:LLAMA_CPP_ROOT } else { Join-Path $QwenRoot "runtime\llama.cpp" }
-$ModelPath = if ($env:MODEL_PATH) { $env:MODEL_PATH } else { Join-Path $QwenRoot "models\Qwen3.8-27B\Qwen3.8-27B-UD-Q3_K_XL.gguf" }
-$QwenUserRoot = if ($env:QWEN_USER_ROOT) { $env:QWEN_USER_ROOT } else { Join-Path $HOME ".qwen" }
-$OrchestrationRoot = if ($env:ORCHESTRATION_ROOT) { $env:ORCHESTRATION_ROOT } else { Join-Path $QwenUserRoot "orchestration" }
+$QwenRoot = if ($env:LOCALAI_INSTALL_ROOT) { $env:LOCALAI_INSTALL_ROOT } else { Split-Path $PSScriptRoot -Parent }
+$QwenCodeRoot = Join-Path $QwenRoot "runtime\qwen-code"
+$LlamaCppRoot = Join-Path $QwenRoot "runtime\llama.cpp"
+$ModelPath = Join-Path $QwenRoot "models\Qwen3.8-27B-UD-Q3_K_XL.gguf"
+$QwenUserRoot = Join-Path $QwenRoot ".localai\qwen"
+$OrchestrationRoot = Join-Path $QwenRoot ".localai\orchestration"
 
 $QwenCodeCli = Join-Path $QwenCodeRoot "bin\qwen.cmd"
 $LlamaServerExe = Join-Path $LlamaCppRoot "llama-server.exe"
 
-# qwen_server.ps1 derives config\qwen_models.ini from these model settings; do not maintain the generated INI separately.
+# qwen_server.ps1 derives .localai/config/qwen_models.ini from these settings.
 $ModelAlias = "qwen3.8-27b-local"
 $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
 $TestModelAlias = "qwen3.8-27b-test"

@@ -1,13 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = Split-Path $PSScriptRoot -Parent
-$ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+. (Join-Path $PSScriptRoot "local_environment.ps1") -Initialize
 
-if (-not (Test-Path $ConfigPath -PathType Leaf)) {
-    throw "Missing config file: $ConfigPath"
-}
-
-. $ConfigPath
+try {
 
 if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
     $ChatModelAlias = "qwen3.8-27b-chat"
@@ -19,7 +14,7 @@ if ($null -eq $ChatProxyPort -or [int]$ChatProxyPort -le 0) {
 
 $ServerManager = Join-Path `
     $QwenRoot `
-    "config\qwen_server.ps1"
+    "scripts\qwen_server.ps1"
 
 $Watcher = Join-Path `
     $PSScriptRoot `
@@ -140,6 +135,7 @@ function Test-QwenChatWindowActive {
 }
 
 function Test-QwenChatLeaseActive {
+    Assert-LocalPath $ChatLeasePath
     if (-not (
         Test-Path `
             -LiteralPath $ChatLeasePath `
@@ -190,6 +186,7 @@ function Test-QwenChatLeaseActive {
 
 function Get-QwenChatProxyHealth {
     try {
+        if (-not (Test-LocalChatProxyOwnership -InstancePath $ProxyInstancePath -ProxyScript $ContextProxy -StateRoot $ProxyStateRoot -Port ([int]$ChatProxyPort))) { return $null }
         $response = Invoke-RestMethod `
             -Uri $ProxyHealthUrl `
             -Method Get `
@@ -204,7 +201,9 @@ function Get-QwenChatProxyHealth {
             [int]$response.context_window -eq [int]$ContextWindowSize -and
             [int]$response.soft_threshold -eq 24888
         ) {
-            return $response
+            if (Test-LocalChatProxyOwnership -Response $response -InstancePath $ProxyInstancePath -ProxyScript $ContextProxy -StateRoot $ProxyStateRoot -Port ([int]$ChatProxyPort)) {
+                return $response
+            }
         }
     }
     catch {
@@ -281,11 +280,14 @@ function Start-QwenChatContextProxy {
         )
     }
 
+    Assert-LocalTree $ProxyStateRoot
     New-Item `
         -Path $ProxyStateRoot `
         -ItemType Directory `
         -Force |
     Out-Null
+
+    Assert-LocalTree $ProxyStateRoot
 
     $pythonExe = Get-QwenChatPython
 
@@ -451,24 +453,28 @@ if ($null -eq $BrowserExe) {
     )
 }
 
+Assert-LocalTree $BrowserProfile
 New-Item `
     -Path $BrowserProfile `
     -ItemType Directory `
     -Force |
 Out-Null
 
+Assert-LocalTree $ExportsRoot
 New-Item `
     -Path $ExportsRoot `
     -ItemType Directory `
     -Force |
 Out-Null
 
+Assert-LocalTree $ClientStateRoot
 New-Item `
     -Path $ClientStateRoot `
     -ItemType Directory `
     -Force |
 Out-Null
 
+Assert-LocalTree $ProxyStateRoot
 New-Item `
     -Path $ProxyStateRoot `
     -ItemType Directory `
@@ -510,6 +516,8 @@ try {
             "--disable-default-apps"
             "--disable-background-mode"
         )
+
+        Assert-LocalTree (Join-Path $QwenRoot '.localai')
 
         Start-Process `
             -FilePath $BrowserExe `
@@ -611,3 +619,6 @@ Write-Host "CHAT_CONTEXT_SOFT_THRESHOLD=24888"
 Write-Host "CHAT_CONTEXT_WINDOW=$ContextWindowSize"
 Write-Host "CHAT_LEASE=ACTIVE"
 Write-Host "CHAT_URL=$ChatUrl"
+
+}
+finally { Restore-LocalEnvironment }

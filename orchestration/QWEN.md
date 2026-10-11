@@ -425,7 +425,7 @@ Do not repeat this generic policy inside normal specialist handoffs. Pass only t
 
 Do not create project-local `.qwen` configuration, memory, agent, orchestration, or QWEN files unless the user explicitly asks for project-local configuration.
 
-Global orchestration and persistent memory belong outside repositories.
+Orchestration and persistent memory belong in the harness clone's `.localai/orchestration`, outside working projects. Registry and hook commands use the authoritative Python source in the harness clone's `orchestration` directory.
 
 Do not require Git for project identity or normal operation.
 

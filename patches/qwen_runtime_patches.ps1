@@ -6,23 +6,27 @@ $ErrorActionPreference = "Stop"
 
 $PatchManagerRevision = 2
 $Root = Split-Path $PSScriptRoot -Parent
-$ConfigPath = Join-Path $Root "config\local.ps1"
+$ConfigPath = Join-Path $Root ".localai\config\local.ps1"
 
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Missing local configuration: $ConfigPath"
 }
 
-. $ConfigPath
+try {
+. (Join-Path $Root "scripts\local_environment.ps1")
 
 $RuntimeRoot = $QwenCodeRoot
 $ManagedRelativeFiles = @(
     "lib\chunks\chunk-PZ66FRIC.js",
     "lib\chunks\chunk-ZEYFMJQA.js",
     "lib\chunks\chunk-DJPASAUV.js",
+    "lib\chunks\chunk-MZCJWS5Y.js",
+    "lib\chunks\chunk-XHF7WQ6B.js",
     "lib\bundled\qc-helper\docs\configuration\settings.md"
 )
 
 $RequiredRuntimeMarkers = @(
+    "LOCALAI_ORIGINAL_PROFILE_BOUNDARY_V1",
     "LOCALAI_CONTEXT_ROLLOVER",
     "LOCALAI_SPECIALIST_CONTEXT_ROLLOVER",
     "LOCALAI_TURN_GROWTH_BUDGET_V5",
@@ -46,6 +50,7 @@ function Get-ManagerNodeExecutable {
 function Assert-ManagedRuntimeFiles {
     foreach ($relative in $ManagedRelativeFiles) {
         $path = Join-Path $RuntimeRoot $relative
+        Assert-LocalPath $path
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Managed Qwen runtime file is missing: $path"
         }
@@ -54,6 +59,13 @@ function Assert-ManagedRuntimeFiles {
 
 function Test-QwenRuntimePatchState {
     Assert-ManagedRuntimeFiles
+    $isolation = [IO.File]::ReadAllText((Join-Path $RuntimeRoot "lib\chunks\chunk-MZCJWS5Y.js"))
+    if (-not $isolation.Contains("LOCALAI_INSTALLATION_PATH_ISOLATION_V1")) {
+        throw "Runtime verification failed; installation path isolation is missing."
+    }
+    if (-not ([IO.File]::ReadAllText((Join-Path $RuntimeRoot "lib\chunks\chunk-XHF7WQ6B.js"))).Contains("LOCALAI_ORIGINAL_PROFILE_BOUNDARY_V1")) {
+        throw "Runtime verification failed; original-profile environment boundary is missing."
+    }
     $chunk = Join-Path $RuntimeRoot "lib\chunks\chunk-PZ66FRIC.js"
     $text = [IO.File]::ReadAllText($chunk)
     foreach ($marker in $RequiredRuntimeMarkers) {
@@ -85,16 +97,16 @@ function Invoke-CompatibilityAndCompressionPatch {
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path $PSScriptRoot -Parent
-$ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+$ConfigPath = Join-Path $RepoRoot ".localai\config\local.ps1"
 
 if (-not (Test-Path $ConfigPath -PathType Leaf)) {
     throw "Missing config file: $ConfigPath"
 }
 
-. $ConfigPath
+. (Join-Path $RepoRoot "scripts\local_environment.ps1")
 
 $ChunksRoot = Join-Path $QwenCodeRoot "lib\chunks"
-$BackupRoot = Join-Path $QwenRoot "backups\qwen-code-patches"
+$BackupRoot = Join-Path $QwenRoot ".localai\tmp\qwen-code-patches"
 
 $KnownValidatedPatchedSha256 =
     "8854D92C278AD63603C1E2695A2BE74B198A7D3AB3358074E0FAEAA9CF36AA8D"
@@ -164,6 +176,7 @@ function Write-Utf8File {
 
     $encoding = New-Object System.Text.UTF8Encoding($HasBom)
 
+    Assert-LocalPath $Path
     [System.IO.File]::WriteAllText(
         $Path,
         $Text,
@@ -775,7 +788,7 @@ function Get-CompressionOptimizationState {
     }
 
     $blocks =
-        Get-CompressionPromptBlocks
+        Get-CompressionPromptBlocks -NewLine (Get-NewLine $Text)
 
     $hasStockCap = $Text.Contains($stockCap)
     $hasLegacyCap = $Text.Contains($legacyCap)
@@ -897,7 +910,7 @@ function Apply-CompressionOptimization {
     }
 
     $blocks =
-        Get-CompressionPromptBlocks
+        Get-CompressionPromptBlocks -NewLine (Get-NewLine $Text)
 
     $oldCap = switch ($state) {
         "unpatched" { "var COMPACT_MAX_OUTPUT_TOKENS = 2e4;" }
@@ -1091,6 +1104,8 @@ function Replace-UniqueOrdinalRange {
 }
 
 function Get-CompressionPromptBlocks {
+    param([Parameter(Mandatory = $true)][string]$NewLine)
+
     $stock =
         [System.Text.Encoding]::UTF8.GetString(
             [System.Convert]::FromBase64String(
@@ -1113,9 +1128,9 @@ function Get-CompressionPromptBlocks {
         )
 
     return [PSCustomObject]@{
-        Stock      = $stock
-        Optimized  = $optimized
-        Aggressive = $aggressive
+        Stock      = $stock.Replace("`r`n", "`n").Replace("`n", $NewLine)
+        Optimized  = $optimized.Replace("`r`n", "`n").Replace("`n", $NewLine)
+        Aggressive = $aggressive.Replace("`r`n", "`n").Replace("`n", $NewLine)
     }
 }
 
@@ -1231,10 +1246,13 @@ if (
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $backupDir = Join-Path $BackupRoot $timestamp
 
+Assert-LocalTree $backupDir
 New-Item $backupDir -ItemType Directory -Force | Out-Null
 
 foreach ($path in $runtimeFiles) {
     $backupPath = Join-Path $backupDir ([System.IO.Path]::GetFileName($path))
+    Assert-LocalPath $backupPath
+    Assert-LocalPath $path
     Copy-Item $path $backupPath -Force
 }
 
@@ -1321,6 +1339,7 @@ try {
     }
 
     if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        Assert-LocalTree $backupDir
         Remove-Item `
             -LiteralPath $backupDir `
             -Recurse `
@@ -1339,11 +1358,14 @@ catch {
             Join-Path $backupDir ([System.IO.Path]::GetFileName($path))
 
         if (Test-Path $backupPath -PathType Leaf) {
+            Assert-LocalPath $backupPath
+            Assert-LocalPath $path
             Copy-Item $backupPath $path -Force
         }
     }
 
     if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        Assert-LocalTree $backupDir
         Remove-Item `
             -LiteralPath $backupDir `
             -Recurse `
@@ -1369,9 +1391,9 @@ $QwenRoot = [IO.Path]::GetFullPath($QwenRoot)
 $ErrorActionPreference = "Stop"
 
 
-$QwenCodeRoot = Join-Path $QwenRoot "runtime\qwen-code\standalone\qwen-code"
+$QwenCodeRoot = Join-Path $QwenRoot "runtime\qwen-code"
 $ChunksRoot = Join-Path $QwenCodeRoot "lib\chunks"
-$BackupRoot = Join-Path $QwenRoot "backups\qwen-code-patches"
+$BackupRoot = Join-Path $QwenRoot ".localai\tmp\qwen-code-patches"
 
 $KnownValidatedPatchedSha256 =
     "277EBD4AC87C3BED5C59E1A8077309E5ADE1F2ED633ED21F450C05A0268DE180"
@@ -1438,6 +1460,7 @@ function Write-Utf8File {
 
     $encoding = New-Object System.Text.UTF8Encoding($HasBom)
 
+    Assert-LocalPath $Path
     [System.IO.File]::WriteAllText(
         $Path,
         $Text,
@@ -1988,6 +2011,8 @@ function Replace-UniqueOrdinalRange {
 }
 
 function Get-CompressionPromptBlocks {
+    param([Parameter(Mandatory = $true)][string]$NewLine)
+
     $stock =
         [System.Text.Encoding]::UTF8.GetString(
             [System.Convert]::FromBase64String(
@@ -2010,9 +2035,9 @@ function Get-CompressionPromptBlocks {
         )
 
     return [PSCustomObject]@{
-        Stock      = $stock
-        Optimized  = $optimized
-        Aggressive = $aggressive
+        Stock      = $stock.Replace("`r`n", "`n").Replace("`n", $NewLine)
+        Optimized  = $optimized.Replace("`r`n", "`n").Replace("`n", $NewLine)
+        Aggressive = $aggressive.Replace("`r`n", "`n").Replace("`n", $NewLine)
     }
 }
 function Get-CompressionOptimizationState {
@@ -2083,7 +2108,7 @@ function Get-CompressionOptimizationState {
     }
 
     $blocks =
-        Get-CompressionPromptBlocks
+        Get-CompressionPromptBlocks -NewLine (Get-NewLine $Text)
 
     $hasStockCap = $Text.Contains($stockCap)
     $hasLegacyCap = $Text.Contains($legacyCap)
@@ -2204,7 +2229,7 @@ function Apply-CompressionOptimization {
     }
 
     $blocks =
-        Get-CompressionPromptBlocks
+        Get-CompressionPromptBlocks -NewLine (Get-NewLine $Text)
 
     $oldCap = switch ($state) {
         "unpatched" { "var COMPACT_MAX_OUTPUT_TOKENS = 2e4;" }
@@ -3214,10 +3239,13 @@ if (
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $backupDir = Join-Path $BackupRoot $timestamp
 
+Assert-LocalTree $backupDir
 New-Item $backupDir -ItemType Directory -Force | Out-Null
 
 foreach ($path in $runtimeFiles) {
     $backupPath = Join-Path $backupDir ([System.IO.Path]::GetFileName($path))
+    Assert-LocalPath $path
+    Assert-LocalPath $backupPath
     Copy-Item $path $backupPath -Force
 }
 
@@ -3347,6 +3375,7 @@ try {
     }
 
     if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        Assert-LocalTree $backupDir
         Remove-Item `
             -LiteralPath $backupDir `
             -Recurse `
@@ -3365,11 +3394,14 @@ catch {
             Join-Path $backupDir ([System.IO.Path]::GetFileName($path))
 
         if (Test-Path $backupPath -PathType Leaf) {
+            Assert-LocalPath $backupPath
+            Assert-LocalPath $path
             Copy-Item $backupPath $path -Force
         }
     }
 
     if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        Assert-LocalTree $backupDir
         Remove-Item `
             -LiteralPath $backupDir `
             -Recurse `
@@ -3382,7 +3414,7 @@ catch {
 
 # LOCALAI AUTOMATIC CONTEXT ROLLOVER V4 BEGIN
 $localAiV4Marker = "LOCALAI_CONTEXT_ROLLOVER_V4"
-$localAiV4RuntimeRoot = Join-Path $QwenRoot "runtime\qwen-code\standalone\qwen-code\lib\chunks"
+$localAiV4RuntimeRoot = Join-Path $QwenRoot "runtime\qwen-code\lib\chunks"
 
 function Invoke-LocalAiV4ReplaceOnce {
     param(
@@ -3567,8 +3599,9 @@ if (-not $localAiV4Text.Contains($localAiV4Marker)) {
         -New $localAiV4CloseNew `
         -Label "Automatic rollover turn loop close"
 
-    $localAiV4Tmp = [IO.Path]::GetTempFileName() + ".js"
+    $localAiV4Tmp = New-LocalTempPath -Extension '.js'
     try {
+        Assert-LocalPath $localAiV4Tmp
         [IO.File]::WriteAllText(
             $localAiV4Tmp,
             $localAiV4Text,
@@ -3580,6 +3613,7 @@ if (-not $localAiV4Text.Contains($localAiV4Marker)) {
             throw "Automatic rollover candidate node --check failed"
         }
 
+        Assert-LocalPath $localAiV4Runtime
         [IO.File]::WriteAllText(
             $localAiV4Runtime,
             $localAiV4Text,
@@ -3587,6 +3621,7 @@ if (-not $localAiV4Text.Contains($localAiV4Marker)) {
         )
     }
     finally {
+        Assert-LocalTree $localAiV4Tmp
         Remove-Item -LiteralPath $localAiV4Tmp -Force -ErrorAction SilentlyContinue
     }
 }
@@ -3605,7 +3640,7 @@ Write-Output (
 
 # LOCALAI AUTOMATIC CONTEXT ROLLOVER V4.2 TURN RETHROW BEGIN
 $localAiV42Marker = "LOCALAI_CONTEXT_ROLLOVER_V4_2_TURN_RETHROW"
-$localAiV42RuntimeRoot = Join-Path $QwenRoot "runtime\qwen-code\standalone\qwen-code\lib\chunks"
+$localAiV42RuntimeRoot = Join-Path $QwenRoot "runtime\qwen-code\lib\chunks"
 
 function Invoke-LocalAiV42ReplaceOnce {
     param(
@@ -3677,8 +3712,9 @@ if (-not $localAiV42Text.Contains($localAiV42Marker)) {
         -New $localAiV42New `
         -Label "Automatic rollover V4.2 Turn.run rethrow"
 
-    $localAiV42Tmp = [IO.Path]::GetTempFileName() + ".js"
+    $localAiV42Tmp = New-LocalTempPath -Extension '.js'
     try {
+        Assert-LocalPath $localAiV42Tmp
         [IO.File]::WriteAllText(
             $localAiV42Tmp,
             $localAiV42Text,
@@ -3690,6 +3726,7 @@ if (-not $localAiV42Text.Contains($localAiV42Marker)) {
             throw "Automatic rollover V4.2 candidate node --check failed"
         }
 
+        Assert-LocalPath $localAiV42Runtime
         [IO.File]::WriteAllText(
             $localAiV42Runtime,
             $localAiV42Text,
@@ -3697,6 +3734,7 @@ if (-not $localAiV42Text.Contains($localAiV42Marker)) {
         )
     }
     finally {
+        Assert-LocalTree $localAiV42Tmp
         Remove-Item -LiteralPath $localAiV42Tmp -Force -ErrorAction SilentlyContinue
     }
 }
@@ -3716,7 +3754,7 @@ Write-Output (
 
 # LOCALAI SPECIALIST CONTEXT ROLLOVER V4.3 BEGIN
 $localAiV43Marker = "LOCALAI_SPECIALIST_CONTEXT_ROLLOVER_V4_3"
-$localAiV43RuntimeRoot = Join-Path $QwenRoot "runtime\qwen-code\standalone\qwen-code\lib\chunks"
+$localAiV43RuntimeRoot = Join-Path $QwenRoot "runtime\qwen-code\lib\chunks"
 
 function Invoke-LocalAiV43ReplaceOnce {
     param(
@@ -3953,16 +3991,19 @@ if (-not $localAiV43Text.Contains($localAiV43Marker)) {
 '@
     $localAiV43Text = Invoke-LocalAiV43ReplaceOnce -Text $localAiV43Text -Old (Convert-LocalAiV43Nl $old $localAiV43Nl) -New (Convert-LocalAiV43Nl $new $localAiV43Nl) -Label "V4.3 interactive owner update"
 
-    $localAiV43Tmp = [IO.Path]::GetTempFileName() + ".js"
+    $localAiV43Tmp = New-LocalTempPath -Extension '.js'
     try {
+        Assert-LocalPath $localAiV43Tmp
         [IO.File]::WriteAllText($localAiV43Tmp, $localAiV43Text, [Text.UTF8Encoding]::new($false))
         & node --check $localAiV43Tmp
         if ($LASTEXITCODE -ne 0) {
             throw "Specialist rollover V4.3 candidate node --check failed"
         }
+        Assert-LocalPath $localAiV43Runtime
         [IO.File]::WriteAllText($localAiV43Runtime, $localAiV43Text, [Text.UTF8Encoding]::new($false))
     }
     finally {
+        Assert-LocalTree $localAiV43Tmp
         Remove-Item -LiteralPath $localAiV43Tmp -Force -ErrorAction SilentlyContinue
     }
 }
@@ -3993,7 +4034,7 @@ QWEN_ROOT_VALUE = os.environ.get("LOCALAI_QWEN_ROOT")
 if not QWEN_ROOT_VALUE:
     raise RuntimeError("LOCALAI_QWEN_ROOT is required")
 QWEN_ROOT = Path(QWEN_ROOT_VALUE)
-ROOT = QWEN_ROOT / "runtime" / "qwen-code" / "standalone" / "qwen-code"
+ROOT = QWEN_ROOT / "runtime" / "qwen-code"
 CHUNKS = ROOT / "lib" / "chunks"
 
 PZ = CHUNKS / "chunk-PZ66FRIC.js"
@@ -4692,8 +4733,6 @@ RUNTIME = (
     QWEN_ROOT
     / "runtime"
     / "qwen-code"
-    / "standalone"
-    / "qwen-code"
     / "lib"
     / "chunks"
     / "chunk-PZ66FRIC.js"
@@ -4917,6 +4956,7 @@ if __name__ == "__main__":
 '@
 
 $PatchRegistry = @(
+    [pscustomobject]@{ Id = "installation-isolation"; Revision = 1; Kind = "python" },
     [pscustomobject]@{ Id = "compatibility-and-compression"; Revision = 1; Kind = "powershell" },
     [pscustomobject]@{ Id = "runtime-resilience"; Revision = 1; Kind = "powershell" },
     [pscustomobject]@{ Id = "root-context-growth"; Revision = 1; Kind = "python" },
@@ -4927,16 +4967,22 @@ function Invoke-PatchBlock {
     param([Parameter(Mandatory=$true)]$Patch, [Parameter(Mandatory=$true)][string]$TempRoot)
     Write-Host "PATCH_BLOCK=$($Patch.Id) REVISION=$($Patch.Revision) STATUS=START"
     switch ($Patch.Id) {
+        "installation-isolation" {
+            & python -B (Join-Path $QwenRoot "scripts\install_local.py") protect-environment
+            if ($LASTEXITCODE -ne 0) { throw "installation-isolation failed: exit=$LASTEXITCODE" }
+        }
         "compatibility-and-compression" { Invoke-CompatibilityAndCompressionPatch }
         "runtime-resilience" { Invoke-RuntimeResiliencePatch -QwenRoot $QwenRoot }
         "root-context-growth" {
             $path = Join-Path $TempRoot "root-context-growth.py"
+            Assert-LocalPath $path
             [IO.File]::WriteAllText($path, $RootContextGrowthPython, [Text.UTF8Encoding]::new($false))
             & python $path
             if ($LASTEXITCODE -ne 0) { throw "root-context-growth failed: exit=$LASTEXITCODE" }
         }
         "specialist-growth-termination" {
             $path = Join-Path $TempRoot "specialist-growth-termination.py"
+            Assert-LocalPath $path
             [IO.File]::WriteAllText($path, $SpecialistGrowthTerminationPython, [Text.UTF8Encoding]::new($false))
             & python $path
             if ($LASTEXITCODE -ne 0) { throw "specialist-growth-termination failed: exit=$LASTEXITCODE" }
@@ -4955,16 +5001,20 @@ if ($VerifyOnly) {
 
 Assert-ManagedRuntimeFiles
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
-$TransactionRoot = Join-Path $env:TEMP "localai-qwen-runtime-patch-$Stamp"
+$TransactionRoot = Join-Path $QwenRoot ".localai\tmp\localai-qwen-runtime-patch-$Stamp"
 $BackupRoot = Join-Path $TransactionRoot "rollback"
 $PreviousQwenRoot = $env:LOCALAI_QWEN_ROOT
 
 try {
+    foreach ($localWritePath in @($TransactionRoot, $BackupRoot)) { Assert-LocalTree $localWritePath }
     New-Item -ItemType Directory -Force -Path $TransactionRoot, $BackupRoot | Out-Null
     foreach ($relative in $ManagedRelativeFiles) {
         $source = Join-Path $RuntimeRoot $relative
         $backup = Join-Path $BackupRoot $relative
+        Assert-LocalTree (Split-Path $backup -Parent)
         New-Item -ItemType Directory -Force -Path (Split-Path $backup -Parent) | Out-Null
+        Assert-LocalPath $source
+        Assert-LocalPath $backup
         Copy-Item -LiteralPath $source -Destination $backup -Force
     }
     $env:LOCALAI_QWEN_ROOT = $QwenRoot
@@ -4985,6 +5035,8 @@ catch {
         $backup = Join-Path $BackupRoot $relative
         $target = Join-Path $RuntimeRoot $relative
         if (Test-Path -LiteralPath $backup -PathType Leaf) {
+            Assert-LocalPath $backup
+            Assert-LocalPath $target
             Copy-Item -LiteralPath $backup -Destination $target -Force
         }
     }
@@ -4999,6 +5051,12 @@ finally {
         $env:LOCALAI_QWEN_ROOT = $PreviousQwenRoot
     }
     if (Test-Path -LiteralPath $TransactionRoot) {
+        Assert-LocalTree $TransactionRoot
         Remove-Item -LiteralPath $TransactionRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+}
+finally {
+    if (Get-Command Restore-LocalEnvironment -ErrorAction SilentlyContinue) { Restore-LocalEnvironment }
 }

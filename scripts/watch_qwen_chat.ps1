@@ -1,13 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = Split-Path $PSScriptRoot -Parent
-$ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+. (Join-Path $PSScriptRoot "local_environment.ps1") -Initialize
 
-if (-not (Test-Path $ConfigPath -PathType Leaf)) {
-    throw "Missing config file: $ConfigPath"
-}
-
-. $ConfigPath
+try {
 
 if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
     $ChatModelAlias = "qwen3.8-27b-chat"
@@ -19,11 +14,11 @@ if ($null -eq $ChatProxyPort -or [int]$ChatProxyPort -le 0) {
 
 $ServerManager = Join-Path `
     $QwenRoot `
-    "config\qwen_server.ps1"
+    "scripts\qwen_server.ps1"
 
 $ContextProxy = Join-Path `
     $QwenRoot `
-    "config\qwen_chat_context_proxy.py"
+    "scripts\qwen_chat_context_proxy.py"
 
 foreach ($required in @(
     $ServerManager,
@@ -127,6 +122,7 @@ function Test-QwenChatWindowActive {
 
 function Get-QwenChatProxyHealth {
     try {
+        if (-not (Test-LocalChatProxyOwnership -InstancePath $ProxyInstancePath -ProxyScript $ContextProxy -StateRoot $ProxyStateRoot -Port ([int]$ChatProxyPort))) { return $null }
         $response = Invoke-RestMethod `
             -Uri $ProxyHealthUrl `
             -Method Get `
@@ -139,7 +135,9 @@ function Get-QwenChatProxyHealth {
             [int]$response.backend_port -eq [int]$ServerPort -and
             [string]$response.model -eq [string]$ChatModelAlias
         ) {
-            return $response
+            if (Test-LocalChatProxyOwnership -Response $response -InstancePath $ProxyInstancePath -ProxyScript $ContextProxy -StateRoot $ProxyStateRoot -Port ([int]$ChatProxyPort)) {
+                return $response
+            }
         }
     }
     catch {
@@ -202,6 +200,9 @@ function Stop-QwenChatContextProxy {
     throw "Qwen chat context proxy did not stop cleanly."
 }
 
+Assert-LocalPath $ClientStateRoot
+Assert-LocalPath $ChatLeasePath
+Assert-LocalTree $ClientStateRoot
 New-Item `
     -Path $ClientStateRoot `
     -ItemType Directory `
@@ -211,6 +212,7 @@ Out-Null
 $LeaseStream = $null
 
 try {
+    Assert-LocalPath $ChatLeasePath
     $LeaseStream = [System.IO.FileStream]::new(
         $ChatLeasePath,
         [System.IO.FileMode]::OpenOrCreate,
@@ -312,3 +314,6 @@ if ($null -ne $watcherError) {
 }
 
 exit $serverStopExitCode
+
+}
+finally { Restore-LocalEnvironment }

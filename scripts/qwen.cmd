@@ -1,7 +1,3 @@
 @echo off
-if /I "%~1"=="chat" (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0qwen_chat.ps1"
-    exit /b %ERRORLEVEL%
-)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0qwen.ps1" %*
+call "%~dp0..\qwen.cmd" %*
 exit /b %ERRORLEVEL%

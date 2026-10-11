@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from local_paths import assert_local_path
+
 from project_identity import (
     CROSS_PROJECT_MEMORY_ROOT,
     ProjectIdentity,
@@ -95,6 +97,7 @@ def _ensure_file(
     path: Path,
     initial_content: str,
 ) -> None:
+    assert_local_path(path)
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -111,6 +114,7 @@ def _atomic_write(
     path: Path,
     content: str,
 ) -> None:
+    assert_local_path(path)
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -119,6 +123,7 @@ def _atomic_write(
     temporary_path = path.with_name(
         f".{path.name}.{os.getpid()}.tmp"
     )
+    assert_local_path(temporary_path)
 
     try:
         temporary_path.write_text(
@@ -145,6 +150,7 @@ def _read_bounded(
     *,
     prefer_tail: bool = False,
 ) -> str:
+    assert_local_path(path)
     if not path.exists():
         return ""
 
@@ -190,6 +196,7 @@ def _append_entry(
     *,
     timestamp: bool = True,
 ) -> None:
+    assert_local_path(path)
     normalized = _normalize_text(
         entry
     )
@@ -277,6 +284,7 @@ def get_cross_project_memory_path() -> Path:
 def initialize_memory_structure(
     identity: ProjectIdentity,
 ) -> None:
+    assert_local_path(get_project_memory_root(identity))
     get_project_memory_root(
         identity
     ).mkdir(

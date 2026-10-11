@@ -14,17 +14,10 @@ from project_registry import (
 )
 
 
-QWEN_HOME = Path(
-    os.environ.get(
-        "QWEN_HOME",
-        str(Path.home() / ".qwen"),
-    )
-).expanduser()
-
-ORCHESTRATION_ROOT = (
-    QWEN_HOME
-    / "orchestration"
-)
+# Standalone maintenance uses the same clone-local state as the launchers.
+INSTALL_ROOT = Path(__file__).resolve().parents[1]
+QWEN_HOME = INSTALL_ROOT / ".localai" / "qwen"
+ORCHESTRATION_ROOT = INSTALL_ROOT / ".localai" / "orchestration"
 
 MEMORY_ROOT = (
     ORCHESTRATION_ROOT
@@ -212,6 +205,9 @@ def _find_configured_project_root(
             / "settings.json"
         ),
     }
+    original_profile = os.environ.get("LOCALAI_ORIGINAL_USERPROFILE")
+    if original_profile:
+        global_settings_paths.add(canonicalize_path(Path(original_profile) / ".qwen" / "settings.json"))
 
     candidates = (
         current,
@@ -225,14 +221,10 @@ def _find_configured_project_root(
                 / PROJECT_SETTINGS_RELATIVE_PATH
             )
 
+            if canonicalize_path(settings_path) in global_settings_paths:
+                continue
+
             if settings_path.is_file():
-                if (
-                    canonicalize_path(
-                        settings_path
-                    )
-                    in global_settings_paths
-                ):
-                    continue
 
                 return (
                     _normalize_existing_or_future_path(

@@ -42,13 +42,14 @@ $ErrorActionPreference = "Stop"
 $ScriptVersion = "2.5.0-live-orchestration-endurance"
 
 $RepoRoot = Split-Path $PSScriptRoot -Parent
-$ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+$ConfigPath = Join-Path $RepoRoot ".localai\config\local.ps1"
 
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-    throw "Missing config file: $ConfigPath. Copy config\local.example.ps1 to config\local.ps1 and edit it first."
+    throw "Missing config file: $ConfigPath. Run the clone's root qwen.cmd to initialize .localai\config\local.ps1."
 }
 
-. $ConfigPath
+try {
+. (Join-Path $RepoRoot "scripts\local_environment.ps1")
 
 if ($null -eq (Get-Variable -Name AlgorithmModelAlias -ErrorAction SilentlyContinue)) {
     $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
@@ -65,10 +66,10 @@ elseif ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) {
 }
 
 if ($null -eq (Get-Variable -Name QwenUserRoot -ErrorAction SilentlyContinue)) {
-    $QwenUserRoot = Join-Path $HOME ".qwen"
+    $QwenUserRoot = Join-Path $QwenRoot ".localai\qwen"
 }
 elseif ([string]::IsNullOrWhiteSpace([string]$QwenUserRoot)) {
-    $QwenUserRoot = Join-Path $HOME ".qwen"
+    $QwenUserRoot = Join-Path $QwenRoot ".localai\qwen"
 }
 
 $BenchmarkDefaults = [ordered]@{
@@ -91,10 +92,10 @@ foreach ($Entry in $BenchmarkDefaults.GetEnumerator()) {
     }
 }
 
-$ServerScript = Join-Path $QwenRoot "config\qwen_server.ps1"
+$ServerScript = Join-Path $QwenRoot "scripts\qwen_server.ps1"
 $StartScript = $ServerScript
 $StopScript = $ServerScript
-$ModelsPreset = Join-Path $QwenRoot "config\qwen_models.ini"
+$ModelsPreset = Join-Path $QwenRoot ".localai\config\qwen_models.ini"
 $SettingsPath = Join-Path $QwenUserRoot "settings.json"
 $ServerExe = $LlamaServerExe
 $RuntimeClients = Join-Path $QwenUserRoot "runtime_clients"
@@ -647,6 +648,8 @@ function Invoke-SyntheticSmoke {
     $Metrics = $null
     $WallSeconds = 0.0
 
+    Assert-LocalTree $TempRoot
+
     [void](
         New-Item `
             -ItemType Directory `
@@ -658,6 +661,8 @@ function Invoke-SyntheticSmoke {
         $ArgumentLine = Get-BenchmarkServerArgumentLine `
             -Parameters $Parameters
 
+        Assert-LocalPath $StdoutPath
+        Assert-LocalPath $StderrPath
         $Process = Start-Process `
             -FilePath $ServerExe `
             -ArgumentList $ArgumentLine `
@@ -770,6 +775,7 @@ function Invoke-SyntheticSmoke {
             Test-Path `
                 -LiteralPath $TempRoot
         ) {
+            Assert-LocalTree $TempRoot
             Remove-Item `
                 -LiteralPath $TempRoot `
                 -Recurse `
@@ -937,6 +943,8 @@ function Invoke-SyntheticMeasurement {
     $Process = $null
     $WallSeconds = 0.0
 
+    Assert-LocalTree $TempRoot
+
     [void](
         New-Item `
             -ItemType Directory `
@@ -949,6 +957,8 @@ function Invoke-SyntheticMeasurement {
             $ArgumentLine = Get-BenchmarkServerArgumentLine `
                 -Parameters $Parameters
 
+            Assert-LocalPath $StdoutPath
+            Assert-LocalPath $StderrPath
             $Process = Start-Process `
                 -FilePath $ServerExe `
                 -ArgumentList $ArgumentLine `
@@ -1058,6 +1068,7 @@ function Invoke-SyntheticMeasurement {
             Test-Path `
                 -LiteralPath $TempRoot
         ) {
+            Assert-LocalTree $TempRoot
             Remove-Item `
                 -LiteralPath $TempRoot `
                 -Recurse `
@@ -1454,6 +1465,7 @@ function Write-AgentBenchmarkWorkspace {
         [string]$ReasoningEffort
     )
 
+    Assert-LocalTree $Path
     [void](New-Item -ItemType Directory -Path $Path -Force)
 
     $CacheSource = @"
@@ -1577,10 +1589,13 @@ if __name__ == "__main__":
 "@
 
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    Assert-LocalPath (Join-Path $Path "cache.py")
     [System.IO.File]::WriteAllText((Join-Path $Path "cache.py"), $CacheSource, $Utf8NoBom)
+    Assert-LocalPath (Join-Path $Path "test_cache.py")
     [System.IO.File]::WriteAllText((Join-Path $Path "test_cache.py"), $TestSource, $Utf8NoBom)
 
     $QwenDir = Join-Path $Path ".qwen"
+    Assert-LocalTree $QwenDir
     [void](New-Item -ItemType Directory -Path $QwenDir -Force)
     $Settings = [ordered]@{
         model = [ordered]@{
@@ -1588,6 +1603,7 @@ if __name__ == "__main__":
         }
     }
     $SettingsJson = ConvertTo-Json -InputObject $Settings -Depth 5
+    Assert-LocalPath (Join-Path $QwenDir "settings.json")
     [System.IO.File]::WriteAllText((Join-Path $QwenDir "settings.json"), $SettingsJson, $Utf8NoBom)
 }
 
@@ -1642,6 +1658,8 @@ function Invoke-AgentSmoke {
 
         try {
             $ArgumentLine = Get-BenchmarkServerArgumentLine -Parameters $Parameters -ModelAlias $ModelAlias
+            Assert-LocalPath $StdoutPath
+            Assert-LocalPath $StderrPath
             $Process = Start-Process `
                 -FilePath $ServerExe `
                 -ArgumentList $ArgumentLine `
@@ -1740,6 +1758,7 @@ function Invoke-AgentSmoke {
     }
     finally {
         if (Test-Path -LiteralPath $TempRoot) {
+            Assert-LocalTree $TempRoot
             Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction Stop
         }
     }
@@ -2216,6 +2235,7 @@ function Remove-NewQwenProjectDirectories {
             -ErrorAction SilentlyContinue
     )) {
         if (-not $Before.ContainsKey($Directory.FullName)) {
+            Assert-LocalTree $Directory.FullName
             Remove-Item `
                 -LiteralPath $Directory.FullName `
                 -Recurse `
@@ -2969,22 +2989,26 @@ function Copy-OrchestrationEnduranceArtifacts {
         [string]$ServerStderrPath = ""
     )
 
+    Assert-LocalTree $Directory
     [void](New-Item -ItemType Directory -Path $Directory -Force)
 
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+    Assert-LocalPath (Join-Path $Directory "qwen-output.txt")
     [System.IO.File]::WriteAllText(
         (Join-Path $Directory "qwen-output.txt"),
         $QwenOutput,
         $Utf8NoBom
     )
 
+    Assert-LocalPath (Join-Path $Directory "core-tests.txt")
     [System.IO.File]::WriteAllText(
         (Join-Path $Directory "core-tests.txt"),
         $CoreTestOutput,
         $Utf8NoBom
     )
 
+    Assert-LocalPath (Join-Path $Directory "extended-tests.txt")
     [System.IO.File]::WriteAllText(
         (Join-Path $Directory "extended-tests.txt"),
         $ExtendedTestOutput,
@@ -3002,6 +3026,8 @@ function Copy-OrchestrationEnduranceArtifacts {
             -not [string]::IsNullOrWhiteSpace($Source) -and
             (Test-Path -LiteralPath $Source -PathType Leaf)
         ) {
+            Assert-LocalPath $Source
+            Assert-LocalPath (Join-Path $Directory $Name)
             Copy-Item `
                 -LiteralPath $Source `
                 -Destination (Join-Path $Directory $Name) `
@@ -3011,6 +3037,7 @@ function Copy-OrchestrationEnduranceArtifacts {
     }
 
     $JsonlDirectory = Join-Path $Directory "session-jsonl"
+    Assert-LocalTree $JsonlDirectory
     [void](New-Item -ItemType Directory -Path $JsonlDirectory -Force)
 
     $Index = 0
@@ -3023,6 +3050,8 @@ function Copy-OrchestrationEnduranceArtifacts {
             $File.Name
         )
 
+        Assert-LocalPath $File.FullName
+        Assert-LocalPath (Join-Path $JsonlDirectory $DestinationName)
         Copy-Item `
             -LiteralPath $File.FullName `
             -Destination (Join-Path $JsonlDirectory $DestinationName) `
@@ -3284,6 +3313,7 @@ function Write-RoleAwareAgentBenchmarkWorkspace {
     $LocalSettingsPath = Join-Path $QwenDir "settings.json"
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+    Assert-LocalPath $LocalSettingsPath
     [System.IO.File]::WriteAllText(
         $LocalSettingsPath,
         $SettingsText,
@@ -3301,6 +3331,7 @@ function Write-ReasoningStressBenchmarkWorkspace {
         [System.Collections.IDictionary]$Parameters
     )
 
+    Assert-LocalTree $Path
     [void](New-Item -ItemType Directory -Path $Path -Force)
 
     $ExportSource = @'
@@ -3860,26 +3891,31 @@ if __name__ == "__main__":
 
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+    Assert-LocalPath (Join-Path $Path "export_cookies.py")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "export_cookies.py"),
         $ExportSource,
         $Utf8NoBom
     )
+    Assert-LocalPath (Join-Path $Path "import_cookies.py")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "import_cookies.py"),
         $ImportSource,
         $Utf8NoBom
     )
+    Assert-LocalPath (Join-Path $Path "psutil.py")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "psutil.py"),
         $PsutilStub,
         $Utf8NoBom
     )
+    Assert-LocalPath (Join-Path $Path "requirements.txt")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "requirements.txt"),
         $Requirements,
         $Utf8NoBom
     )
+    Assert-LocalPath (Join-Path $Path "test_cookie_workflow.py")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "test_cookie_workflow.py"),
         $TestSource,
@@ -3887,6 +3923,7 @@ if __name__ == "__main__":
     )
 
     $QwenDir = Join-Path $Path ".qwen"
+    Assert-LocalTree $QwenDir
     [void](New-Item -ItemType Directory -Path $QwenDir -Force)
 
     $SettingsText = [System.IO.File]::ReadAllText($SettingsPath)
@@ -3898,6 +3935,7 @@ if __name__ == "__main__":
         -TestReasoningBudgetTokens ([int]$Parameters["test-reasoning-budget"]) `
         -MaxContextGrowthTokensPerTurn ([int]$Parameters["max-context-growth-tokens-per-turn"])
 
+    Assert-LocalPath (Join-Path $QwenDir "settings.json")
     [System.IO.File]::WriteAllText(
         (Join-Path $QwenDir "settings.json"),
         $SettingsText,
@@ -4248,18 +4286,21 @@ def import_cookies(
 
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+    Assert-LocalPath (Join-Path $Path "export_cookies.py")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "export_cookies.py"),
         $ReferenceExport,
         $Utf8NoBom
     )
 
+    Assert-LocalPath (Join-Path $Path "import_cookies.py")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "import_cookies.py"),
         $ReferenceImport,
         $Utf8NoBom
     )
 
+    Assert-LocalPath (Join-Path $Path "requirements.txt")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "requirements.txt"),
         "psutil`ncryptography`n",
@@ -4349,6 +4390,7 @@ function Invoke-AgenticHarnessSelfTest {
     }
     finally {
         if (Test-Path -LiteralPath $TempRoot) {
+            Assert-LocalTree $TempRoot
             Remove-Item `
                 -LiteralPath $TempRoot `
                 -Recurse `
@@ -4427,6 +4469,8 @@ function Invoke-RoleAwareAgentMeasurement {
         $ArgumentLine = Get-BenchmarkRouterArgumentLine `
             -Parameters $Parameters
 
+        Assert-LocalPath $StdoutPath
+        Assert-LocalPath $StderrPath
         $Process = Start-Process `
             -FilePath $ServerExe `
             -ArgumentList $ArgumentLine `
@@ -4685,6 +4729,7 @@ function Invoke-RoleAwareAgentMeasurement {
         }
         finally {
             if (Test-Path -LiteralPath $TempRoot) {
+                Assert-LocalTree $TempRoot
                 Remove-Item `
                     -LiteralPath $TempRoot `
                     -Recurse `
@@ -4940,6 +4985,7 @@ function Invoke-OrchestrationEnduranceSelfTest {
         ([System.IO.Path]::GetTempPath()) `
         ("qwen-orchestration-endurance-selftest-" + [Guid]::NewGuid().ToString("N"))
 
+    Assert-LocalTree $TempRoot
     [void](New-Item -ItemType Directory -Path $TempRoot -Force)
 
     $JsonlPath = Join-Path $TempRoot "fixture.jsonl"
@@ -4969,18 +5015,21 @@ function Invoke-OrchestrationEnduranceSelfTest {
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
     try {
+        Assert-LocalPath $JsonlPath
         [System.IO.File]::WriteAllText(
             $JsonlPath,
             $Fixture,
             $Utf8NoBom
         )
 
+        Assert-LocalPath $TracePath
         [System.IO.File]::WriteAllText(
             $TracePath,
             $TraceFixture,
             $Utf8NoBom
         )
 
+        Assert-LocalPath $HookPath
         [System.IO.File]::WriteAllText(
             $HookPath,
             "",
@@ -5041,6 +5090,7 @@ function Invoke-OrchestrationEnduranceSelfTest {
     }
     finally {
         if (Test-Path -LiteralPath $TempRoot) {
+            Assert-LocalTree $TempRoot
             Remove-Item `
                 -LiteralPath $TempRoot `
                 -Recurse `
@@ -5085,13 +5135,14 @@ function Invoke-OrchestrationEnduranceStress {
     ).Hash.ToUpperInvariant()
 
     $PersistentRoot = Join-Path `
-        (Join-Path (Join-Path $HOME "Desktop") "LocalAI-tests") `
+        (Join-Path $QwenRoot ".localai\results") `
         "orchestration-endurance"
 
     $RunDirectory = Join-Path `
         $PersistentRoot `
         (Get-Date -Format "yyyyMMdd-HHmmss")
 
+    Assert-LocalTree $RunDirectory
     [void](New-Item -ItemType Directory -Path $RunDirectory -Force)
 
     Write-Host ""
@@ -5346,6 +5397,7 @@ function Invoke-OrchestrationEnduranceStress {
 
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+    Assert-LocalPath $ReportPath
     [System.IO.File]::WriteAllLines(
         $ReportPath,
         $ReportLines,
@@ -5415,7 +5467,7 @@ $script:AgenticCheckpointRunFingerprint = $null
 $script:AgenticCheckpointResumed = $false
 $script:AgenticCheckpointPath = Join-Path `
     $RepoRoot `
-    "benchmark-state\agentic-autotune-checkpoint.json"
+    ".localai\benchmark-state\agentic-autotune-checkpoint.json"
 
 function Reset-AdaptiveStressPlannerState {
     $script:AdaptiveStressCache = @{}
@@ -5773,6 +5825,7 @@ function Save-AgenticAutotuneCheckpoint {
 
     $Directory = Split-Path $script:AgenticCheckpointPath -Parent
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        Assert-LocalTree $Directory
         New-Item -ItemType Directory -Path $Directory -Force | Out-Null
     }
 
@@ -5785,10 +5838,13 @@ function Save-AgenticAutotuneCheckpoint {
     }
 
     $Temp = $script:AgenticCheckpointPath + ".tmp"
+    Assert-LocalPath $Temp
     $Payload |
         ConvertTo-Json -Depth 12 |
         Set-Content -LiteralPath $Temp -Encoding UTF8
 
+    Assert-LocalPath $Temp
+    Assert-LocalPath $script:AgenticCheckpointPath
     Move-Item `
         -LiteralPath $Temp `
         -Destination $script:AgenticCheckpointPath `
@@ -7287,9 +7343,11 @@ function Write-ContextLifecycleBenchmarkWorkspace {
         [System.Collections.IDictionary]$Parameters
     )
 
+    Assert-LocalTree $Path
     [void](New-Item -ItemType Directory -Path $Path -Force)
 
     $QwenDir = Join-Path $Path ".qwen"
+    Assert-LocalTree $QwenDir
     [void](New-Item -ItemType Directory -Path $QwenDir -Force)
 
     $SettingsText = [System.IO.File]::ReadAllText($SettingsPath)
@@ -7304,12 +7362,14 @@ function Write-ContextLifecycleBenchmarkWorkspace {
 
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+    Assert-LocalPath (Join-Path $QwenDir "settings.json")
     [System.IO.File]::WriteAllText(
         (Join-Path $QwenDir "settings.json"),
         $SettingsText,
         $Utf8NoBom
     )
 
+    Assert-LocalPath (Join-Path $Path "BENCHMARK_MARKER.txt")
     [System.IO.File]::WriteAllText(
         (Join-Path $Path "BENCHMARK_MARKER.txt"),
         "LocalAI forced context lifecycle compaction stress.`n",
@@ -7896,6 +7956,8 @@ function Invoke-ContextLifecycleOpenAiAudit {
         $ArgumentLine = Get-BenchmarkRouterArgumentLine `
             -Parameters $Candidate
 
+        Assert-LocalPath $StdoutPath
+        Assert-LocalPath $StderrPath
         $Process = Start-Process `
             -FilePath $ServerExe `
             -ArgumentList $ArgumentLine `
@@ -7919,6 +7981,8 @@ function Invoke-ContextLifecycleOpenAiAudit {
             $TurnOpenAiDir = Join-Path `
                 $TempRoot `
                 ("openai-turn-" + $Turn.ToString("D2"))
+
+            Assert-LocalTree $TurnOpenAiDir
 
             [void](
                 New-Item `
@@ -8068,6 +8132,7 @@ function Invoke-ContextLifecycleOpenAiAudit {
         }
         finally {
             if (Test-Path -LiteralPath $TempRoot) {
+                Assert-LocalTree $TempRoot
                 Remove-Item `
                     -LiteralPath $TempRoot `
                     -Recurse `
@@ -8559,6 +8624,8 @@ function Invoke-ContextLifecycleRolloverStress {
         $ArgumentLine = Get-BenchmarkRouterArgumentLine `
             -Parameters $Candidate
 
+        Assert-LocalPath $StdoutPath
+        Assert-LocalPath $StderrPath
         $Process = Start-Process `
             -FilePath $ServerExe `
             -ArgumentList $ArgumentLine `
@@ -8607,6 +8674,8 @@ function Invoke-ContextLifecycleRolloverStress {
             $TurnOpenAiDir = Join-Path `
                 $TempRoot `
                 ("openai-rollover-turn-" + $Turn.ToString("D2"))
+
+            Assert-LocalTree $TurnOpenAiDir
 
             [void](
                 New-Item `
@@ -8864,6 +8933,8 @@ function Invoke-ContextLifecycleRolloverStress {
 
             $RecallOpenAiDir = Join-Path $TempRoot "openai-rollover-recall"
 
+            Assert-LocalTree $RecallOpenAiDir
+
             [void](
                 New-Item `
                     -ItemType Directory `
@@ -8952,6 +9023,7 @@ function Invoke-ContextLifecycleRolloverStress {
         }
         finally {
             if (Test-Path -LiteralPath $TempRoot) {
+                Assert-LocalTree $TempRoot
                 Remove-Item `
                     -LiteralPath $TempRoot `
                     -Recurse `
@@ -9220,6 +9292,8 @@ function Invoke-ContextLifecycleCompactionStress {
         $ArgumentLine = Get-BenchmarkRouterArgumentLine `
             -Parameters $Candidate
 
+        Assert-LocalPath $StdoutPath
+        Assert-LocalPath $StderrPath
         $Process = Start-Process `
             -FilePath $ServerExe `
             -ArgumentList $ArgumentLine `
@@ -9267,6 +9341,8 @@ function Invoke-ContextLifecycleCompactionStress {
             $TurnOpenAiDir = Join-Path `
                 $TempRoot `
                 ("openai-turn-" + $Turn.ToString("D2"))
+
+            Assert-LocalTree $TurnOpenAiDir
 
             [void](
                 New-Item `
@@ -9603,6 +9679,8 @@ function Invoke-ContextLifecycleCompactionStress {
 
             $RecallOpenAiDir = Join-Path $TempRoot "openai-recall"
 
+            Assert-LocalTree $RecallOpenAiDir
+
             [void](
                 New-Item `
                     -ItemType Directory `
@@ -9691,6 +9769,7 @@ function Invoke-ContextLifecycleCompactionStress {
         }
         finally {
             if (Test-Path -LiteralPath $TempRoot) {
+                Assert-LocalTree $TempRoot
                 Remove-Item `
                     -LiteralPath $TempRoot `
                     -Recurse `
@@ -10143,17 +10222,21 @@ function Invoke-AdaptivePlannerSelfTest {
         ("localai-lifecycle-detector-negative-" + [Guid]::NewGuid().ToString("N"))
 
     try {
+        Assert-LocalTree $DetectorTemp
         [void](New-Item -ItemType Directory -Path $DetectorTemp -Force)
+        Assert-LocalTree $DetectorSingleTemp
         [void](New-Item -ItemType Directory -Path $DetectorSingleTemp -Force)
 
         # Mirrors the observed production log shape:
         # 25563/1476 -> 19189/101 within one no-tools CLI turn.
+        Assert-LocalPath (Join-Path $DetectorTemp "001-compaction.json")
         [System.IO.File]::WriteAllText(
             (Join-Path $DetectorTemp "001-compaction.json"),
             '{"messages":[{"content":"<state_snapshot>durable state</state_snapshot>"}],"usage":{"prompt_tokens":25563,"completion_tokens":1476}}',
             (New-Object System.Text.UTF8Encoding($false))
         )
 
+        Assert-LocalPath (Join-Path $DetectorTemp "002-post.json")
         [System.IO.File]::WriteAllText(
             (Join-Path $DetectorTemp "002-post.json"),
             '{"messages":[{"content":"<state_snapshot>durable state</state_snapshot>"}],"usage":{"prompt_tokens":19189,"completion_tokens":101}}',
@@ -10178,6 +10261,7 @@ function Invoke-AdaptivePlannerSelfTest {
 
         # A normal post-compaction request can contain state_snapshot by
         # itself. That MUST NOT be misclassified as a fresh compaction.
+        Assert-LocalPath (Join-Path $DetectorSingleTemp "001-normal.json")
         [System.IO.File]::WriteAllText(
             (Join-Path $DetectorSingleTemp "001-normal.json"),
             '{"messages":[{"content":"<state_snapshot>durable state</state_snapshot>"}],"usage":{"prompt_tokens":25902,"completion_tokens":88}}',
@@ -10211,6 +10295,7 @@ function Invoke-AdaptivePlannerSelfTest {
     finally {
         foreach ($Path in @($DetectorTemp,$DetectorSingleTemp)) {
             if (Test-Path -LiteralPath $Path) {
+                Assert-LocalTree $Path
                 Remove-Item `
                     -LiteralPath $Path `
                     -Recurse `
@@ -10762,6 +10847,7 @@ function Invoke-ReasoningGrowthSelfTest {
 
     try {
         $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        Assert-LocalPath $TempPath
         [System.IO.File]::WriteAllText(
             $TempPath,
             $CandidateText,
@@ -10778,6 +10864,7 @@ function Invoke-ReasoningGrowthSelfTest {
     }
     finally {
         if (Test-Path -LiteralPath $TempPath) {
+            Assert-LocalTree $TempPath
             Remove-Item -LiteralPath $TempPath -Force
         }
     }
@@ -11082,6 +11169,8 @@ function Invoke-ContextKvMeasurement {
     $ExecutionError = $null
     $RequestSucceeded = $false
 
+    Assert-LocalTree $TempRoot
+
     [void](
         New-Item `
             -ItemType Directory `
@@ -11095,6 +11184,8 @@ function Invoke-ContextKvMeasurement {
                 $ArgumentLine = Get-BenchmarkServerArgumentLine `
                     -Parameters $Config
 
+                Assert-LocalPath $StdoutPath
+                Assert-LocalPath $StderrPath
                 $Process = Start-Process `
                     -FilePath $ServerExe `
                     -ArgumentList $ArgumentLine `
@@ -11248,6 +11339,7 @@ function Invoke-ContextKvMeasurement {
             Test-Path `
                 -LiteralPath $TempRoot
         ) {
+            Assert-LocalTree $TempRoot
             Remove-Item `
                 -LiteralPath $TempRoot `
                 -Recurse `
@@ -13697,7 +13789,9 @@ function Invoke-TransactionalBenchmarkApply {
     $SettingsReplaced = $false
 
     try {
+        Assert-LocalPath $LocalTemp
         [System.IO.File]::WriteAllText($LocalTemp,$LocalText,$LocalEncoding)
+        Assert-LocalPath $SettingsTemp
         [System.IO.File]::WriteAllText($SettingsTemp,$SettingsText,$SettingsEncoding)
 
         Test-PowerShellFileParse -Path $LocalTemp
@@ -13710,9 +13804,11 @@ function Invoke-TransactionalBenchmarkApply {
             -TestReasoningBudgetTokens ([int]$Recommended["test-reasoning-budget"]) `
             -MaxContextGrowthTokensPerTurn ([int]$Recommended["max-context-growth-tokens-per-turn"])
 
+        foreach ($localWritePath in @($LocalTemp, $ConfigPath, $LocalRestore)) { Assert-LocalPath $localWritePath }
         [System.IO.File]::Replace($LocalTemp,$ConfigPath,$LocalRestore)
         $LocalReplaced = $true
 
+        foreach ($localWritePath in @($SettingsTemp, $SettingsPath, $SettingsRestore)) { Assert-LocalPath $localWritePath }
         [System.IO.File]::Replace($SettingsTemp,$SettingsPath,$SettingsRestore)
         $SettingsReplaced = $true
 
@@ -13743,10 +13839,12 @@ function Invoke-TransactionalBenchmarkApply {
     }
     catch {
         if ($SettingsReplaced) {
+            Assert-LocalPath $SettingsPath
             [System.IO.File]::WriteAllBytes($SettingsPath,$OriginalSettingsBytes)
         }
 
         if ($LocalReplaced) {
+            Assert-LocalPath $ConfigPath
             [System.IO.File]::WriteAllBytes($ConfigPath,$OriginalLocalBytes)
         }
 
@@ -13761,6 +13859,7 @@ function Invoke-TransactionalBenchmarkApply {
             $SettingsRestore
         )) {
             if (Test-Path -LiteralPath $Path) {
+                Assert-LocalTree $Path
                 Remove-Item `
                     -LiteralPath $Path `
                     -Force `
@@ -14636,7 +14735,7 @@ Write-Output ("MAX_EXPENSIVE_STRESS_SESSIONS=" + $MaxAdaptiveStressSessions)
 Write-Output "AGENTIC_ONLY_AUTOTUNE=AVAILABLE_SKIP_NGRAM_PMIN_CONTEXT"
 Write-Output "AGENTIC_TARGETED_CONFIRMATION=AVAILABLE_EXPLICIT_CANDIDATE_REPEAT_ONLY"
 Write-Output "ORCHESTRATION_ENDURANCE_STRESS=AVAILABLE_ROLE_ROUTING_RECOVERY_COMPACTION_TERMINAL"
-Write-Output "ORCHESTRATION_ENDURANCE_REPORT_ROOT=$HOME\Desktop\LocalAI-tests\orchestration-endurance"
+Write-Output "ORCHESTRATION_ENDURANCE_REPORT_ROOT=$QwenRoot\.localai\results\orchestration-endurance"
 Write-Output "ORCHESTRATION_ENDURANCE_TEMP_WORKSPACE=SYSTEM_TEMP_CLEANED"
 Write-Output "ORCHESTRATION_ENDURANCE_RECOVERY=VALIDATE_IF_GROWTH_LIMIT_OBSERVED"
 Write-Output "ORCHESTRATION_ENDURANCE_ROLLOVER=DYNAMIC_NOT_REQUIRED_NON_BLOCKING"
@@ -14794,3 +14893,8 @@ else {
 
 Invoke-FullConvergentBenchmark `
     -Parameters $Parameters
+
+}
+finally {
+    if (Get-Command Restore-LocalEnvironment -ErrorAction SilentlyContinue) { Restore-LocalEnvironment }
+}

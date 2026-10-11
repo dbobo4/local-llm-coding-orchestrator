@@ -98,7 +98,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,
@@ -114,7 +114,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,
@@ -130,7 +130,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,
@@ -146,7 +146,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,
@@ -154,7 +154,7 @@
           },
           {
             "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"<QWEN_ROOT>\\config\\qwen_server.ps1\" -Action Stop -IfIdle",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"<CLONE_ROOT>\\scripts\\qwen_server.ps1\" -Action Stop -IfIdle",
             "name": "qwen-server-stop",
             "description": "Stop local llama.cpp server after Qwen session cleanup",
             "timeout": 10000,
@@ -170,7 +170,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,
@@ -186,7 +186,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,
@@ -202,7 +202,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\maintenance_hook.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\maintenance_hook.py\"",
             "name": "qwen-orchestration-maintenance",
             "description": "Trusted global project registry maintenance hook",
             "timeout": 10000,
@@ -216,7 +216,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-prompt-memory-carrier",
             "description": "Persist PROMPT Pxxx memory and strip its carrier before Agent execution",
             "timeout": 10000,
@@ -232,7 +232,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,
@@ -248,7 +248,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"<USERPROFILE>\\.qwen\\orchestration\\hook_dispatcher.py\"",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
             "name": "qwen-orchestration-dispatcher",
             "description": "Qwen Codex-style orchestration lifecycle dispatcher",
             "timeout": 10000,

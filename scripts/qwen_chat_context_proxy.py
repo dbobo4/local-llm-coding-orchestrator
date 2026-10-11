@@ -22,6 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestration"))
+from local_paths import assert_local_path, assert_local_tree
+
 REVISION = 1
 SOFT_THRESHOLD_DEFAULT = 24888
 COMPACT_MAX_OUTPUT_TOKENS = 2048
@@ -178,6 +181,7 @@ class SnapshotStore:
         self._load()
 
     def _load(self) -> None:
+        assert_local_path(self.path)
         with self.lock:
             if not self.path.is_file():
                 self.records = []
@@ -200,6 +204,7 @@ class SnapshotStore:
                 self.records = valid[-CACHE_MAX_RECORDS:]
             except Exception:
                 bad = self.path.with_suffix(".corrupt-" + str(int(time.time())) + ".json")
+                assert_local_path(bad)
                 try:
                     self.path.replace(bad)
                 except Exception:
@@ -207,6 +212,7 @@ class SnapshotStore:
                 self.records = []
 
     def _save(self) -> None:
+        assert_local_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "revision": REVISION,
@@ -214,6 +220,7 @@ class SnapshotStore:
             "records": self.records[-CACHE_MAX_RECORDS:],
         }
         temp = self.path.with_suffix(".tmp")
+        assert_local_path(temp)
         temp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1096,6 +1103,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _record_error(self, exc: Exception) -> None:
         try:
             state_root = Path(self.server.args.state_root)
+            assert_local_path(state_root / "last_error.txt")
             state_root.mkdir(parents=True, exist_ok=True)
             path = state_root / "last_error.txt"
             path.write_text(
@@ -1151,6 +1159,9 @@ def main() -> int:
         raise SystemExit("Proxy listen host must be loopback.")
 
     state_root = Path(args.state_root)
+    assert_local_tree(state_root)
+    assert_local_path(state_root / "instance.json")
+    assert_local_path(state_root / "snapshots.json")
     state_root.mkdir(parents=True, exist_ok=True)
     instance_path = state_root / "instance.json"
     snapshots_path = state_root / "snapshots.json"
@@ -1189,6 +1200,7 @@ def main() -> int:
         "shutdown_token": token,
     }
     temp = instance_path.with_suffix(".tmp")
+    assert_local_path(temp)
     temp.write_text(json.dumps(instance, indent=2), encoding="utf-8")
     os.replace(temp, instance_path)
 
@@ -1205,6 +1217,7 @@ def main() -> int:
     finally:
         server.server_close()
         try:
+            assert_local_path(instance_path)
             if instance_path.is_file():
                 current = json.loads(instance_path.read_text(encoding="utf-8"))
                 if int(current.get("pid", -1)) == os.getpid():

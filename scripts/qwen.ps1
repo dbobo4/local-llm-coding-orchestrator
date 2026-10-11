@@ -18,18 +18,11 @@ if ($LocalAiNodeOptions -notmatch '(^|\s)--use-system-ca(\s|$)') {
     }
 }
 
-$RepoRoot = Split-Path $PSScriptRoot -Parent
-$ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+try {
+. (Join-Path $PSScriptRoot "local_environment.ps1") -Initialize
 
-if (-not (Test-Path $ConfigPath -PathType Leaf)) {
-    Write-Error "Missing config\local.ps1. Copy config\local.example.ps1 to config\local.ps1 and adjust it for this machine."
-    exit 1
-}
-
-. $ConfigPath
-
-$PatchScript = Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"
-$ServerScript = Join-Path $QwenRoot "config\qwen_server.ps1"
+$PatchScript = Join-Path $QwenRoot "patches\qwen_runtime_patches.ps1"
+$ServerScript = Join-Path $QwenRoot "scripts\qwen_server.ps1"
 
 foreach ($required in @(
     $PatchScript,
@@ -45,6 +38,7 @@ foreach ($required in @(
 $CliLeaseRoot = Join-Path `
     $QwenUserRoot `
     "runtime_clients\cli"
+Assert-LocalPath $CliLeaseRoot
 
 New-Item `
     -Path $CliLeaseRoot `
@@ -55,6 +49,7 @@ Out-Null
 $CliLeasePath = Join-Path `
     $CliLeaseRoot `
     ("{0}.lock" -f $PID)
+Assert-LocalPath $CliLeasePath
 
 $CliLeaseStream = $null
 $qwenExitCode = 0
@@ -62,6 +57,7 @@ $stopExitCode = 0
 $primaryError = $null
 
 try {
+    Assert-LocalPath $CliLeasePath
     $CliLeaseStream = [System.IO.FileStream]::new(
         $CliLeasePath,
         [System.IO.FileMode]::OpenOrCreate,
@@ -92,6 +88,7 @@ try {
         throw "Qwen server preflight failed."
     }
 
+    Assert-LocalTree (Join-Path $QwenRoot '.localai')
     & $QwenCodeCli @args
     $qwenExitCode = $LASTEXITCODE
 }
@@ -133,3 +130,7 @@ if (
 }
 
 exit $qwenExitCode
+}
+finally {
+    if (Get-Command Restore-LocalEnvironment -ErrorAction SilentlyContinue) { Restore-LocalEnvironment }
+}

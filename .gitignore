@@ -1,4 +1,5 @@
 # Local machine configuration
+.localai/
 config/local.ps1
 config/qwen_models.ini
 

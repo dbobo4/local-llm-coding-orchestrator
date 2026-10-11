@@ -1,18 +1,9 @@
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = Split-Path $PSScriptRoot -Parent
-$ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+. (Join-Path $PSScriptRoot "local_environment.ps1")
+
+try {
 $SettingsTemplatePath = Join-Path $RepoRoot "config\settings.example.json"
-
-if (-not (Test-Path $ConfigPath -PathType Leaf)) {
-    throw "Missing config file: $ConfigPath. Copy config\local.example.ps1 to config\local.ps1 and edit it first."
-}
-
-if (-not (Test-Path $SettingsTemplatePath -PathType Leaf)) {
-    throw "Missing settings template: $SettingsTemplatePath"
-}
-
-. $ConfigPath
 
 # Backward-compatible defaults for local.ps1 files created before
 # role-specific model routing was introduced.
@@ -121,94 +112,21 @@ foreach ($file in $RequiredFiles) {
 
 $AgentsRoot = Join-Path $QwenUserRoot "agents"
 $SettingsPath = Join-Path $QwenUserRoot "settings.json"
-
+Assert-LocalPath $SettingsPath
+Assert-LocalPath $AgentsRoot
 New-Item -ItemType Directory -Force -Path $QwenUserRoot, $AgentsRoot, $OrchestrationRoot | Out-Null
 
 $Targets = @{
-    $SourceQwenMd         = Join-Path $QwenUserRoot "QWEN.md"
+    $SourceQwenMd = Join-Path $QwenUserRoot "QWEN.md"
     $SourceAlgorithmAgent = Join-Path $AgentsRoot "algorithm-agent.md"
-    $SourceTestAgent      = Join-Path $AgentsRoot "test-agent.md"
-    $SourceDispatcher     = Join-Path $OrchestrationRoot "hook_dispatcher.py"
-    $SourceMaintenance    = Join-Path $OrchestrationRoot "maintenance_hook.py"
-    $SourceMemoryProtocol = Join-Path $OrchestrationRoot "memory_protocol.py"
-    $SourceMemoryStore    = Join-Path $OrchestrationRoot "memory_store.py"
-    $SourceProjectIdentity = Join-Path $OrchestrationRoot "project_identity.py"
-    $SourceProjectRegistry = Join-Path $OrchestrationRoot "project_registry.py"
-    $SourceWorkflowState   = Join-Path $OrchestrationRoot "workflow_state.py"
-    $SourceRuntimePatcher = Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"
-    $SourceServerManager = Join-Path $QwenRoot "config\qwen_server.ps1"
-    $SourceUpdateManager = Join-Path $QwenRoot "config\qwen_update.ps1"
-    $SourceQwenLauncher = Join-Path $QwenRoot "config\qwen_cli.ps1"
-    $SourceChatLauncher = Join-Path $QwenRoot "config\qwen_chat.ps1"
-    $SourceChatWatcher = Join-Path $QwenRoot "config\watch_qwen_chat.ps1"
-    $SourceChatContextProxy = Join-Path $QwenRoot "config\qwen_chat_context_proxy.py"
-    $SourceBenchmark = Join-Path $QwenRoot "config\benchmark_qwen.ps1"
+    $SourceTestAgent = Join-Path $AgentsRoot "test-agent.md"
 }
-
-$QwenBinRoot = Join-Path $QwenRoot "bin"
-$QwenUpdateCmdPath = Join-Path $QwenBinRoot "qwen-update.cmd"
-
-$Timestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
-$BackupRoot = Join-Path $QwenRoot "backups\orchestrator-install\$Timestamp"
-$FilesToBackup = @($Targets.Values) + @($SettingsPath, $QwenUpdateCmdPath)
-$ExistingFiles = @($FilesToBackup | Where-Object { Test-Path $_ -PathType Leaf })
-
-if ($ExistingFiles.Count -gt 0) {
-    New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
-
-    foreach ($file in $ExistingFiles) {
-        $safeName = ($file -replace '[:\\\/]', '_')
-        Copy-Item $file (Join-Path $BackupRoot $safeName) -Force
-    }
-}
-
-# LOCALAI_PACKAGE3_INSTALLER_V1
-$RuntimeConfigRoot = Join-Path $QwenRoot "config"
-New-Item -ItemType Directory -Force -Path $RuntimeConfigRoot | Out-Null
-
-# LOCALAI_RUNTIME_LOCAL_CONFIG_DEPLOY_V1
-$SourceRuntimeLocalConfig = Join-Path $RepoRoot "config\local.ps1"
-if (-not (Test-Path -LiteralPath $SourceRuntimeLocalConfig -PathType Leaf)) {
-    throw "Missing source runtime config: $SourceRuntimeLocalConfig"
-}
-$InstalledRuntimeLocalConfig = Join-Path $RuntimeConfigRoot "local.ps1"
-Copy-Item `
-    -LiteralPath $SourceRuntimeLocalConfig `
-    -Destination $InstalledRuntimeLocalConfig `
-    -Force
-Write-Host "RUNTIME_LOCAL_CONFIG_DEPLOY=PASS"
 foreach ($entry in $Targets.GetEnumerator()) {
-    Copy-Item $entry.Key $entry.Value -Force
+    Assert-LocalPath $entry.Value
 }
-
-foreach ($requiredProductionFile in @(
-    (Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"),
-    (Join-Path $QwenRoot "config\qwen_server.ps1"),
-    (Join-Path $QwenRoot "config\qwen_update.ps1"),
-    (Join-Path $QwenRoot "config\qwen_cli.ps1"),
-    (Join-Path $QwenRoot "config\qwen_chat.ps1"),
-    (Join-Path $QwenRoot "config\watch_qwen_chat.ps1"),
-    (Join-Path $QwenRoot "config\qwen_chat_context_proxy.py"),
-    (Join-Path $QwenRoot "config\benchmark_qwen.ps1")
-)) {
-    if (-not (Test-Path -LiteralPath $requiredProductionFile -PathType Leaf)) {
-        throw "Production runtime deployment failed: $requiredProductionFile"
-    }
+foreach ($entry in $Targets.GetEnumerator()) {
+    Copy-Item -LiteralPath $entry.Key -Destination $entry.Value -Force
 }
-
-New-Item -ItemType Directory -Force -Path $QwenBinRoot | Out-Null
-$QwenUpdateCmdText = @(
-    "@echo off"
-    ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $QwenRoot "config\qwen_update.ps1") + '" %*')
-    "exit /b %ERRORLEVEL%"
-    ""
-) -join [Environment]::NewLine
-[IO.File]::WriteAllText(
-    $QwenUpdateCmdPath,
-    $QwenUpdateCmdText,
-    (New-Object Text.UTF8Encoding($false))
-)
-Write-Host "QWEN_UPDATE_WRAPPER_DEPLOY=PASS"
 
 function Set-AgentModelFrontmatter {
     param(
@@ -250,13 +168,13 @@ Set-AgentModelFrontmatter `
 
 $template = Get-Content $SettingsTemplatePath -Raw | ConvertFrom-Json
 
-$dispatcherPath = Join-Path $OrchestrationRoot "hook_dispatcher.py"
-$maintenancePath = Join-Path $OrchestrationRoot "maintenance_hook.py"
-$stopServerPath = Join-Path $QwenRoot "config\qwen_server.ps1"
+$dispatcherPath = $SourceDispatcher
+$maintenancePath = $SourceMaintenance
+$stopServerPath = $SourceServerManager
 
-$dispatcherCommand = 'python "' + $dispatcherPath + '"'
-$maintenanceCommand = 'python "' + $maintenancePath + '"'
-$stopServerCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $stopServerPath + '" -Action Stop -IfIdle'
+$dispatcherCommand = "python '" + $dispatcherPath.Replace("'", "''") + "'"
+$maintenanceCommand = "python '" + $maintenancePath.Replace("'", "''") + "'"
+$stopServerCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '" + $stopServerPath.Replace("'", "''") + "' -Action Stop -IfIdle"
 
 foreach ($eventName in @("SubagentStart","UserPromptSubmit","SessionStart","SessionEnd","SubagentStop","Stop","PostToolUse","PostToolUseFailure")) {
     foreach ($eventGroup in $template.hooks.$eventName) {
@@ -487,6 +405,12 @@ $modelSettings |
         -NotePropertyValue ([int]$MaxContextGrowthTokensPerTurn) `
         -Force
 
+$general = Ensure-ObjectProperty $settings "general"
+$general | Add-Member -NotePropertyName "enableAutoUpdate" -NotePropertyValue $false -Force
+$mcpServers = Ensure-ObjectProperty $settings "mcpServers"
+$context7 = Ensure-ObjectProperty $mcpServers "context7"
+$context7 | Add-Member -NotePropertyName "httpUrl" -NotePropertyValue "https://mcp.context7.com/mcp" -Force
+
 $json = $settings | ConvertTo-Json -Depth 30
 [IO.File]::WriteAllText(
     $SettingsPath,
@@ -670,20 +594,14 @@ foreach ($eventName in @("PostToolUse","PostToolUseFailure")) {
     }
 }
 
-Write-Host "ORCHESTRATOR_INSTALL=PASS"
+
 Write-Host "QWEN_USER_ROOT=$QwenUserRoot"
 Write-Host "ORCHESTRATION_ROOT=$OrchestrationRoot"
 Write-Host "SETTINGS=$SettingsPath"
 
-if ($ExistingFiles.Count -gt 0) {
-    Write-Host "BACKUP=$BackupRoot"
-}
-
-
-
 # Apply/verify all Qwen Code compatibility and runtime-hardening patches only
 # after orchestration files and settings have reached their final installed state.
-$InstalledRuntimePatcher = Join-Path $QwenRoot "config\qwen_runtime_patches.ps1"
+$InstalledRuntimePatcher = $SourceRuntimePatcher
 
 & powershell.exe `
     -NoProfile `
@@ -696,3 +614,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "RUNTIME_PATCH_INSTALL=PASS"
+Write-Host "ORCHESTRATOR_INSTALL=PASS"
+
+}
+finally { Restore-LocalEnvironment }

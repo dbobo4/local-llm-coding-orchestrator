@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from project_identity import STATE_ROOT
+from local_paths import assert_local_path, assert_local_tree
 
 
 VerificationStatus = Literal[
@@ -178,6 +179,7 @@ def _atomic_write_json(
     path: Path,
     payload: dict[str, Any],
 ) -> None:
+    assert_local_path(path)
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -186,6 +188,7 @@ def _atomic_write_json(
     temporary_path = path.with_name(
         f".{path.name}.{os.getpid()}.tmp"
     )
+    assert_local_path(temporary_path)
 
     try:
         temporary_path.write_text(
@@ -215,6 +218,7 @@ def _atomic_write_json(
 def _read_json_document(
     path: Path,
 ) -> dict[str, Any] | None:
+    assert_local_path(path)
     if not path.exists():
         return None
 
@@ -316,6 +320,7 @@ def load_state(
         session_id,
         turn_id,
     )
+    assert_local_path(path)
 
     payload = json.loads(
         path.read_text(
@@ -336,6 +341,7 @@ def try_load_state(
         session_id,
         turn_id,
     )
+    assert_local_path(path)
 
     if not path.exists():
         return None
@@ -844,6 +850,7 @@ def has_prior_closed_turn(
     root = _session_root(
         state.session_id
     )
+    assert_local_path(root)
 
     if not root.exists():
         return False
@@ -1387,6 +1394,7 @@ def delete_state(
         session_id,
         turn_id,
     )
+    assert_local_path(path)
 
     if not path.exists():
         return False
@@ -1425,6 +1433,7 @@ def delete_session_state(
             session_id
         )
     )
+    assert_local_tree(session_directory)
 
     if not session_directory.exists():
         return False

@@ -11,18 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from local_paths import assert_local_path, assert_local_tree
 
-QWEN_HOME = Path(
-    os.environ.get(
-        "QWEN_HOME",
-        str(Path.home() / ".qwen"),
-    )
-).expanduser()
 
-ORCHESTRATION_ROOT = (
-    QWEN_HOME
-    / "orchestration"
-)
+# Standalone maintenance uses the same clone-local state as the launchers.
+INSTALL_ROOT = Path(__file__).resolve().parents[1]
+QWEN_HOME = INSTALL_ROOT / ".localai" / "qwen"
+ORCHESTRATION_ROOT = INSTALL_ROOT / ".localai" / "orchestration"
 
 REGISTRY_PATH = (
     ORCHESTRATION_ROOT
@@ -187,6 +182,7 @@ def _project_from_dict(
 
 
 def _load_registry_document() -> dict[str, Any]:
+    assert_local_path(REGISTRY_PATH)
     if not REGISTRY_PATH.exists():
         return _empty_registry()
 
@@ -263,6 +259,7 @@ def _load_projects() -> list[RegisteredProject]:
 def _atomic_write_projects(
     projects: list[RegisteredProject],
 ) -> None:
+    assert_local_path(REGISTRY_PATH)
     ORCHESTRATION_ROOT.mkdir(
         parents=True,
         exist_ok=True,
@@ -281,6 +278,7 @@ def _atomic_write_projects(
             f".{REGISTRY_PATH.name}.{os.getpid()}.tmp"
         )
     )
+    assert_local_path(temporary_path)
 
     try:
         temporary_path.write_text(
@@ -762,6 +760,7 @@ def _state_file_project_id(
 def _cleanup_project_states(
     project_id: str,
 ) -> tuple[int, int]:
+    assert_local_tree(STATE_ROOT)
     if not STATE_ROOT.exists():
         return (
             0,
@@ -786,6 +785,7 @@ def _cleanup_project_states(
     touched_session_directories: set[Path] = set()
 
     for state_path in matching_state_files:
+        assert_local_path(state_path)
         touched_session_directories.add(
             state_path.parent
         )
@@ -864,6 +864,7 @@ def purge_project(
         PROJECT_MEMORY_ROOT
         / project.project_id
     )
+    assert_local_tree(memory_root)
 
     removed_memory = False
 

@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from local_paths import assert_local_path, assert_local_tree
+
 from project_identity import (
     ORCHESTRATION_ROOT,
     PROJECT_MEMORY_ROOT,
@@ -26,8 +28,7 @@ from workflow_state import (
 
 
 REGISTRY_SCRIPT_PATH = (
-    ORCHESTRATION_ROOT
-    / "project_registry.py"
+    Path(__file__).resolve().with_name("project_registry.py")
 )
 
 LOG_ROOT = (
@@ -94,6 +95,7 @@ def _write_json(
 def _log_error(
     error: BaseException,
 ) -> None:
+    assert_local_path(ERROR_LOG_PATH)
     try:
         LOG_ROOT.mkdir(
             parents=True,
@@ -383,6 +385,7 @@ def _cleanup_replaced_temporary_memory(
         PROJECT_MEMORY_ROOT
         / replaced_project_id
     )
+    assert_local_tree(temporary_memory_root)
 
     if not temporary_memory_root.exists():
         return

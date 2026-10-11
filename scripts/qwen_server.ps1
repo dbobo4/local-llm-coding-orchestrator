@@ -6,16 +6,133 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "local_environment.ps1")
+
+function Get-QwenModelsPresetText {
+    $model = [IO.Path]::GetFullPath($ModelPath).Replace('\', '/')
+    return @(
+        'version = 1', '', "[$ChatModelAlias]", "model = $model",
+        ('alias = ' + (@($ModelAlias, $AlgorithmModelAlias, $TestModelAlias) -join ',')),
+        'load-on-startup = true', ''
+    ) -join [Environment]::NewLine
+}
+
+function Get-QwenServerArguments {
+    param([switch]$Legacy)
+    $modelArguments = if ($Legacy) {
+        @('--model', $ModelPath, '--alias', $ModelAlias)
+    } else {
+        @('--models-preset', (Join-Path $QwenRoot '.localai\config\qwen_models.ini'), '--models-max', '1')
+    }
+    return $modelArguments + @(
+        '--host', $ServerHost, '--port', [string]$ServerPort,
+        '--ctx-size', [string]$ContextWindowSize, '--parallel', '1', '--n-gpu-layers', '99', '--fit', 'off',
+        '--spec-type', 'draft-mtp,ngram-mod', '--spec-draft-n-max', '2', '--spec-draft-p-min', [string]$SpecDraftPMin,
+        '--spec-ngram-mod-n-min', [string]$SpecNgramModNMin, '--spec-ngram-mod-n-max', [string]$SpecNgramModNMax,
+        '--spec-ngram-mod-n-match', [string]$SpecNgramModNMatch,
+        '--threads', '20', '--threads-batch', '20', '--spec-draft-threads', '20', '--spec-draft-threads-batch', '20',
+        '--flash-attn', 'on', '--cache-type-k', $CacheTypeK, '--cache-type-v', $CacheTypeV,
+        '--batch-size', '1024', '--ubatch-size', '512', '--jinja', '--reasoning', 'on',
+        '--reasoning-effort', 'xhigh', '--reasoning-budget', '-1', '--reasoning-preserve'
+    )
+}
+
+function Test-QwenFullyQualifiedPath {
+    param([string]$Path)
+    $root = [IO.Path]::GetPathRoot($Path)
+    return ($root -match '^[A-Za-z]:[\\/]$' -or $root -match '^\\\\[^\\/]+[\\/][^\\/]+[\\/]?$')
+}
+
+function Get-QwenServerProcessMode {
+    param($Process, [int]$ProcessId, [string]$ExpectedExe, [string]$ExpectedPreset)
+    Assert-LocalPath $ExpectedExe
+    Assert-LocalPath $ExpectedPreset
+    $expected = [IO.Path]::GetFullPath($ExpectedExe)
+    if ([string]$Process.Name -ine [IO.Path]::GetFileName($expected)) { throw 'Unexpected server executable name.' }
+    $imagePath = [string]$Process.ExecutablePath
+    if ([string]::IsNullOrWhiteSpace($imagePath)) {
+        try { $imagePath = [string](Get-Process -Id $ProcessId -ErrorAction Stop).Path }
+        catch { throw 'Cannot independently verify the server executable path.' }
+    }
+    if ([string]::IsNullOrWhiteSpace($imagePath)) { throw 'Cannot independently verify the server executable path.' }
+    if (-not [IO.Path]::GetFullPath($imagePath).Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Server belongs to another installation. Refusing to use or stop it.'
+    }
+    # The launcher emits ordinary Windows arguments; malformed/ambiguous quoting fails closed.
+    $command = [string]$Process.CommandLine
+    $matches = [regex]::Matches($command, '"[^"]*"|[^\s"]+')
+    $tokens = @(); $position = 0
+    foreach ($match in $matches) {
+        $gap = $command.Substring($position, $match.Index - $position)
+        if ($gap.Trim().Length -ne 0 -or ($tokens.Count -gt 0 -and $gap.Length -eq 0)) { throw 'Ambiguous server command line.' }
+        $tokens += $match.Value.Trim('"')
+        $position = $match.Index + $match.Length
+    }
+    if ($command.Substring($position).Trim().Length -ne 0 -or $tokens.Count -lt 2 -or
+        -not (Test-QwenFullyQualifiedPath $tokens[0]) -or
+        -not [IO.Path]::GetFullPath($tokens[0]).Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Cannot verify the server executable and launch arguments.'
+    }
+    $legacy = $tokens -contains '--model' -or $tokens -contains '-m'
+    $arguments = @(Get-QwenServerArguments -Legacy:$legacy)
+    $expectedOptions = @{}
+    for ($i = 0; $i -lt $arguments.Count; $i++) {
+        $key = [string]$arguments[$i]
+        $value = $null
+        if ($i + 1 -lt $arguments.Count -and -not $arguments[$i + 1].StartsWith('--')) { $value = [string]$arguments[++$i] }
+        $expectedOptions[$key] = $value
+    }
+    $seen = @{}
+    for ($i = 1; $i -lt $tokens.Count; $i++) {
+        $key = $tokens[$i]
+        if ($key -ceq '-m') { $key = '--model' }
+        if ($expectedOptions.Keys -cnotcontains $key -or $seen.ContainsKey($key)) { throw "Unexpected or duplicate server option: $key" }
+        $seen[$key] = $true
+        $value = $expectedOptions[$key]
+        if ($null -ne $value) {
+            if (++$i -ge $tokens.Count) { throw "Missing server option value: $key" }
+            if ($key -in @('--model', '--models-preset')) {
+                if (-not (Test-QwenFullyQualifiedPath $tokens[$i]) -or
+                    -not [IO.Path]::GetFullPath($tokens[$i]).Equals([IO.Path]::GetFullPath($value), [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Wrong server path for $key."
+                }
+            } elseif ($tokens[$i] -cne $value) { throw "Wrong server value for $key." }
+        }
+    }
+    if ($seen.Count -ne $expectedOptions.Count) { throw 'Server launch configuration is incomplete.' }
+    if (-not $legacy) {
+        if (-not (Test-Path -LiteralPath $ExpectedPreset -PathType Leaf) -or
+            [IO.File]::ReadAllText($ExpectedPreset).Replace("`r`n", "`n") -cne (Get-QwenModelsPresetText).Replace("`r`n", "`n")) {
+            throw 'Server preset does not match the configured model and aliases.'
+        }
+        return 'Router'
+    }
+    Assert-LocalPath $ModelPath
+    return 'Legacy'
+}
+
+function Test-QwenLocalListener {
+    param([string]$HostAddress, [int]$Port, [string]$ExpectedExe, [string]$ExpectedPreset)
+    Assert-LocalPath $ExpectedPreset
+    $owners = @(Get-NetTCPConnection -LocalAddress $HostAddress -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+    if ($owners.Count -eq 0) { return $false }
+    if ($owners.Count -ne 1) { throw "Server port $Port has ambiguous ownership. Refusing to use it." }
+    $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$owners[0])" -ErrorAction Stop
+    if ($null -eq $process) { throw "Cannot identify the server listener. Refusing to use it." }
+    $null = Get-QwenServerProcessMode -Process $process -ProcessId ([int]$owners[0]) -ExpectedExe $ExpectedExe -ExpectedPreset $ExpectedPreset
+    return $true
+}
 
 function Invoke-QwenServerStart {
     $RepoRoot = Split-Path $PSScriptRoot -Parent
-    $ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+    $ConfigPath = Join-Path $RepoRoot ".localai\config\local.ps1"
 
     if (-not (Test-Path $ConfigPath -PathType Leaf)) {
         throw "Missing config file: $ConfigPath"
     }
 
-    . $ConfigPath
+    . (Join-Path $RepoRoot "scripts\local_environment.ps1")
 
     if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
         $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
@@ -82,7 +199,8 @@ function Invoke-QwenServerStart {
     }
 
     $ServerExe = $LlamaServerExe
-    $ModelsPreset = Join-Path $QwenRoot "config\qwen_models.ini"
+    $ModelsPreset = Join-Path $QwenRoot ".localai\config\qwen_models.ini"
+    Assert-LocalPath $ModelsPreset
 
     if (-not (Test-Path $ServerExe -PathType Leaf)) {
         throw "llama-server.exe not found: $ServerExe"
@@ -100,24 +218,7 @@ function Invoke-QwenServerStart {
         -Force |
     Out-Null
 
-    $PresetModelPath = (
-        [System.IO.Path]::GetFullPath(
-            $ModelPath
-        )
-    ).Replace(
-        "\",
-        "/"
-    )
-
-    $PresetText = @(
-        "version = 1"
-        ""
-        "[$ChatModelAlias]"
-        "model = $PresetModelPath"
-        ("alias = " + ($RoleModelAliases -join ","))
-        "load-on-startup = true"
-        ""
-    ) -join [Environment]::NewLine
+    $PresetText = Get-QwenModelsPresetText
 
     $PresetNeedsWrite = $true
 
@@ -152,46 +253,19 @@ function Invoke-QwenServerStart {
     Write-Host "========================================"
     Write-Host ""
 
-    & $ServerExe `
-        --models-preset $ModelsPreset `
-        --models-max 1 `
-        --host $ServerHost `
-        --port $ServerPort `
-        --ctx-size $ContextWindowSize `
-        --parallel 1 `
-        --n-gpu-layers 99 `
-        --fit off `
-        --spec-type draft-mtp,ngram-mod `
-        --spec-draft-n-max 2 `
-        --spec-draft-p-min $SpecDraftPMin `
-        --spec-ngram-mod-n-min $SpecNgramModNMin `
-        --spec-ngram-mod-n-max $SpecNgramModNMax `
-        --spec-ngram-mod-n-match $SpecNgramModNMatch `
-        --threads 20 `
-        --threads-batch 20 `
-        --spec-draft-threads 20 `
-        --spec-draft-threads-batch 20 `
-        --flash-attn on `
-        --cache-type-k $CacheTypeK `
-        --cache-type-v $CacheTypeV `
-        --batch-size 1024 `
-        --ubatch-size 512 `
-        --jinja `
-        --reasoning on `
-        --reasoning-effort xhigh `
-        --reasoning-budget -1 `
-        --reasoning-preserve
+    $ServerArguments = @(Get-QwenServerArguments)
+    & $ServerExe @ServerArguments
 }
 
 function Invoke-QwenServerEnsure {
     $RepoRoot = Split-Path $PSScriptRoot -Parent
-    $ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+    $ConfigPath = Join-Path $RepoRoot ".localai\config\local.ps1"
 
     if (-not (Test-Path $ConfigPath -PathType Leaf)) {
         throw "Missing config file: $ConfigPath"
     }
 
-    . $ConfigPath
+    . (Join-Path $RepoRoot "scripts\local_environment.ps1")
 
     if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) {
         $AlgorithmModelAlias = "qwen3.8-27b-algorithm"
@@ -222,7 +296,8 @@ function Invoke-QwenServerEnsure {
     $ExpectedModelSummary = $ExpectedModels -join ", "
 
     $StartScript = $PSCommandPath
-    $LogRoot = Join-Path $QwenRoot "logs"
+    $LogRoot = Join-Path $QwenRoot ".localai\logs"
+    Assert-LocalPath $LogRoot
 
     $HostAddress = [string]$ServerHost
     $Port = [int]$ServerPort
@@ -270,6 +345,9 @@ function Invoke-QwenServerEnsure {
 
     function Get-QwenApiState {
         try {
+            if (-not (Test-QwenLocalListener -HostAddress $HostAddress -Port $Port -ExpectedExe $LlamaServerExe -ExpectedPreset (Join-Path $QwenRoot ".localai\config\qwen_models.ini"))) {
+                return "unreachable"
+            }
             $response = Invoke-RestMethod `
                 -Uri $ApiUrl `
                 -Method Get `
@@ -312,6 +390,8 @@ function Invoke-QwenServerEnsure {
         }
     }
 
+    # Check ownership before requesting metadata or reusing a ready listener.
+    $null = Test-QwenLocalListener -HostAddress $HostAddress -Port $Port -ExpectedExe $LlamaServerExe -ExpectedPreset (Join-Path $QwenRoot ".localai\config\qwen_models.ini")
     $initialApiState = Get-QwenApiState
 
     if ($initialApiState -eq "ready") {
@@ -339,6 +419,8 @@ function Invoke-QwenServerEnsure {
 
     $stdoutLog = Join-Path $LogRoot "qwen-server.stdout.log"
     $stderrLog = Join-Path $LogRoot "qwen-server.stderr.log"
+    Assert-LocalPath $stdoutLog
+    Assert-LocalPath $stderrLog
 
     Write-Host "Qwen server is not running. Starting it..."
 
@@ -400,13 +482,13 @@ function Invoke-QwenServerEnsure {
 function Invoke-QwenServerStop {
     param([switch]$IfIdle)
     $RepoRoot = Split-Path $PSScriptRoot -Parent
-    $ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+    $ConfigPath = Join-Path $RepoRoot ".localai\config\local.ps1"
 
     if (-not (Test-Path $ConfigPath -PathType Leaf)) {
         throw "Missing config file: $ConfigPath"
     }
 
-    . $ConfigPath
+    . (Join-Path $RepoRoot "scripts\local_environment.ps1")
 
     if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) {
         $ChatModelAlias = "qwen3.8-27b-chat"
@@ -414,7 +496,8 @@ function Invoke-QwenServerStop {
 
     $ExpectedExe = $LlamaServerExe
     $ExpectedModelPath = $ModelPath
-    $ExpectedRouterPreset = Join-Path $QwenRoot "config\qwen_models.ini"
+    $ExpectedRouterPreset = Join-Path $QwenRoot ".localai\config\qwen_models.ini"
+    Assert-LocalPath $ExpectedRouterPreset
 
     $HostAddress = [string]$ServerHost
     $Port = [int]$ServerPort
@@ -447,6 +530,7 @@ function Invoke-QwenServerStop {
         param(
             [string]$Path
         )
+        Assert-LocalPath $Path
 
         if (-not (
             Test-Path `
@@ -497,6 +581,7 @@ function Invoke-QwenServerStop {
     }
 
     function Test-QwenCliActive {
+        Assert-LocalTree $CliLeaseRoot
         if (-not (
             Test-Path `
                 -LiteralPath $CliLeaseRoot `
@@ -561,60 +646,6 @@ function Invoke-QwenServerStop {
         }
 
         return ([int]$owners[0] -eq $ProcessId)
-    }
-
-    function Test-QwenRouterMode {
-        param(
-            [string]$CommandLine
-        )
-
-        $expectedPresetName = [System.IO.Path]::GetFileName(
-            $ExpectedRouterPreset
-        )
-
-        if (-not [string]::IsNullOrWhiteSpace($CommandLine)) {
-            $hasPresetSwitch = (
-                $CommandLine.IndexOf(
-                    "--models-preset",
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            )
-
-            $hasPresetName = (
-                $CommandLine.IndexOf(
-                    $expectedPresetName,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            )
-
-            if (
-                $hasPresetSwitch -and
-                $hasPresetName
-            ) {
-                return $true
-            }
-        }
-
-        try {
-            $response = Invoke-RestMethod `
-                -Uri "$RouterBaseUrl/v1/models" `
-                -Method Get `
-                -TimeoutSec 2
-
-            foreach ($model in @($response.data)) {
-                if (
-                    [string]$model.id -eq $ChatModelAlias -and
-                    [string]$model.source -eq "preset"
-                ) {
-                    return $true
-                }
-            }
-        }
-        catch {
-            return $false
-        }
-
-        return $false
     }
 
     function Get-QwenRouterModelChildIds {
@@ -780,140 +811,8 @@ function Invoke-QwenServerStop {
         )
     }
 
-    $expectedName = [System.IO.Path]::GetFileName(
-        $ExpectedExe
-    )
-
-    $actualName = [string]$processInfo.Name
-
-    $nameMatches = $actualName.Equals(
-        $expectedName,
-        [System.StringComparison]::OrdinalIgnoreCase
-    )
-
-    if (-not $nameMatches) {
-        throw (
-            "Port $Port is owned by an unexpected process. " +
-            "PID=$serverPid Name=$actualName. " +
-            "Refusing to stop it."
-        )
-    }
-
-    $expectedFullPath = [System.IO.Path]::GetFullPath(
-        $ExpectedExe
-    )
-
-    $actualExe = [string]$processInfo.ExecutablePath
-    $commandLine = [string]$processInfo.CommandLine
-
-    $identitySource = ""
-
-    if (-not [string]::IsNullOrWhiteSpace($actualExe)) {
-        $actualFullPath = [System.IO.Path]::GetFullPath(
-            $actualExe
-        )
-
-        $pathMatches = $actualFullPath.Equals(
-            $expectedFullPath,
-            [System.StringComparison]::OrdinalIgnoreCase
-        )
-
-        if (-not $pathMatches) {
-            throw (
-                "Port $Port is owned by an unexpected process. " +
-                "PID=$serverPid Path=$actualFullPath. " +
-                "Refusing to stop it."
-            )
-        }
-
-        $identitySource = "ExecutablePath"
-    }
-
-    if ([string]::IsNullOrWhiteSpace($identitySource)) {
-        $expectedModelName = [System.IO.Path]::GetFileName(
-            $ExpectedModelPath
-        )
-
-        $expectedPresetName = [System.IO.Path]::GetFileName(
-            $ExpectedRouterPreset
-        )
-
-        $hostToken = "--host $HostAddress"
-        $portToken = "--port $Port"
-
-        $hasCommandLine = -not [string]::IsNullOrWhiteSpace(
-            $commandLine
-        )
-
-        $hasHost = $false
-        $hasPort = $false
-        $hasLegacyModel = $false
-        $hasRouterPresetSwitch = $false
-        $hasRouterPresetName = $false
-
-        if ($hasCommandLine) {
-            $hasHost = (
-                $commandLine.IndexOf(
-                    $hostToken,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            )
-
-            $hasPort = (
-                $commandLine.IndexOf(
-                    $portToken,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            )
-
-            $hasLegacyModel = (
-                $commandLine.IndexOf(
-                    $expectedModelName,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            )
-
-            $hasRouterPresetSwitch = (
-                $commandLine.IndexOf(
-                    "--models-preset",
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            )
-
-            $hasRouterPresetName = (
-                $commandLine.IndexOf(
-                    $expectedPresetName,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            )
-        }
-
-        $hasRouterPreset = (
-            $hasRouterPresetSwitch -and
-            $hasRouterPresetName
-        )
-
-        $commandMatches = (
-            $hasCommandLine -and
-            $hasHost -and
-            $hasPort -and
-            (
-                $hasLegacyModel -or
-                $hasRouterPreset
-            )
-        )
-
-        if (-not $commandMatches) {
-            throw (
-                "Could not verify listener identity safely. " +
-                "PID=$serverPid Name=$actualName. " +
-                "ExecutablePath is unavailable and CommandLine " +
-                "does not match the configured Qwen server."
-            )
-        }
-
-        $identitySource = "Name+CommandLine"
-    }
+    $serverMode = Get-QwenServerProcessMode -Process $processInfo -ProcessId $serverPid -ExpectedExe $ExpectedExe -ExpectedPreset $ExpectedRouterPreset
+    $identitySource = 'Executable+LaunchConfiguration'
 
     if (-not (Test-QwenListenerOwnedBy -ProcessId $serverPid)) {
         Write-Host "QWEN_SERVER_STATUS=ALREADY_STOPPED"
@@ -935,8 +834,7 @@ function Invoke-QwenServerStop {
         }
     }
 
-    $isRouter = Test-QwenRouterMode `
-        -CommandLine $commandLine
+    $isRouter = $serverMode -eq 'Router'
 
     if ($isRouter) {
         Invoke-QwenRouterModelUnload `
@@ -990,15 +888,19 @@ function Invoke-QwenServerStop {
 
 function Invoke-QwenServerStatus {
     $RepoRoot = Split-Path $PSScriptRoot -Parent
-    $ConfigPath = Join-Path $RepoRoot "config\local.ps1"
+    $ConfigPath = Join-Path $RepoRoot ".localai\config\local.ps1"
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { throw "Missing config file: $ConfigPath" }
-    . $ConfigPath
+    . (Join-Path $RepoRoot "scripts\local_environment.ps1")
     if ([string]::IsNullOrWhiteSpace([string]$ChatModelAlias)) { $ChatModelAlias = "qwen3.8-27b-chat" }
     if ([string]::IsNullOrWhiteSpace([string]$AlgorithmModelAlias)) { $AlgorithmModelAlias = "qwen3.8-27b-algorithm" }
     if ([string]::IsNullOrWhiteSpace([string]$TestModelAlias)) { $TestModelAlias = "qwen3.8-27b-test" }
     $ExpectedAliases = @($ModelAlias, $AlgorithmModelAlias, $TestModelAlias)
     $ApiUrl = "http://${ServerHost}:${ServerPort}/v1/models"
     try {
+        if (-not (Test-QwenLocalListener -HostAddress ([string]$ServerHost) -Port ([int]$ServerPort) -ExpectedExe $LlamaServerExe -ExpectedPreset (Join-Path $QwenRoot ".localai\config\qwen_models.ini"))) {
+            Write-Host "QWEN_SERVER_STATUS=STOPPED_OR_UNREACHABLE"
+            return $false
+        }
         $response = Invoke-RestMethod -Uri $ApiUrl -Method Get -TimeoutSec 2
         $canonical = @(@($response.data) | Where-Object { [string]$_.id -eq $ChatModelAlias })
         if ($canonical.Count -ne 1) { Write-Host "QWEN_SERVER_STATUS=WRONG_MODEL"; return $false }
@@ -1015,6 +917,7 @@ function Invoke-QwenServerStatus {
     }
 }
 
+try {
 switch ($Action) {
     "Start"  { Invoke-QwenServerStart; break }
     "Ensure" { Invoke-QwenServerEnsure; break }
@@ -1022,3 +925,6 @@ switch ($Action) {
     "Stop"   { Invoke-QwenServerStop -IfIdle:$IfIdle; break }
     default  { throw "Unsupported server action: $Action" }
 }
+
+}
+finally { if (Get-Command Restore-LocalEnvironment -ErrorAction SilentlyContinue) { Restore-LocalEnvironment } }

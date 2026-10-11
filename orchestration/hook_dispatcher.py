@@ -10,6 +10,8 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
+from local_paths import assert_local_path
+
 import workflow_state as _localai_workflow_state
 
 from memory_protocol import (
@@ -133,6 +135,7 @@ def _log_error(
     event_name: str,
     error: BaseException,
 ) -> None:
+    assert_local_path(ERROR_LOG_PATH)
     try:
         ERROR_LOG_ROOT.mkdir(
             parents=True,
@@ -690,6 +693,7 @@ def _localai_v514_trace(
                 state.terminal_abort_reason if state else None
             ),
         }
+        assert_local_path(ERROR_LOG_ROOT / "terminal_completion_trace_v5_14.jsonl")
         ERROR_LOG_ROOT.mkdir(parents=True, exist_ok=True)
         with (
             ERROR_LOG_ROOT / "terminal_completion_trace_v5_14.jsonl"
@@ -2313,6 +2317,7 @@ def _localai_v5141_is_valid_read_evidence(
 
 
 def _localai_v5141_acquire_reread_lock():
+    assert_local_path(_LOCALAI_V5141_REREAD_LOCK_PATH)
     _LOCALAI_V5141_REREAD_LOCK_PATH.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -2506,8 +2511,7 @@ def main() -> None:
                         "an internal error and failed open. "
                         "Orchestration reliability for this "
                         "event is reduced; inspect "
-                        "C:\\Users\\User\\.qwen\\orchestration"
-                        "\\logs\\hook_errors.log."
+                        f"{ERROR_LOG_PATH}."
                     ),
                 }
             )
