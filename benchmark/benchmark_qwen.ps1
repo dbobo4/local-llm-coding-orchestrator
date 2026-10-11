@@ -8340,7 +8340,7 @@ function Get-ContextLifecycleRolloverMechanismContext {
 
     $Scaled = [int](
         [Math]::Floor(
-            ($ProductionContext * 0.60) / 1024.0
+            ($ProductionContext * 0.80) / 1024.0
         ) * 1024
     )
 
@@ -8378,7 +8378,7 @@ function New-ContextLifecyclePendingPressurePacket {
         [int]$TargetChars
     )
 
-    if ($TargetChars -lt 16000) {
+    if ($TargetChars -lt 12000) {
         throw "CONTEXT_LIFECYCLE_PENDING_PRESSURE_PACKET_TOO_SMALL"
     }
 
@@ -8775,24 +8775,26 @@ function Invoke-ContextLifecycleRolloverStress {
         $BasePacketChars = 8500
     }
 
+    # Experimental bounded current-request pressure: deliberately avoid the
+    # previously observed context-limit at 29350 high-entropy characters.
     # These are intentionally CHAR targets, not token targets. The payload is
     # deterministic high-entropy hex rather than repetitive prose so BPE cannot
     # make it unrealistically cheap. The goal is to make the CURRENT pending
     # user request itself consume enough context that compacting prior history
     # cannot get below the real auto-compaction safe target.
     $PressurePacketChars = @(
-        [int][Math]::Round($MechanismContext * 1.20),
-        [int][Math]::Round($MechanismContext * 1.50),
-        [int][Math]::Round($MechanismContext * 1.80)
+        [int][Math]::Round($MechanismContext * 0.42),
+        [int][Math]::Round($MechanismContext * 0.49),
+        [int][Math]::Round($MechanismContext * 0.55)
     )
 
     for ($PressureIndex = 0; $PressureIndex -lt $PressurePacketChars.Count; $PressureIndex++) {
-        if ($PressurePacketChars[$PressureIndex] -lt 28000) {
-            $PressurePacketChars[$PressureIndex] = 28000
+        if ($PressurePacketChars[$PressureIndex] -lt 13500) {
+            $PressurePacketChars[$PressureIndex] = 13500
         }
 
-        if ($PressurePacketChars[$PressureIndex] -gt 52000) {
-            $PressurePacketChars[$PressureIndex] = 52000
+        if ($PressurePacketChars[$PressureIndex] -gt 19000) {
+            $PressurePacketChars[$PressureIndex] = 19000
         }
     }
     # Reserve the full pressure ladder and continuation even after late compaction.
@@ -8806,7 +8808,7 @@ function Invoke-ContextLifecycleRolloverStress {
     Write-Host "TRIGGER=REAL_LOCALAI_CONTEXT_ROLLOVER_REQUIRED_PATH"
     Write-Host "ROLLOVER_REQUIRED_TOKEN_SOURCE=RUNTIME_EFFECTIVE_CONTEXT_ESTIMATE"
     Write-Host "RUNTIME_TEST_HOOKS=NONE"
-    Write-Host "PRESSURE_POLICY=AFTER_FIRST_PROVEN_COMPACTION_USE_HIGH_ENTROPY_CURRENT_PENDING_REQUEST"
+    Write-Host "PRESSURE_POLICY=AFTER_FIRST_PROVEN_COMPACTION_BOUNDED_HIGH_ENTROPY_CURRENT_PENDING_REQUEST"
     Write-Host (
         "PRESSURE_PACKET_CHARS=" +
         ($PressurePacketChars -join ",")
@@ -8823,7 +8825,7 @@ function Invoke-ContextLifecycleRolloverStress {
         "MECHANISM_CONTEXT=" +
         $MechanismContext
     )
-    Write-Host "MECHANISM_CONTEXT_POLICY=60_PERCENT_ROUNDED_CLAMP_24576_32768"
+    Write-Host "MECHANISM_CONTEXT_POLICY=80_PERCENT_ROUNDED_CLAMP_24576_32768"
     Write-Host "CONTEXT_OUTPUT_MARGIN_POLICY=LOCKED_5_PERCENT_RATIO_NOT_TUNED"
     Write-Host "PRODUCTION_CONTEXT_OUTPUT_MARGIN_CHANGED=NO"
     Write-Host "ROLLOVER_REQUIRED_MINIMUM=1"

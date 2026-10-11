@@ -176,10 +176,12 @@ Restore-LocalEnvironment
                 self.assertEqual(len(data['turns']), compaction + 5)
                 pressure = [turn for turn in data['turns'] if turn['pressure']]
                 self.assertEqual([turn['turn'] for turn in pressure], list(range(compaction + 1, compaction + 4)))
-                self.assertTrue(29000 < pressure[0]['chars'] < 30000)
-                self.assertTrue(36000 < pressure[1]['chars'] < 38000)
-                self.assertTrue(44000 < pressure[2]['chars'] < 45000)
+                self.assertTrue(13500 < pressure[0]['chars'] < 14000)
+                self.assertTrue(15800 < pressure[1]['chars'] < 16200)
+                self.assertTrue(17700 < pressure[2]['chars'] < 18100)
                 self.assertEqual(data['recalls'], 1)
+                self.assertIn('MECHANISM_CONTEXT=32768', output)
+                self.assertIn('MECHANISM_CONTEXT_POLICY=80_PERCENT_ROUNDED_CLAMP_24576_32768', output)
                 self.assertIn('POST_ROLLOVER_TURNS=2', output)
 
     def test_early_rollover_stops_pressure_and_runs_two_subsequent_turns(self):
