@@ -7484,6 +7484,7 @@ function Get-ContextLifecycleCumulativeMetrics {
     function Get-MaxMetric {
         param(
             [Parameter(Mandatory = $true)]
+            [AllowEmptyString()]
             [string]$Source,
 
             [Parameter(Mandatory = $true)]
@@ -7795,6 +7796,8 @@ function Get-ContextLifecycleOpenAiAudit {
             TotalBytes = 0
             RequestLikeFileCount = 0
             UsageFileCount = 0
+            MaxPromptTokens = $null
+            MaxCompletionTokens = $null
             FileLines = @()
         }
     }
@@ -7811,6 +7814,8 @@ function Get-ContextLifecycleOpenAiAudit {
     $TotalBytes = [long]0
     $RequestLikeFileCount = 0
     $UsageFileCount = 0
+    $MaxPromptTokens = $null
+    $MaxCompletionTokens = $null
     $FileLines = New-Object "System.Collections.Generic.List[string]"
 
     $PromptPattern = '"(?:prompt_tokens|promptTokenCount|input_tokens|inputTokens)"\s*:\s*(\d+)'
@@ -7872,6 +7877,8 @@ function Get-ContextLifecycleOpenAiAudit {
             [void]$PromptValues.Add(
                 [string]$Match.Groups[1].Value
             )
+            $Value = [long]$Match.Groups[1].Value
+            if ($null -eq $MaxPromptTokens -or $Value -gt $MaxPromptTokens) { $MaxPromptTokens = $Value }
         }
 
         $CompletionValues = New-Object "System.Collections.Generic.List[string]"
@@ -7879,6 +7886,8 @@ function Get-ContextLifecycleOpenAiAudit {
             [void]$CompletionValues.Add(
                 [string]$Match.Groups[1].Value
             )
+            $Value = [long]$Match.Groups[1].Value
+            if ($null -eq $MaxCompletionTokens -or $Value -gt $MaxCompletionTokens) { $MaxCompletionTokens = $Value }
         }
 
         $HasExactDirective = (
@@ -7959,6 +7968,8 @@ function Get-ContextLifecycleOpenAiAudit {
         TotalBytes = $TotalBytes
         RequestLikeFileCount = $RequestLikeFileCount
         UsageFileCount = $UsageFileCount
+        MaxPromptTokens = $MaxPromptTokens
+        MaxCompletionTokens = $MaxCompletionTokens
         FileLines = @($FileLines.ToArray())
     }
 }
@@ -8542,6 +8553,25 @@ function Get-ContextLifecycleRolloverEvidence {
     }
 }
 
+function Get-ContextLifecycleTurnUsage {
+    param([AllowEmptyString()][string]$Text, [string]$Path)
+    $Cumulative = Get-ContextLifecycleCumulativeMetrics -Text $Text
+    $Audit = Get-ContextLifecycleOpenAiAudit -Path $Path
+    $PromptTokens = $Audit.MaxPromptTokens
+    $CompletionTokens = $Audit.MaxCompletionTokens
+    $Source = 'OPENAI_LOG_MAX_PER_REQUEST'
+    if ($null -eq $PromptTokens -and $null -eq $CompletionTokens) {
+        $Source = if ($null -ne $Cumulative.PromptTokens -or $null -ne $Cumulative.CompletionTokens) { 'QWEN_STREAM_MAX_CUMULATIVE_ONLY' } else { 'MISSING' }
+    }
+    $Status = if ($null -eq $PromptTokens -and $null -eq $CompletionTokens) { 'MISSING' }
+        elseif ($null -eq $PromptTokens -or $null -eq $CompletionTokens) { 'PARTIAL' } else { 'OBSERVED' }
+    return [pscustomobject]@{
+        Source = $Source; Status = $Status; PromptTokens = $PromptTokens; CompletionTokens = $CompletionTokens
+        CumulativePromptTokens = $Cumulative.PromptTokens; CumulativeCompletionTokens = $Cumulative.CompletionTokens
+        UsageFileCount = $Audit.UsageFileCount
+    }
+}
+
 function Invoke-ContextLifecycleRolloverStress {
     param(
         [Parameter(Mandatory = $true)]
@@ -8619,6 +8649,9 @@ function Invoke-ContextLifecycleRolloverStress {
     $RolloverTurn = 0
     $PostRolloverTurns = 0
     $RolloverCompleted = $false
+    $RolloverRequired = $false
+    $PreviousRequiredCount = 0
+    $PreviousCompletedCount = 0
     $CompletionPasses = 0
     $CompletionHistoryEntries = 0
     $RequiredReason = $null
@@ -8626,7 +8659,11 @@ function Invoke-ContextLifecycleRolloverStress {
     $RequiredAfter = $null
     $RequiredSafeTarget = $null
     $CompactionRequestTurns = 0
-    $MaxTurns = 7
+    $MaxDiscoveryTurns = 7
+    $DiscoveryTurns = 0
+    $ExecutedTurns = 0
+    $RetentionCalls = 0
+    $NotExercisedReason = $null
     $RequiredPostRolloverTurns = 2
     $PressureAttempt = 0
     $FirstCompactionObserved = $false
@@ -8663,6 +8700,8 @@ function Invoke-ContextLifecycleRolloverStress {
             $PressurePacketChars[$PressureIndex] = 52000
         }
     }
+    # Reserve the full pressure ladder and continuation even after late compaction.
+    $MaxTurns = $MaxDiscoveryTurns + $PressurePacketChars.Count + $RequiredPostRolloverTurns
 
     Write-Host ""
     Write-Host "========================================"
@@ -8670,6 +8709,7 @@ function Invoke-ContextLifecycleRolloverStress {
     Write-Host "========================================"
     Write-Host "SCOPE=ROOT_SAME_SESSION_FRESH_CHAT_ROLLOVER"
     Write-Host "TRIGGER=REAL_LOCALAI_CONTEXT_ROLLOVER_REQUIRED_PATH"
+    Write-Host "ROLLOVER_REQUIRED_TOKEN_SOURCE=RUNTIME_EFFECTIVE_CONTEXT_ESTIMATE"
     Write-Host "RUNTIME_TEST_HOOKS=NONE"
     Write-Host "PRESSURE_POLICY=AFTER_FIRST_PROVEN_COMPACTION_USE_HIGH_ENTROPY_CURRENT_PENDING_REQUEST"
     Write-Host (
@@ -8693,6 +8733,10 @@ function Invoke-ContextLifecycleRolloverStress {
     Write-Host "PRODUCTION_CONTEXT_OUTPUT_MARGIN_CHANGED=NO"
     Write-Host "ROLLOVER_REQUIRED_MINIMUM=1"
     Write-Host "ROLLOVER_COMPLETED_REQUIRED=1"
+    Write-Host "DISCOVERY_TURN_LIMIT=$MaxDiscoveryTurns"
+    Write-Host "PENDING_PRESSURE_ATTEMPT_LIMIT=$($PressurePacketChars.Count)"
+    Write-Host "STRESS_TURN_LIMIT=$MaxTurns"
+    Write-Host "RETENTION_CALL_LIMIT=1"
     Write-Host (
         "POST_ROLLOVER_TURNS_REQUIRED=" +
         $RequiredPostRolloverTurns
@@ -8741,17 +8785,19 @@ function Invoke-ContextLifecycleRolloverStress {
             $UsingPendingPressure = $false
 
             if ($RolloverCompleted) {
+                $Phase = 'POST_ROLLOVER'
                 $TargetChars = 1400
                 $Packet = New-ContextLifecyclePacket `
                     -Turn $Turn `
                     -TargetChars $TargetChars
             }
             elseif ($FirstCompactionObserved) {
-                $PressureSlot = [Math]::Min(
-                    $PressureAttempt,
-                    $PressurePacketChars.Count - 1
-                )
-                $TargetChars = [int]$PressurePacketChars[$PressureSlot]
+                if ($PressureAttempt -ge $PressurePacketChars.Count) {
+                    $NotExercisedReason = 'PENDING_PRESSURE_LIMIT_REACHED'
+                    break
+                }
+                $Phase = 'PENDING_PRESSURE'
+                $TargetChars = [int]$PressurePacketChars[$PressureAttempt]
                 $Packet = New-ContextLifecyclePendingPressurePacket `
                     -Turn $Turn `
                     -TargetChars $TargetChars
@@ -8759,6 +8805,12 @@ function Invoke-ContextLifecycleRolloverStress {
                 $PressureAttempt++
             }
             else {
+                if ($DiscoveryTurns -ge $MaxDiscoveryTurns) {
+                    $NotExercisedReason = 'FIRST_COMPACTION_NOT_OBSERVED'
+                    break
+                }
+                $Phase = 'COMPACTION_DISCOVERY'
+                $DiscoveryTurns++
                 $TargetChars = $BasePacketChars
                 $Packet = New-ContextLifecyclePacket `
                     -Turn $Turn `
@@ -8766,6 +8818,7 @@ function Invoke-ContextLifecycleRolloverStress {
             }
 
             [void]$Sentinels.Add([string]$Packet.Sentinel)
+            Write-Host "ROLLOVER_TURN_START index=$Turn phase=$Phase packet_chars=$($Packet.CharCount) pressure_attempt=$PressureAttempt"
 
             $TurnOpenAiDir = Join-Path `
                 $TempRoot `
@@ -8820,6 +8873,7 @@ function Invoke-ContextLifecycleRolloverStress {
 
                     $Timer.Stop()
                     $ExitCode = $LASTEXITCODE
+                    $ExecutedTurns++
                 }
                 finally {
                     $ErrorActionPreference = $OldPreference
@@ -8829,7 +8883,11 @@ function Invoke-ContextLifecycleRolloverStress {
                 Pop-Location
             }
 
+            $Usage = Get-ContextLifecycleTurnUsage -Text $QwenOutput -Path $TurnOpenAiDir
+
             if ($ExitCode -ne 0) {
+                Write-Host ("ROLLOVER_TURN index=$Turn phase=$Phase exit_code=$ExitCode usage_source=$($Usage.Source) usage_status=$($Usage.Status)" +
+                    " prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.PromptTokens) completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CompletionTokens)")
                 $FailureReason = (
                     "QWEN_EXIT_CODE_" +
                     $ExitCode +
@@ -8900,11 +8958,26 @@ function Invoke-ContextLifecycleRolloverStress {
             $Evidence = Get-ContextLifecycleRolloverEvidence `
                 -Text $QwenOutput `
                 -Files $ChangedJsonl
+            $TurnEvidence = Get-ContextLifecycleRolloverEvidence -Text $QwenOutput
 
             $CompletedNow = (
                 $Evidence.CompletedObserved -or
                 $Telemetry.ContextRolloverCompletedCount -gt 0
             )
+            if ($Evidence.RequiredObserved -or $Telemetry.ContextRolloverRequiredCount -gt 0) { $RolloverRequired = $true }
+            # Historical markers remain in resumed JSONL; only new turn evidence
+            # or an increase in cumulative telemetry indicates another rollover.
+            if (-not $RolloverCompleted -and ($TurnEvidence.RequiredCount -gt 1 -or $TurnEvidence.CompletedCount -gt 1 -or
+                $Telemetry.ContextRolloverCompletedCount -gt 1)) {
+                $FailureReason = 'MULTIPLE_ROLLOVERS_ON_FIRST_COMPLETED_TURN'
+            }
+            elseif ($RolloverCompleted -and ($TurnEvidence.RequiredObserved -or $TurnEvidence.CompletedObserved -or
+                $Telemetry.ContextRolloverRequiredCount -gt $PreviousRequiredCount -or
+                $Telemetry.ContextRolloverCompletedCount -gt $PreviousCompletedCount)) {
+                $FailureReason = 'ROLLOVER_REPEATED_DURING_CONTINUATION'
+            }
+            $PreviousRequiredCount = [Math]::Max($PreviousRequiredCount, $Telemetry.ContextRolloverRequiredCount)
+            $PreviousCompletedCount = [Math]::Max($PreviousCompletedCount, $Telemetry.ContextRolloverCompletedCount)
 
             if ($Evidence.RequiredObserved) {
                 $RequiredReason = $Evidence.Reason
@@ -8928,13 +9001,15 @@ function Invoke-ContextLifecycleRolloverStress {
                 $RolloverCompleted = $true
                 $RolloverTurn = $Turn
             }
-            elseif ($RolloverCompleted) {
+            elseif ($RolloverCompleted -and $null -eq $FailureReason -and $Telemetry.MaxTokensCount -eq 0 -and
+                $Telemetry.NoVisibleProgressCount -eq 0 -and $Telemetry.ToolCalls -eq 0) {
                 $PostRolloverTurns++
             }
 
             Write-Host (
                 "ROLLOVER_TURN index=" +
                 $Turn +
+                " phase=" + $Phase +
                 " packet_chars=" +
                 $Packet.CharCount +
                 " wall=" +
@@ -8954,6 +9029,13 @@ function Invoke-ContextLifecycleRolloverStress {
                 $UsingPendingPressure +
                 " pressure_attempt=" +
                 $PressureAttempt +
+                " usage_source=" + $Usage.Source +
+                " usage_status=" + $Usage.Status +
+                " prompt_tokens=" + (Convert-ContextLifecycleAuditValue $Usage.PromptTokens) +
+                " completion_tokens=" + (Convert-ContextLifecycleAuditValue $Usage.CompletionTokens) +
+                " cli_cumulative_prompt_tokens=" + (Convert-ContextLifecycleAuditValue $Usage.CumulativePromptTokens) +
+                " cli_cumulative_completion_tokens=" + (Convert-ContextLifecycleAuditValue $Usage.CumulativeCompletionTokens) +
+                " openai_usage_files=" + $Usage.UsageFileCount +
                 " required_marker=" +
                 $Evidence.RequiredObserved +
                 " completed_marker=" +
@@ -8975,6 +9057,7 @@ function Invoke-ContextLifecycleRolloverStress {
                 " tool_calls=" +
                 $Telemetry.ToolCalls
             )
+            if ($null -ne $FailureReason) { break }
 
             if ($Telemetry.MaxTokensCount -gt 0) {
                 $FailureReason = "MAX_TOKENS_OBSERVED"
@@ -9004,8 +9087,15 @@ function Invoke-ContextLifecycleRolloverStress {
             $null -eq $FailureReason -and
             -not $RolloverCompleted
         ) {
-            $FailureReason = "ROLLOVER_NOT_EXERCISED"
+            if ($RolloverRequired) {
+                $FailureReason = 'ROLLOVER_REQUIRED_WITHOUT_COMPLETION'
+            }
+            else {
+                $FailureReason = 'ROLLOVER_NOT_EXERCISED'
+                if ($null -eq $NotExercisedReason) { $NotExercisedReason = 'STRESS_TURN_LIMIT_REACHED' }
+            }
         }
+        if ($null -eq $FailureReason -and -not $RolloverRequired) { $FailureReason = 'ROLLOVER_REQUIRED_EVIDENCE_MISSING' }
 
         if (
             $null -eq $FailureReason -and
@@ -9062,6 +9152,7 @@ function Invoke-ContextLifecycleRolloverStress {
                         Out-String
                     )
                     $RecallExit = $LASTEXITCODE
+                    $RetentionCalls++
                 }
                 finally {
                     $ErrorActionPreference = $OldPreference
@@ -9071,6 +9162,11 @@ function Invoke-ContextLifecycleRolloverStress {
                 Pop-Location
             }
 
+            $Usage = Get-ContextLifecycleTurnUsage -Text $RecallOutput -Path $RecallOpenAiDir
+            Write-Host ("ROLLOVER_RETENTION phase=RETENTION exit_code=$RecallExit usage_source=$($Usage.Source) usage_status=$($Usage.Status)" +
+                " prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.PromptTokens) completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CompletionTokens)" +
+                " cli_cumulative_prompt_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CumulativePromptTokens) cli_cumulative_completion_tokens=$(Convert-ContextLifecycleAuditValue $Usage.CumulativeCompletionTokens)" +
+                " openai_usage_files=$($Usage.UsageFileCount)")
             if ($RecallExit -ne 0) {
                 $FailureReason = (
                     "RETENTION_RECALL_EXIT_CODE_" +
@@ -9106,6 +9202,15 @@ function Invoke-ContextLifecycleRolloverStress {
 
             $FinalTelemetry = Get-RoleAwareTelemetrySummary `
                 -Files $ChangedJsonl
+            $RecallEvidence = Get-ContextLifecycleRolloverEvidence -Text $RecallOutput
+            if ($null -eq $FailureReason) {
+                if ($RecallEvidence.RequiredObserved -or $RecallEvidence.CompletedObserved -or
+                    $FinalTelemetry.ContextRolloverRequiredCount -gt $PreviousRequiredCount -or
+                    $FinalTelemetry.ContextRolloverCompletedCount -gt $PreviousCompletedCount) { $FailureReason = 'ROLLOVER_DURING_RETENTION' }
+                elseif ($FinalTelemetry.MaxTokensCount -gt 0) { $FailureReason = 'MAX_TOKENS_OBSERVED' }
+                elseif ($FinalTelemetry.NoVisibleProgressCount -gt 0) { $FailureReason = 'NO_VISIBLE_PROGRESS_OBSERVED' }
+                elseif ($FinalTelemetry.ToolCalls -gt 0) { $FailureReason = 'UNEXPECTED_TOOL_CALLS' }
+            }
         }
     }
     catch {
@@ -9178,6 +9283,11 @@ function Invoke-ContextLifecycleRolloverStress {
         "ROLLOVER_COMPLETED=" +
         $RolloverCompleted
     )
+    Write-Host "ROLLOVER_REQUIRED_OBSERVED=$RolloverRequired"
+    Write-Host "EXECUTED_STRESS_TURNS=$ExecutedTurns"
+    Write-Host "EXECUTED_RETENTION_CALLS=$RetentionCalls"
+    Write-Host "DISCOVERY_TURNS=$DiscoveryTurns"
+    Write-Host "STRESS_TURN_LIMIT=$MaxTurns"
     Write-Host (
         "ROLLOVER_COMPLETION_PASSES=" +
         $CompletionPasses
@@ -9246,6 +9356,7 @@ function Invoke-ContextLifecycleRolloverStress {
         Write-Host "RETENTION_PASS=False"
 
         if ($FailureReason -eq "ROLLOVER_NOT_EXERCISED") {
+            Write-Host "NOT_EXERCISED_REASON=$NotExercisedReason"
             Write-Host "CONTEXT_LIFECYCLE_ROLLOVER_STRESS=NOT_EXERCISED"
         }
         else {
