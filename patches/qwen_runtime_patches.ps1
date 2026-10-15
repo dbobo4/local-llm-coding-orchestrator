@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$PatchManagerRevision = 3
+$PatchManagerRevision = 4
 $Root = Split-Path $PSScriptRoot -Parent
 $ConfigPath = Join-Path $Root ".localai\config\local.ps1"
 
@@ -73,6 +73,9 @@ function Test-QwenRuntimePatchState {
     }
     $chunk = Join-Path $RuntimeRoot "lib\chunks\chunk-PZ66FRIC.js"
     $text = [IO.File]::ReadAllText($chunk)
+    if ((Get-WorkflowCompatibilityState $text) -ne "patched") {
+        throw "Runtime verification failed; workflow compatibility is missing or unapproved."
+    }
     foreach ($marker in $RequiredRuntimeMarkers) {
         if (-not $text.Contains($marker)) {
             throw "Runtime verification failed; marker missing: $marker"
@@ -142,6 +145,614 @@ function Invoke-ReportFindingsGrammarPatch {
     Assert-LocalPath $path
     $text = [IO.File]::ReadAllText($path)
     $patched = Apply-ReportFindingsGrammarCompatibility $text
+    if ($patched -cne $text) {
+        $bytes = [IO.File]::ReadAllBytes($path)
+        $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
+        [IO.File]::WriteAllText($path, $patched, [Text.UTF8Encoding]::new($bom))
+    }
+}
+
+# PATCH BLOCK: workflow-continuation-compatibility
+# Only exact pinned scheduler/hook boundaries change; all earlier policy blocks remain intact.
+$WorkflowCompatibilityAnchors = @(
+    [pscustomobject]@{ Id = "todo-schema"; Count = 1; Old = @'
+        todo_id: {
+          type: "string",
+          maxLength: 500,
+'@
+        New = @'
+        todo_id: {
+          type: "string",
+          // LOCALAI_WORKFLOW_COMPATIBILITY_V1_TODO
+          minLength: 1,
+          maxLength: 500,
+'@
+    },
+    [pscustomobject]@{ Id = "optional-todo-normalization"; Count = 1; Old = @'
+      const requestsToProcess = dedupeRequestsByCallId(
+        Array.isArray(request) ? request : [request]
+      ).map((item) => ({ ...item, args: structuredClone(item.args) }));
+'@
+        New = @'
+      // LOCALAI_WORKFLOW_COMPATIBILITY_V1_NORMALIZE
+      const requestsToProcess = dedupeRequestsByCallId(
+        Array.isArray(request) ? request : [request]
+      ).map((item) => {
+        const args = structuredClone(item.args);
+        if (canonicalToolName(item.name) === ToolNames.AGENT && args && typeof args === "object" && !Array.isArray(args) && args.todo_id === "") {
+          delete args.todo_id;
+        }
+        return { ...item, args };
+      });
+'@
+    },
+    [pscustomobject]@{ Id = "parameter-failure-hook"; Count = 1; Old = @'
+            const finalError = count >= VALIDATION_RETRY_LOOP_THRESHOLD ? new Error(
+              `${invocationOrError.message}${RETRY_LOOP_STOP_DIRECTIVE}`
+            ) : displayError;
+'@
+        New = @'
+            let finalError = count >= VALIDATION_RETRY_LOOP_THRESHOLD ? new Error(
+              `${invocationOrError.message}${RETRY_LOOP_STOP_DIRECTIVE}`
+            ) : displayError;
+            // LOCALAI_WORKFLOW_COMPATIBILITY_V1_PARAMETER_FAILURE
+            if (canonicalToolName(reqInfo.name) === ToolNames.AGENT && !this.config.getDisableAllHooks() && this.config.getMessageBus()) {
+              const failureHook = await safelyFirePostToolUseFailureHook(
+                this.config.getMessageBus(), reqInfo.callId, ToolNames.AGENT, reqInfo.args,
+                "LOCALAI_AGENT_PARAMETER_ERROR: " + invocationOrError.message, false,
+                this.config.getApprovalMode(), reqInfo.callId
+              );
+              const context = typeof failureHook.additionalContext === "string" ? failureHook.additionalContext.slice(0, 4096) : "";
+              if (context) {
+                finalError = new Error(context.startsWith("LOCALAI_WORKFLOW_INCOMPLETE:") ? context : finalError.message + "\n" + context);
+              }
+            }
+'@
+    },
+    [pscustomobject]@{ Id = "subagent-continuation"; Count = 2; Old = @'
+        if (!typedStopOutput?.isBlockingDecision() && !typedStopOutput?.shouldStopExecution()) {
+          return void 0;
+        }
+'@
+        New = @'
+        if (!typedStopOutput?.isBlockingDecision() && !typedStopOutput?.shouldStopExecution()) {
+          // LOCALAI_WORKFLOW_COMPATIBILITY_V1_SUBAGENT_CONTINUATION
+          const message = typedStopOutput?.systemMessage;
+          return typeof message === "string" && message.startsWith("LOCALAI_ROOT_CONTINUATION:") ? message.slice(0, 4096) : void 0;
+        }
+'@
+    },
+    [pscustomobject]@{ Id = "current-tool-response-pause"; Count = 1; Old = @'
+  async *sendMessageStream(request, callerSignal, prompt_id, options2, turns = MAX_TURNS2) {
+    const messageType = options2?.type ?? "userQuery" /* UserQuery */;
+'@
+        New = @'
+  async *sendMessageStream(request, callerSignal, prompt_id, options2, turns = MAX_TURNS2) {
+    // LOCALAI_WORKFLOW_COMPATIBILITY_V1_CURRENT_AGENT_PAUSE
+    for (const part of Array.isArray(request) ? request : [request]) {
+      const response = part?.functionResponse;
+      const error = response?.response?.error;
+      if (response && canonicalToolName(response.name) === ToolNames.AGENT && typeof error === "string" && error.startsWith("LOCALAI_WORKFLOW_INCOMPLETE:")) {
+        throw new Error(error.slice(0, 4096));
+      }
+    }
+    const messageType = options2?.type ?? "userQuery" /* UserQuery */;
+'@
+    },
+    [pscustomobject]@{ Id = "real-user-submit"; Count = 1; Old = @'
+        const submittedPrompt = messageType === "userQuery" /* UserQuery */ && typeof options2?.submittedPrompt === "string" && options2.submittedPrompt.trim().length > 0 ? options2.submittedPrompt : void 0;
+'@
+        New = @'
+        // LOCALAI_WORKFLOW_COMPATIBILITY_V1_REAL_USER_SUBMIT
+        const submittedPrompt = messageType === "userQuery" /* UserQuery */ ? typeof options2?.submittedPrompt === "string" && options2.submittedPrompt.trim().length > 0 ? options2.submittedPrompt : preHookUserPromptText : void 0;
+'@
+    },
+    [pscustomobject]@{ Id = "root-paused-or-capped-stop"; Count = 1; Old = @'
+        const stopOutput = hookOutput;
+        if (stopOutput?.systemMessage) {
+'@
+        New = @'
+        const stopOutput = hookOutput;
+        // LOCALAI_WORKFLOW_COMPATIBILITY_V1_ROOT_STOP
+        const localAiStopMessage = stopOutput?.systemMessage;
+        const localAiRawMetadata = stopOutput?.hookSpecificOutput?.localai_workflow;
+        const localAiWorkflowMetadata = (stopOutput?.isBlockingDecision() || stopOutput?.shouldStopExecution()) && localAiRawMetadata?.version === 1 && localAiRawMetadata.session_id === this.config.getSessionId() && typeof localAiRawMetadata.turn_id === "string" && localAiRawMetadata.turn_id.length > 0 && Number.isSafeInteger(localAiRawMetadata.progress_epoch) && localAiRawMetadata.progress_epoch >= 0 && Number.isSafeInteger(localAiRawMetadata.stagnation_count) && localAiRawMetadata.stagnation_count > 0 ? localAiRawMetadata : void 0;
+        if ((stopOutput?.isBlockingDecision() || stopOutput?.shouldStopExecution()) && typeof localAiStopMessage === "string") {
+          const localAiPaused = localAiStopMessage.startsWith("LOCALAI_WORKFLOW_INCOMPLETE:");
+          const localAiCapped = localAiStopMessage.startsWith("LOCALAI_ROOT_CONTINUATION:") && (localAiWorkflowMetadata ? localAiWorkflowMetadata.stagnation_count : (options2?.stopHookState?.iterationCount ?? 0) + 1) >= this.config.getStopHookBlockingCap();
+          if (localAiPaused || localAiCapped) {
+            const errorMessage = localAiPaused ? localAiStopMessage : "LOCALAI_WORKFLOW_INCOMPLETE: Root workflow remains unfinished at the Stop continuation limit.";
+            endCurrentInteraction("error", errorMessage, "localai_workflow_incomplete");
+            throw new Error(errorMessage.slice(0, 4096));
+          }
+        }
+        if (stopOutput?.systemMessage) {
+'@
+    },
+    [pscustomobject]@{ Id = "actual-child-owner"; Count = 1; Old = @'
+    const sourceType = this.config.getSessionSourceType();
+    const sourceId = this.config.getSessionSourceId();
+    return {
+      session_id: this.config.getSessionId(),
+'@
+        New = @'
+    // LOCALAI_WORKFLOW_COMPATIBILITY_V2_OWNER
+    const owner = subagentIdentityContext.getStore();
+    const childOwner = owner && typeof owner.id === "string" && owner.id.length > 0 && typeof owner.type === "string";
+    const sourceType = childOwner ? "subagent" : this.config.getSessionSourceType();
+    const sourceId = childOwner ? owner.id : this.config.getSessionSourceId();
+    return {
+      session_id: this.config.getSessionId(),
+      ...childOwner ? { agent_id: owner.id, agent_type: owner.type } : {},
+'@
+    },
+    [pscustomobject]@{ Id = "start-owner-payload"; Count = 1; Old = @'
+  async fireSubagentStartEvent(agentId, agentType, permissionMode, signal) {
+    const input = {
+'@
+        New = @'
+  async fireSubagentStartEvent(agentId, agentType, permissionMode, signal, parentToolCallId) {
+    // LOCALAI_WORKFLOW_COMPATIBILITY_V2_START_CALL
+    const input = {
+      parent_tool_call_id: parentToolCallId,
+'@
+    },
+    [pscustomobject]@{ Id = "start-owner-forward"; Count = 1; Old = @'
+  async fireSubagentStartEvent(agentId, agentType, permissionMode, signal) {
+    const result = await this.hookEventHandler.fireSubagentStartEvent(
+      agentId,
+      agentType,
+      permissionMode,
+      signal
+    );
+'@
+        New = @'
+  async fireSubagentStartEvent(agentId, agentType, permissionMode, signal, parentToolCallId) {
+    const result = await this.hookEventHandler.fireSubagentStartEvent(
+      agentId,
+      agentType,
+      permissionMode,
+      signal,
+      parentToolCallId
+    );
+'@
+    },
+    [pscustomobject]@{ Id = "foreground-start-admission"; Count = 1; Old = @'
+            agentType,
+            resolvedMode,
+            signal
+          );
+          const additionalContext = startHookOutput?.getAdditionalContext();
+'@
+        New = @'
+            agentType,
+            resolvedMode,
+            signal,
+            this.callId
+          );
+          // LOCALAI_WORKFLOW_COMPATIBILITY_V2_START_GUARD
+          if (startHookOutput?.isBlockingDecision() || startHookOutput?.shouldStopExecution()) {
+            const error = new Error("LOCALAI_WORKFLOW_INCOMPLETE: Specialist start admission was denied.");
+            error.localAiAdmissionDenied = true;
+            throw error;
+          }
+          const additionalContext = startHookOutput?.getAdditionalContext();
+'@
+    },
+    [pscustomobject]@{ Id = "foreground-start-no-failopen"; Count = 1; Old = @'
+        } catch (hookError) {
+          debugLogger37.warn(
+            `[Agent] SubagentStart hook failed, continuing execution: ${hookError}`
+'@
+        New = @'
+        } catch (hookError) {
+          if (hookError?.localAiAdmissionDenied === true) throw hookError;
+          debugLogger37.warn(
+            `[Agent] SubagentStart hook failed, continuing execution: ${hookError}`
+'@
+    },
+    [pscustomobject]@{ Id = "foreground-start-outer-error"; Count = 1; Old = @'
+    } catch (error3) {
+      opts.recordSpanOutcome?.(
+'@
+        New = @'
+    } catch (error3) {
+      if (error3?.localAiAdmissionDenied === true) throw error3;
+      opts.recordSpanOutcome?.(
+'@
+    },
+    [pscustomobject]@{ Id = "stop-owner-payload"; Count = 1; Old = @'
+  async fireSubagentStopEvent(agentId, agentType, agentTranscriptPath, lastAssistantMessage, stopHookActive, permissionMode, signal, terminateReason) {
+    // LOCALAI_SPECIALIST_GROWTH_TERMINATION_V5_5
+    const input = {
+'@
+        New = @'
+  async fireSubagentStopEvent(agentId, agentType, agentTranscriptPath, lastAssistantMessage, stopHookActive, permissionMode, signal, terminateReason, parentToolCallId) {
+    // LOCALAI_SPECIALIST_GROWTH_TERMINATION_V5_5
+    const input = {
+      parent_tool_call_id: parentToolCallId,
+'@
+    },
+    [pscustomobject]@{ Id = "stop-owner-forward"; Count = 1; Old = @'
+      signal,
+      terminateReason
+    );
+    return result.finalOutput ? createHookOutput("SubagentStop", result.finalOutput) : void 0;
+'@
+        New = @'
+      signal,
+      terminateReason,
+      parentToolCallId
+    );
+    return result.finalOutput ? createHookOutput("SubagentStop", result.finalOutput) : void 0;
+'@
+    },
+    [pscustomobject]@{ Id = "stop-owner-signature"; Count = 1; Old = @'
+  async fireSubagentStopEvent(agentId, agentType, agentTranscriptPath, lastAssistantMessage, stopHookActive, permissionMode, signal, terminateReason) {
+    const result
+'@
+        New = @'
+  async fireSubagentStopEvent(agentId, agentType, agentTranscriptPath, lastAssistantMessage, stopHookActive, permissionMode, signal, terminateReason, parentToolCallId) {
+    const result
+'@
+    },
+    [pscustomobject]@{ Id = "stop-owner-invocation"; Count = 2; Old = @'
+          signal,
+          subagent.getTerminateMode()
+        );
+'@
+        New = @'
+          signal,
+          subagent.getTerminateMode(),
+          this.callId
+        );
+'@
+    },
+    [pscustomobject]@{ Id = "stop-progress-count"; Count = 2; Old = @'
+          const currentIterationCount = (options2?.stopHookState?.iterationCount ?? 0) + 1;
+          const currentReasons = [
+            ...options2?.stopHookState?.reasons ?? [],
+            continueReason
+          ];
+'@
+        New = @'
+          const currentIterationCount = localAiWorkflowMetadata ? localAiWorkflowMetadata.stagnation_count : (options2?.stopHookState?.iterationCount ?? 0) + 1;
+          const currentReasons = [
+            ...options2?.stopHookState?.reasons ?? [],
+            continueReason
+          ].slice(localAiWorkflowMetadata ? -this.config.getStopHookBlockingCap() : 0);
+'@
+    },
+    [pscustomobject]@{ Id = "agent-terminal-phase"; Count = 1; Old = @'
+  async _executeToolCallBody(scheduledCall, signal, span) {
+    const localAiPromptBlockedTools = [
+'@
+        New = @'
+  async _executeToolCallBody(scheduledCall, signal, span) {
+    // LOCALAI_WORKFLOW_COMPATIBILITY_V3_AGENT_PHASE
+    const commitFailure = async (status, response) => {
+      const ownedPhase = canonicalToolName(scheduledCall.request.name) === ToolNames.AGENT && response.executionStatus === "not_started";
+      if (ownedPhase) {
+        this.localAiPendingFailureCommits ??= new Set();
+        this.localAiPendingFailureCommits.add(scheduledCall.request.callId);
+      }
+      try {
+        const phase = response.executionStatus;
+        if (ownedPhase && !this.config.getDisableAllHooks() && this.config.getMessageBus()) {
+          const parts = response.responseParts;
+          const modelResponse = Array.isArray(parts) ? parts.find((part) => part.functionResponse)?.functionResponse?.response : void 0;
+          const failure = await safelyFirePostToolUseFailureHook(
+            this.config.getMessageBus(), scheduledCall.request.callId, ToolNames.AGENT,
+            invocation.params, typeof modelResponse?.error === "string" ? modelResponse.error : "Agent execution did not complete.",
+            status === "cancelled", this.config.getApprovalMode(), scheduledCall.request.callId, phase
+          );
+          const context = typeof failure.additionalContext === "string" ? failure.additionalContext.slice(0, 4096) : "";
+          if (context && modelResponse && typeof modelResponse.error === "string") {
+            modelResponse.error = context.startsWith("LOCALAI_WORKFLOW_INCOMPLETE:") ? context : modelResponse.error + "\n" + context;
+            response.error = new Error(modelResponse.error);
+            response.contentLength = modelResponse.error.length;
+            if (typeof response.resultDisplay === "string") response.resultDisplay = modelResponse.error;
+          }
+        }
+      } catch {
+        debugLogger34.warn("LocalAI Agent phase callback unavailable; no retirement proof was delivered.");
+      } finally {
+        if (ownedPhase) this.localAiPendingFailureCommits.delete(scheduledCall.request.callId);
+      }
+      this.setStatusInternal(scheduledCall.request.callId, status, response);
+    };
+    const waitForGuard = async (guard, context) => {
+      if (canonicalToolName(scheduledCall.request.name) !== ToolNames.AGENT) return evaluateToolInvocationGuard(guard, context);
+      let onAbort;
+      const cancelled = new Promise((resolve) => {
+        onAbort = () => resolve({ allowed: false, reason: "Tool call cancelled before execution." });
+        context.signal.addEventListener("abort", onAbort, { once: true });
+        if (context.signal.aborted) onAbort();
+      });
+      try {
+        return await Promise.race([evaluateToolInvocationGuard(guard, context), cancelled]);
+      } finally {
+        context.signal.removeEventListener("abort", onAbort);
+      }
+    };
+    const localAiPromptBlockedTools = [
+'@
+    },
+    [pscustomobject]@{ Id = "agent-not-started-error-commit"; Count = 2; Old = @'
+        observeSyntheticProducer(errorResponse);
+        this.setStatusInternal(callId, "error", errorResponse);
+'@
+        New = @'
+        observeSyntheticProducer(errorResponse);
+        await commitFailure("error", errorResponse);
+'@
+    },
+    [pscustomobject]@{ Id = "agent-not-started-cancel-commit"; Count = 2; Old = @'
+        observeSyntheticProducer(cancelledResponse);
+        this.setStatusInternal(callId, "cancelled", cancelledResponse);
+'@
+        New = @'
+        observeSyntheticProducer(cancelledResponse);
+        await commitFailure("cancelled", cancelledResponse);
+'@
+    },
+    [pscustomobject]@{ Id = "safe-failure-phase-forward"; Count = 1; Old = @'
+async function safelyFirePostToolUseFailureHook(messageBus, toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, tool_call_id) {
+  try {
+    return await firePostToolUseFailureHook(
+      messageBus,
+      toolUseId,
+      toolName,
+      toolInput,
+      errorMessage,
+      isInterrupt,
+      permissionMode,
+      void 0,
+      tool_call_id
+    );
+'@
+        New = @'
+async function safelyFirePostToolUseFailureHook(messageBus, toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, tool_call_id, executionStatus) {
+  try {
+    return await firePostToolUseFailureHook(
+      messageBus,
+      toolUseId,
+      toolName,
+      toolInput,
+      errorMessage,
+      isInterrupt,
+      permissionMode,
+      void 0,
+      tool_call_id,
+      executionStatus
+    );
+'@
+    },
+    [pscustomobject]@{ Id = "failure-message-phase"; Count = 1; Old = @'
+async function firePostToolUseFailureHook(messageBus, toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, signal, tool_call_id) {
+'@
+        New = @'
+async function firePostToolUseFailureHook(messageBus, toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, signal, tool_call_id, executionStatus) {
+'@
+    },
+    [pscustomobject]@{ Id = "failure-message-input-phase"; Count = 1; Old = @'
+          error: errorMessage,
+          is_interrupt: isInterrupt
+        },
+'@
+        New = @'
+          error: errorMessage,
+          is_interrupt: isInterrupt,
+          ...executionStatus !== void 0 ? { execution_status: executionStatus } : {}
+        },
+'@
+    },
+    [pscustomobject]@{ Id = "failure-system-phase"; Count = 1; Old = @'
+  async firePostToolUseFailureEvent(toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, signal, tool_call_id) {
+    const result = await this.hookEventHandler.firePostToolUseFailureEvent(
+      toolUseId,
+      toolName,
+      toolInput,
+      errorMessage,
+      isInterrupt,
+      permissionMode,
+      signal,
+      tool_call_id
+    );
+'@
+        New = @'
+  async firePostToolUseFailureEvent(toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, signal, tool_call_id, executionStatus) {
+    const result = await this.hookEventHandler.firePostToolUseFailureEvent(
+      toolUseId,
+      toolName,
+      toolInput,
+      errorMessage,
+      isInterrupt,
+      permissionMode,
+      signal,
+      tool_call_id,
+      executionStatus
+    );
+'@
+    },
+    [pscustomobject]@{ Id = "failure-handler-phase"; Count = 1; Old = @'
+  async firePostToolUseFailureEvent(toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, signal, tool_call_id) {
+    const input = {
+'@
+        New = @'
+  async firePostToolUseFailureEvent(toolUseId, toolName, toolInput, errorMessage, isInterrupt, permissionMode, signal, tool_call_id, executionStatus) {
+    const input = {
+      ...executionStatus !== void 0 ? { execution_status: executionStatus } : {},
+'@
+    },
+    [pscustomobject]@{ Id = "failure-replay-phase"; Count = 1; Old = @'
+                  input["error"] || "",
+                  input["is_interrupt"],
+                  input["permission_mode"] || "default",
+                  signal,
+                  input["tool_call_id"] || void 0
+                );
+'@
+        New = @'
+                  input["error"] || "",
+                  input["is_interrupt"],
+                  input["permission_mode"] || "default",
+                  signal,
+                  input["tool_call_id"] || void 0,
+                  input["execution_status"]
+                );
+'@
+    },
+    [pscustomobject]@{ Id = "agent-failure-updated-input"; Count = 4; Old = @'
+            () => safelyFirePostToolUseFailureHook(
+              messageBus,
+              toolUseId,
+              canonicalName,
+              toolInput,
+'@
+        New = @'
+            () => safelyFirePostToolUseFailureHook(
+              messageBus,
+              toolUseId,
+              canonicalName,
+              canonicalName === ToolNames.AGENT ? invocation.params : toolInput,
+'@
+    },
+    [pscustomobject]@{ Id = "agent-phase-abort-drain-order"; Count = 1; Old = @'
+          if (call?.status !== "awaiting_approval" && call?.status !== "scheduled") {
+'@
+        New = @'
+          // The owned phase callback commits its terminal response after its hook completes.
+          if (this.localAiPendingFailureCommits?.has(callId) || (call?.status !== "awaiting_approval" && call?.status !== "scheduled")) {
+'@
+    },
+    [pscustomobject]@{ Id = "agent-guard-abort-wait"; Count = 1; Old = @'
+      const guardDecision = await evaluateToolInvocationGuard(
+'@
+        New = @'
+      const guardDecision = await waitForGuard(
+'@
+    },
+    [pscustomobject]@{ Id = "managed-start-configuration"; Count = 1; Old = @'
+__name(deriveSubagentExceptionMetadata, "deriveSubagentExceptionMetadata");
+var AgentToolInvocation = class extends BaseToolInvocation {
+'@
+        New = @'
+__name(deriveSubagentExceptionMetadata, "deriveSubagentExceptionMetadata");
+function localAiRequiresStartAdmission(config) {
+  const groups = config.getUserHooks?.()?.SubagentStart;
+  return Array.isArray(groups) && groups.some((group) => Array.isArray(group?.hooks) && group.hooks.some((hook) => hook?.name === "qwen-orchestration-dispatcher"));
+}
+function localAiStartAdmissionError() {
+  const error = new Error("LOCALAI_WORKFLOW_INCOMPLETE: Specialist start admission could not be verified.");
+  error.localAiAdmissionDenied = true;
+  return error;
+}
+var AgentToolInvocation = class extends BaseToolInvocation {
+'@
+    },
+    [pscustomobject]@{ Id = "managed-start-response"; Count = 1; Old = @'
+    const hookSystem = this.config.getHookSystem();
+    contextState.set("hook_context", "");
+    try {
+'@
+        New = @'
+    const localAiNativeHookSystem = this.config.getHookSystem();
+    // LOCALAI_WORKFLOW_COMPATIBILITY_V4_START_RECEIPT
+    const localAiManagedStart = localAiRequiresStartAdmission(this.config);
+    const hookSystem = localAiManagedStart && localAiNativeHookSystem ? {
+      fireSubagentStartEvent: async (...args) => {
+        try {
+          const output = await localAiNativeHookSystem.fireSubagentStartEvent(...args);
+          if (!output || typeof output !== "object" || Array.isArray(output) || output.continue !== true ||
+            (output.decision !== void 0 && !["allow", "approve"].includes(output.decision)) ||
+            typeof output.isBlockingDecision !== "function" || typeof output.shouldStopExecution !== "function" ||
+            typeof output.getAdditionalContext !== "function" || output.isBlockingDecision() !== false || output.shouldStopExecution() !== false) {
+            throw localAiStartAdmissionError();
+          }
+          output.getAdditionalContext();
+          return output;
+        } catch {
+          throw localAiStartAdmissionError();
+        }
+      }
+    } : localAiNativeHookSystem;
+    contextState.set("hook_context", "");
+    if (localAiManagedStart && !hookSystem) throw localAiStartAdmissionError();
+    try {
+'@
+    },
+    [pscustomobject]@{ Id = "managed-start-aggregate"; Count = 1; Old = @'
+    return result.finalOutput ? createHookOutput("SubagentStart", result.finalOutput) : void 0;
+'@
+        New = @'
+    if (localAiRequiresStartAdmission(this.hookEventHandler.config) && (result?.success !== true || !Array.isArray(result.errors) || result.errors.length !== 0)) {
+      throw localAiStartAdmissionError();
+    }
+    const output = result.finalOutput ? createHookOutput("SubagentStart", result.finalOutput) : void 0;
+    return output;
+'@
+    }
+)
+
+function Get-WorkflowCompatibilityState {
+    param([Parameter(Mandatory=$true)][string]$Text)
+    $normalized = $Text.Replace("`r`n", "`n")
+    $root = $WorkflowCompatibilityAnchors | Where-Object Id -eq "root-paused-or-capped-stop"
+    $legacyRoot = $root.New.Replace("`r`n", "`n")
+    $legacyRoot = [regex]::Replace($legacyRoot, '(?m)^        const localAi(?:RawMetadata|WorkflowMetadata) = .*\n', '')
+    $legacyRoot = $legacyRoot.Replace('(localAiWorkflowMetadata ? localAiWorkflowMetadata.stagnation_count : (options2?.stopHookState?.iterationCount ?? 0) + 1)', '(options2?.stopHookState?.iterationCount ?? 0) + 1')
+    $previous = [regex]::Matches($normalized, [regex]::Escape($legacyRoot)).Count -eq 1
+    if ($previous) { $normalized = $normalized.Replace($legacyRoot, $root.Old.Replace("`r`n", "`n")) }
+    $states = @()
+    foreach ($anchor in $WorkflowCompatibilityAnchors) {
+        $old = $anchor.Old.Replace("`r`n", "`n")
+        $new = $anchor.New.Replace("`r`n", "`n")
+        $oldCount = [regex]::Matches($normalized, [regex]::Escape($old)).Count
+        $newCount = [regex]::Matches($normalized, [regex]::Escape($new)).Count
+        if ($oldCount -eq $anchor.Count -and $newCount -eq 0) { $states += "unpatched" }
+        elseif ($newCount -eq $anchor.Count -and $oldCount -eq 0) { $states += "patched" }
+        else { return "incompatible" }
+    }
+    $unique = @($states | Select-Object -Unique)
+    if ($previous -and @($states[0..5] | Where-Object { $_ -ne "patched" }).Count -eq 0 -and
+        @($states[6..($states.Count - 1)] | Where-Object { $_ -ne "unpatched" }).Count -eq 0) { return "previous" }
+    # The prior V2 manifest has exactly 18 approved anchors; added phase anchors must all be original.
+    if (-not $previous -and @($states[0..17] | Where-Object { $_ -ne "patched" }).Count -eq 0 -and
+        @($states[18..($states.Count - 1)] | Where-Object { $_ -ne "unpatched" }).Count -eq 0) { return "previous_v2" }
+    # V3 has 30 exact approved anchors; Start receipt additions must remain original.
+    if (-not $previous -and @($states[0..29] | Where-Object { $_ -ne "patched" }).Count -eq 0 -and
+        @($states[30..($states.Count - 1)] | Where-Object { $_ -ne "unpatched" }).Count -eq 0) { return "previous_v3" }
+    if ($unique.Count -ne 1) { return "incompatible" }
+    return $unique[0]
+}
+
+function Apply-WorkflowCompatibility {
+    param([Parameter(Mandatory=$true)][string]$Text)
+    $state = Get-WorkflowCompatibilityState $Text
+    if ($state -eq "patched") { return $Text }
+    if ($state -notin @("unpatched", "previous", "previous_v2", "previous_v3")) { throw "Unapproved workflow boundary; refusing compatibility patch." }
+    $patched = $Text.Replace("`r`n", "`n")
+    if ($state -eq "previous") {
+        $root = $WorkflowCompatibilityAnchors | Where-Object Id -eq "root-paused-or-capped-stop"
+        $legacyRoot = $root.New.Replace("`r`n", "`n")
+        $legacyRoot = [regex]::Replace($legacyRoot, '(?m)^        const localAi(?:RawMetadata|WorkflowMetadata) = .*\n', '')
+        $legacyRoot = $legacyRoot.Replace('(localAiWorkflowMetadata ? localAiWorkflowMetadata.stagnation_count : (options2?.stopHookState?.iterationCount ?? 0) + 1)', '(options2?.stopHookState?.iterationCount ?? 0) + 1')
+        $patched = $patched.Replace($legacyRoot, $root.New.Replace("`r`n", "`n"))
+    }
+    foreach ($anchor in $WorkflowCompatibilityAnchors) {
+        $patched = $patched.Replace($anchor.Old.Replace("`r`n", "`n"), $anchor.New.Replace("`r`n", "`n"))
+    }
+    if ((Get-WorkflowCompatibilityState $patched) -ne "patched") { throw "Workflow compatibility integrity failed." }
+    if ($Text.Contains("`r`n")) { $patched = $patched.Replace("`n", "`r`n") }
+    return $patched
+}
+
+function Invoke-WorkflowCompatibilityPatch {
+    $path = Join-Path $RuntimeRoot "lib\chunks\chunk-PZ66FRIC.js"
+    Assert-LocalPath $path
+    $text = [IO.File]::ReadAllText($path)
+    $patched = Apply-WorkflowCompatibility $text
     if ($patched -cne $text) {
         $bytes = [IO.File]::ReadAllBytes($path)
         $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
@@ -5018,7 +5629,8 @@ $PatchRegistry = @(
     [pscustomobject]@{ Id = "runtime-resilience"; Revision = 1; Kind = "powershell" },
     [pscustomobject]@{ Id = "root-context-growth"; Revision = 1; Kind = "python" },
     [pscustomobject]@{ Id = "specialist-growth-termination"; Revision = 2; Kind = "python" },
-    [pscustomobject]@{ Id = "report-findings-grammar"; Revision = 1; Kind = "powershell" }
+    [pscustomobject]@{ Id = "report-findings-grammar"; Revision = 1; Kind = "powershell" },
+    [pscustomobject]@{ Id = "workflow-continuation-compatibility"; Revision = 4; Kind = "powershell" }
 )
 
 function Invoke-PatchBlock {
@@ -5032,6 +5644,7 @@ function Invoke-PatchBlock {
         "compatibility-and-compression" { Invoke-CompatibilityAndCompressionPatch }
         "runtime-resilience" { Invoke-RuntimeResiliencePatch -QwenRoot $QwenRoot }
         "report-findings-grammar" { Invoke-ReportFindingsGrammarPatch }
+        "workflow-continuation-compatibility" { Invoke-WorkflowCompatibilityPatch }
         "root-context-growth" {
             $path = Join-Path $TempRoot "root-context-growth.py"
             Assert-LocalPath $path

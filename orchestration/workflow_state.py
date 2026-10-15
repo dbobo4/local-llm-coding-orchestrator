@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import copy
+
 import hashlib
 import json
+import msvcrt
 import os
 import shutil
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,11 +34,28 @@ WorkflowKind = Literal[
 ]
 
 MAX_EQUIVALENT_FAILURES = 3
+MAX_DELEGATION_FAILURES = 9
+MAX_DELEGATION_FAILURE_KEYS = 16
+MAX_STOP_STAGNATION = 3
+MAX_SLICE_TOOLS = 32
+MAX_SLICE_FILES = 16
+MAX_PROCESSED_STOPS = 64
+MAX_AUDIT_EVENTS = 32
+ADMISSION_PRIOR_FIELDS = (
+    "algorithm_scope_files", "algorithm_scope_objectives",
+    "growth_recovery_completed_objectives", "growth_recovery_residual_objectives",
+    "growth_recovery_required", "growth_recovery_guard_active", "growth_recovery_final_slice",
+    "partial_side_effects_possible", "delegation_failures", "delegation_failure_total", "delegation_blocked_reason",
+)
 
 # Session-local routing metadata intentionally does not use .json
 # so workflow-state diagnostics that enumerate *.json files only
 # see actual root-turn state files.
 ROUTING_STATE_FILENAME = "_routing_state.dat"
+
+
+class WorkflowStateError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -100,15 +122,277 @@ class WorkflowState:
     growth_recovery_failed_files: list[str] = field(default_factory=list)
     growth_recovery_failed_objectives: list[str] = field(default_factory=list)
     growth_recovery_reread_files: list[str] = field(default_factory=list)
+    growth_recovery_absent_files: list[str] = field(default_factory=list)
 
     growth_recovery_completed_objectives: list[str] = field(default_factory=list)
     growth_recovery_residual_objectives: list[str] = field(default_factory=list)
     growth_recovery_final_slice: bool = False
 
+    # Repair attempts belong to the root workflow, separate from TEST failures.
+    delegation_failures: dict[str, int] = field(default_factory=dict)
+    delegation_failure_total: int = 0
+    delegation_blocked_reason: str | None = None
+    last_successful_algorithm_objectives: list[str] = field(default_factory=list)
+    resumable_end_reason: str | None = None
+    progress_epoch: int = 0
+    stop_progress_epoch: int = 0
+    stop_stagnation_count: int = 0
+    stop_blocked_reason: str | None = None
+    pending_admission: dict[str, Any] | None = None
+    active_agents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    processed_stops: dict[str, str] = field(default_factory=dict)
+    audit_events: list[dict[str, Any]] = field(default_factory=list)
+    closure_outcome: str | None = None
+    scope_requires_refinement: bool = False
+
 
     # At most one successful PROMPT-owned durable-memory mutation may
     # be committed during one real root user turn.
     prompt_memory_written: bool = False
+
+
+
+@contextmanager
+def session_transition_lock(session_id: str):
+    # All hook transitions for one session share this bounded Windows lock.
+    path = STATE_ROOT / "_locks" / (_safe_component(session_id) + ".lock")
+    assert_local_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if handle.seek(0, 2) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise WorkflowStateError("Session transition lock is busy; no state was changed.")
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def scope_digest(files: list[str], objectives: list[str], generation: int) -> str:
+    return hashlib.sha256(json.dumps([files, objectives, generation], separators=(",", ":")).encode()).hexdigest()
+
+
+def recovery_reference(state: WorkflowState) -> str:
+    values = [state.project_id, state.session_id, state.turn_id, state.growth_recovery_generation,
+              state.growth_recovery_anchor_objectives, state.growth_recovery_completed_objectives,
+              state.growth_recovery_residual_objectives, state.growth_recovery_failed_files]
+    return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
+
+
+def advance_progress(state: WorkflowState) -> None:
+    state.progress_epoch += 1
+    state.stop_progress_epoch = state.progress_epoch
+    state.stop_stagnation_count = 0
+    state.stop_blocked_reason = None
+
+
+def record_stop_stagnation(state: WorkflowState) -> None:
+    if state.stop_progress_epoch != state.progress_epoch:
+        state.stop_progress_epoch = state.progress_epoch
+        state.stop_stagnation_count = 0
+    state.stop_stagnation_count += 1
+    state.stop_block_count += 1
+    if state.stop_stagnation_count >= MAX_STOP_STAGNATION:
+        state.stop_blocked_reason = "Root continuation stagnated without verified execution progress."
+    save_state(state)
+
+
+def append_audit(state: WorkflowState, agent_id: str, role: str, outcome: str, binding: dict[str, Any]) -> None:
+    state.audit_events.append({"agent_id": agent_id, "role": role, "outcome": outcome,
+                               "generation": binding.get("generation"), "scope_digest": binding.get("digest"),
+                               "receipt_summary": binding.get("receipt_summary", "")[:800],
+                               "objectives": binding.get("objectives", []), "time": _utc_timestamp()})
+    state.audit_events = state.audit_events[-MAX_AUDIT_EVENTS:]
+
+
+def bind_specialist(state: WorkflowState, agent_id: str, role: str, parent_call_id: str) -> None:
+    active = state.active_agents.get(agent_id)
+    if active and active.get("role") == role and active.get("call_id") == parent_call_id:
+        return
+    if state.active_agents:
+        raise WorkflowStateError("Specialist identity is already active or consumed.")
+    admission = state.pending_admission
+    if (not admission or admission.get("role") != role
+            or admission.get("call_id") != parent_call_id
+            or admission.get("interruption")
+            or parent_call_id in state.processed_stops):
+        raise WorkflowStateError("Specialist start has no matching accepted admission.")
+    state.active_agents[agent_id] = dict(admission, tools={}, write_targets=[], interruption=None)
+    state.pending_admission = None
+    if role == "algorithm_agent":
+        state.algorithm_started = True
+        state.algorithm_completed = False
+        if state.test_selected:
+            state.final_test_started = False
+            state.final_test_completed = False
+            state.verification_status = "pending"
+    else:
+        state.test_selected = True
+        state.verification_after_implementation = state.algorithm_selected
+        if state.algorithm_selected:
+            state.implementation_verification_required = True
+        state.final_test_started = True
+        state.final_test_completed = False
+        state.verification_status = "pending"
+    state.turn_closed = False
+    save_state(state)
+
+
+def capture_admission_state(state: WorkflowState) -> dict[str, Any]:
+    return copy.deepcopy({name: getattr(state, name) for name in ADMISSION_PRIOR_FIELDS})
+
+
+def retire_not_started_admission(state: WorkflowState) -> bool:
+    admission = state.pending_admission
+    prior = admission.get("prior_state") if admission else None
+    if not isinstance(prior, dict) or set(prior) != set(ADMISSION_PRIOR_FIELDS):
+        return False
+    for name, value in prior.items():
+        if name.endswith(("_files", "_objectives")):
+            valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
+        elif name == "delegation_failures":
+            valid = isinstance(value, dict) and all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in value.items())
+        elif name == "delegation_failure_total":
+            valid = type(value) is int and value >= 0
+        elif name == "delegation_blocked_reason":
+            valid = value is None or isinstance(value, str)
+        else:
+            valid = type(value) is bool
+        if not valid:
+            return False
+    for name, value in prior.items():
+        setattr(state, name, copy.deepcopy(value))
+    append_audit(state, "pending", admission["role"], "NOT_STARTED", admission)
+    state.processed_stops[admission["call_id"]] = "NOT_STARTED"
+    while len(state.processed_stops) > MAX_PROCESSED_STOPS:
+        del state.processed_stops[next(iter(state.processed_stops))]
+    state.pending_admission = None
+    state.closure_outcome = "interrupted"
+    if admission["role"] == "algorithm_agent":
+        state.algorithm_completed = False
+    else:
+        state.final_test_completed = False
+        state.verification_status = "pending"
+    # Caller commits restoration, consumption and the bounded repair counter in one save.
+    return True
+
+
+def commit_specialist_stop(state: WorkflowState, agent_id: str, role: str, outcome: str) -> None:
+    binding = state.active_agents.pop(agent_id)
+    append_audit(state, agent_id, role, outcome, binding)
+    state.processed_stops[binding["call_id"]] = outcome
+    while len(state.processed_stops) > MAX_PROCESSED_STOPS:
+        del state.processed_stops[next(iter(state.processed_stops))]
+    successful = outcome == "PASS"
+    if role == "algorithm_agent" and successful:
+        state.algorithm_completed = True
+        state.last_successful_algorithm_objectives = list(binding["objectives"])
+        state.scope_requires_refinement = binding.get("phase") == "discover"
+        if state.growth_recovery_guard_active and state.growth_recovery_final_slice:
+            state.growth_recovery_guard_active = False
+            state.growth_recovery_required = False
+            state.growth_recovery_anchor_objectives = []
+            state.growth_recovery_failed_files = []
+            state.growth_recovery_failed_objectives = []
+            state.growth_recovery_reread_files = []
+            state.growth_recovery_absent_files = []
+            state.growth_recovery_completed_objectives = []
+            state.growth_recovery_residual_objectives = []
+            state.growth_recovery_final_slice = False
+        state.partial_side_effects_possible = False
+    elif role == "test_agent" and outcome in {"PASS", "FAIL", "BLOCKED"}:
+        state.final_test_completed = True
+        state.verification_status = outcome.lower()
+        if outcome == "FAIL":
+            fingerprint = make_failure_fingerprint("test_agent_verification", binding.get("receipt_summary", "Verification failed."))
+            state.failure_fingerprints[fingerprint] = state.failure_fingerprints.get(fingerprint, 0) + 1
+            state.last_failure_fingerprint = fingerprint
+            state.last_failure_summary = binding.get("receipt_summary", "Verification failed.")[:4000]
+            state.misunderstandings_required = state.verification_after_implementation
+            state.misunderstandings_read = False
+        else:
+            state.last_failure_fingerprint = None
+            state.last_failure_summary = binding.get("receipt_summary", "Verification is blocked.")[:4000] if outcome == "BLOCKED" else None
+    else:
+        state.closure_outcome = "interrupted"
+        state.partial_side_effects_possible = True
+        if role == "algorithm_agent":
+            state.algorithm_completed = False
+            if not state.growth_recovery_guard_active:
+                state.growth_recovery_anchor_objectives = list(binding["objectives"])
+                state.growth_recovery_completed_objectives = []
+                state.growth_recovery_residual_objectives = list(binding["objectives"])
+            state.growth_recovery_failed_files = list(binding["files"])
+            state.growth_recovery_failed_objectives = list(binding["objectives"])
+            state.growth_recovery_reread_files = []
+            state.growth_recovery_absent_files = []
+            state.growth_recovery_required = True
+            state.growth_recovery_guard_active = True
+            state.growth_recovery_final_slice = False
+            state.growth_recovery_generation += 1
+        else:
+            state.final_test_completed = False
+            state.verification_status = "pending"
+    if successful or (role == "test_agent" and outcome in {"FAIL", "BLOCKED"}):
+        advance_progress(state)
+        state.delegation_failures = {}
+        state.delegation_failure_total = 0
+        state.delegation_blocked_reason = None
+        state.closure_outcome = None
+        if successful:
+            state.terminal_abort_reason = None
+            if role == "test_agent":
+                state.partial_side_effects_possible = False
+    save_state(state)
+
+
+def abandon_specialists(state: WorkflowState) -> None:
+    for agent_id in list(state.active_agents):
+        role = state.active_agents[agent_id]["role"]
+        commit_specialist_stop(state, agent_id, role, "ABANDONED")
+    if state.pending_admission:
+        admission = state.pending_admission
+        append_audit(state, "pending", admission["role"], "ABANDONED_ADMISSION", admission)
+        state.processed_stops[admission["call_id"]] = "ABANDONED_ADMISSION"
+        while len(state.processed_stops) > MAX_PROCESSED_STOPS:
+            del state.processed_stops[next(iter(state.processed_stops))]
+        state.pending_admission = None
+        state.closure_outcome = "interrupted"
+        state.partial_side_effects_possible = True
+        if admission["role"] == "algorithm_agent":
+            state.algorithm_completed = False
+            mark_growth_recovery_required(state)
+        else:
+            state.final_test_completed = False
+            state.verification_status = "pending"
+            save_state(state)
+
+
+def archive_session_outcome(state: WorkflowState) -> None:
+    directory = STATE_ROOT / "_audit" / _safe_component(state.session_id)
+    path = directory / (_safe_component(state.turn_id) + ".json")
+    _atomic_write_json(path, {"session_id": state.session_id, "project_id": state.project_id,
+                              "turn_id": state.turn_id, "outcome": state.closure_outcome,
+                              "events": state.audit_events})
+    assert_local_tree(directory)
+    owned = []
+    for candidate in directory.glob("*.json"):
+        value = _read_json_document(candidate)
+        if value and value.get("project_id") == state.project_id:
+            owned.append(candidate)
+    for candidate in sorted(owned, key=lambda entry: entry.stat().st_mtime_ns)[:-8]:
+        candidate.unlink()
 
 
 def _utc_timestamp() -> str:
@@ -191,16 +475,15 @@ def _atomic_write_json(
     assert_local_path(temporary_path)
 
     try:
-        temporary_path.write_text(
-            json.dumps(
+        with temporary_path.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(
                 payload,
                 indent=2,
                 ensure_ascii=False,
                 sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+            ) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
         os.replace(
             temporary_path,
@@ -228,17 +511,14 @@ def _read_json_document(
                 encoding="utf-8"
             )
         )
-    except (
-        OSError,
-        json.JSONDecodeError,
-    ):
-        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkflowStateError("Stored workflow metadata cannot be read safely.") from error
 
     if not isinstance(
         payload,
         dict,
     ):
-        return None
+        raise WorkflowStateError("Stored workflow metadata must be an object.")
 
     return payload
 
@@ -322,15 +602,37 @@ def load_state(
     )
     assert_local_path(path)
 
-    payload = json.loads(
-        path.read_text(
-            encoding="utf-8"
-        )
-    )
-
-    return WorkflowState(
-        **payload
-    )
+    try:
+        payload = _read_json_document(path)
+        if payload is None:
+            raise WorkflowStateError("Referenced workflow state is missing.")
+        state = WorkflowState(**payload)
+        if state.session_id != session_id or state.turn_id != turn_id or not isinstance(state.project_id, str):
+            raise WorkflowStateError("Stored workflow identity does not match its reference.")
+        for name, value in asdict(state).items():
+            default = WorkflowState.__dataclass_fields__[name].default
+            if isinstance(default, bool) and type(value) is not bool:
+                raise WorkflowStateError("Stored workflow flags are malformed.")
+        if not isinstance(state.active_agents, dict) or not isinstance(state.processed_stops, dict):
+            raise WorkflowStateError("Stored execution bindings are malformed.")
+        for name in ("growth_recovery_generation", "progress_epoch", "stop_progress_epoch", "stop_stagnation_count", "delegation_failure_total"):
+            if type(getattr(state, name)) is not int or getattr(state, name) < 0:
+                raise WorkflowStateError("Stored workflow counters are malformed.")
+        for name in ("algorithm_scope_files", "algorithm_scope_objectives", "growth_recovery_anchor_objectives",
+                     "growth_recovery_completed_objectives", "growth_recovery_residual_objectives", "growth_recovery_reread_files"):
+            value = getattr(state, name)
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise WorkflowStateError("Stored workflow scope is malformed.")
+        bindings = list(state.active_agents.values()) + ([state.pending_admission] if state.pending_admission is not None else [])
+        for binding in bindings:
+            if (not isinstance(binding, dict) or not all(isinstance(binding.get(key), str) and binding[key] for key in ("call_id", "role", "digest"))
+                    or binding["role"] not in {"algorithm_agent", "test_agent"}
+                    or type(binding.get("generation")) is not int
+                    or not isinstance(binding.get("files"), list) or not isinstance(binding.get("objectives"), list)):
+                raise WorkflowStateError("Stored admission snapshot is malformed.")
+        return state
+    except (OSError, ValueError, TypeError) as error:
+        raise WorkflowStateError("Stored workflow state is malformed; it was preserved for review.") from error
 
 
 def try_load_state(
@@ -351,12 +653,8 @@ def try_load_state(
             session_id,
             turn_id,
         )
-    except (
-        OSError,
-        json.JSONDecodeError,
-        TypeError,
-    ):
-        return None
+    except (OSError, json.JSONDecodeError, TypeError) as error:
+        raise WorkflowStateError("Stored workflow state could not be loaded.") from error
 
 
 def save_state(
@@ -412,6 +710,10 @@ def _load_routing_state(
     )
 
     if payload is None:
+        root = get_session_state_root(session_id)
+        assert_local_path(root)
+        if root.exists() and any(root.glob("*.json")):
+            raise WorkflowStateError("Session routing is missing while workflow state remains.")
         return _empty_routing_state(
             session_id
         )
@@ -422,11 +724,11 @@ def _load_routing_state(
         )
     )
 
-    if not isinstance(
-        active_root_turn_id,
-        str,
-    ):
-        active_root_turn_id = None
+    states_remain = any(get_session_state_root(session_id).glob("*.json"))
+    if (payload.get("session_id") != session_id
+            or (active_root_turn_id is not None and (not isinstance(active_root_turn_id, str) or not active_root_turn_id))
+            or (states_remain and not active_root_turn_id)):
+        raise WorkflowStateError("Session routing has an invalid or missing active workflow pointer.")
 
     agent_root_turns = (
         payload.get(
@@ -438,7 +740,7 @@ def _load_routing_state(
         agent_root_turns,
         dict,
     ):
-        agent_root_turns = {}
+        raise WorkflowStateError("Session routing child map is malformed or missing.")
 
     clean_agent_map: dict[
         str,
@@ -449,7 +751,7 @@ def _load_routing_state(
         agent_id,
         root_turn_id,
     ) in agent_root_turns.items():
-        if (
+        if not (
             isinstance(
                 agent_id,
                 str,
@@ -461,6 +763,8 @@ def _load_routing_state(
             )
             and root_turn_id
         ):
+            raise WorkflowStateError("Session routing child identity is malformed.")
+        else:
             clean_agent_map[
                 agent_id
             ] = root_turn_id
@@ -506,9 +810,12 @@ def set_active_root_turn(
     session_id: str,
     root_turn_id: str,
 ) -> None:
-    routing = _load_routing_state(
-        session_id
-    )
+    path = _routing_state_path(session_id)
+    if not path.exists():
+        load_state(session_id, root_turn_id)
+        routing = _empty_routing_state(session_id)
+    else:
+        routing = _load_routing_state(session_id)
 
     routing[
         "active_root_turn_id"
@@ -555,10 +862,13 @@ def get_active_state(
     if root_turn_id is None:
         return None
 
-    return try_load_state(
+    state = try_load_state(
         session_id,
         root_turn_id,
     )
+    if state is None:
+        raise WorkflowStateError("Session routing references missing workflow state.")
+    return state
 
 
 def start_or_resume_user_turn(
@@ -574,6 +884,8 @@ def start_or_resume_user_turn(
             session_id
         )
     )
+    if active_state is not None and active_state.project_id != project_id:
+        raise WorkflowStateError("A user turn cannot replace another project's workflow.")
 
     # A blocked Stop may cause an internal continuation. It belongs
     # to the same orchestration workflow until the main Stop hook
@@ -586,6 +898,14 @@ def start_or_resume_user_turn(
             active_state,
             False,
         )
+
+    if active_state is not None:
+        terminal = (active_state.closure_outcome == "success" or (
+            not active_state.algorithm_selected and active_state.closure_outcome in {"verification_fail", "verification_blocked"}))
+        if not terminal or not can_finish_turn(active_state)[0]:
+            return active_state, False
+        archive_session_outcome(active_state)
+        delete_state(active_state.session_id, active_state.turn_id)
 
     state = create_state(
         session_id=session_id,
@@ -664,6 +984,12 @@ def has_registered_agents(session_id: str) -> bool:
     return bool(_load_routing_state(session_id)["agent_root_turns"])
 
 
+def clear_registered_agents(session_id: str) -> None:
+    routing = _load_routing_state(session_id)
+    routing["agent_root_turns"] = {}
+    _save_routing_state(session_id, routing)
+
+
 def get_agent_state(
     session_id: str,
     agent_id: str,
@@ -718,10 +1044,12 @@ def set_algorithm_scope(
     *,
     files: list[str],
     objectives: list[str],
+    persist: bool = True,
 ) -> None:
     state.algorithm_scope_files = list(dict.fromkeys(files))
     state.algorithm_scope_objectives = list(dict.fromkeys(objectives))
-    save_state(state)
+    if persist:
+        save_state(state)
 
 
 def mark_growth_recovery_required(
@@ -743,6 +1071,7 @@ def mark_growth_recovery_required(
     )
     state.growth_recovery_failed_objectives = list(failed_objectives)
     state.growth_recovery_reread_files = []
+    state.growth_recovery_absent_files = []
     state.growth_recovery_required = True
     state.growth_recovery_guard_active = True
     state.growth_recovery_generation += 1
@@ -757,13 +1086,48 @@ def mark_growth_recovery_required(
 def record_growth_recovery_reread(
     state: WorkflowState,
     file_path: str,
+    *, missing: bool = False,
 ) -> None:
     if not state.growth_recovery_required:
         return
     value = str(file_path).strip().replace("\\", "/").lower()
+    absent_changed = missing != (value in state.growth_recovery_absent_files)
+    if missing and value not in state.growth_recovery_absent_files:
+        state.growth_recovery_absent_files.append(value)
+    elif not missing and value in state.growth_recovery_absent_files:
+        state.growth_recovery_absent_files.remove(value)
     if value and value not in state.growth_recovery_reread_files:
         state.growth_recovery_reread_files.append(value)
+        advance_progress(state)
+        reset_delegation_repairs(state)
+    elif absent_changed:
         save_state(state)
+
+
+def reset_delegation_repairs(state: WorkflowState, *, persist: bool = True) -> None:
+    state.delegation_failures = {}
+    state.delegation_failure_total = 0
+    state.delegation_blocked_reason = None
+    if persist:
+        save_state(state)
+
+
+def record_delegation_failure(state: WorkflowState, category: str, reason: str) -> None:
+    if state.delegation_blocked_reason:
+        return
+    fingerprint = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:20]
+    key = category + ":" + fingerprint
+    if key not in state.delegation_failures and len(state.delegation_failures) >= MAX_DELEGATION_FAILURE_KEYS:
+        state.delegation_blocked_reason = "Repair fingerprint capacity reached."
+    else:
+        count = state.delegation_failures.get(key, 0) + 1
+        state.delegation_failures[key] = count
+        state.delegation_failure_total += 1
+        if count >= MAX_EQUIVALENT_FAILURES or state.delegation_failure_total >= MAX_DELEGATION_FAILURES:
+            state.delegation_blocked_reason = (
+                f"Bounded repair exhausted ({category}; equivalent={count}, total={state.delegation_failure_total})."
+            )
+    save_state(state)
 
 
 def set_growth_recovery_plan(
@@ -774,6 +1138,7 @@ def set_growth_recovery_plan(
     delegate_files: list[str],
     delegate_objectives: list[str],
     final_slice: bool,
+    persist: bool = True,
 ) -> None:
     state.growth_recovery_completed_objectives = list(completed)
     state.growth_recovery_residual_objectives = list(residual)
@@ -783,7 +1148,8 @@ def set_growth_recovery_plan(
     state.growth_recovery_guard_active = True
     state.growth_recovery_final_slice = bool(final_slice)
     state.partial_side_effects_possible = False
-    save_state(state)
+    if persist:
+        save_state(state)
 
 
 def mark_growth_recovery_algorithm_success(
@@ -803,6 +1169,7 @@ def mark_growth_recovery_algorithm_success(
     state.growth_recovery_failed_files = []
     state.growth_recovery_failed_objectives = []
     state.growth_recovery_reread_files = []
+    state.growth_recovery_absent_files = []
     state.growth_recovery_completed_objectives = []
     state.growth_recovery_residual_objectives = []
     state.growth_recovery_final_slice = False
@@ -1261,6 +1628,15 @@ def can_finish_turn(
         )
     )
 
+    if state.active_agents or state.pending_admission:
+        return False, "An admitted specialist execution is still unresolved."
+    if state.scope_requires_refinement:
+        return False, "Read-only discovery finished; concrete implementation refinement is still required."
+    if state.stop_blocked_reason:
+        return False, state.stop_blocked_reason
+    if state.delegation_failure_total or state.delegation_blocked_reason:
+        return False, "Agent delegation still requires a valid repaired handoff; the task is incomplete."
+
     if state.growth_recovery_guard_active:
         if state.growth_recovery_required:
             return (
@@ -1273,22 +1649,7 @@ def can_finish_turn(
         )
 
     if state.terminal_abort_reason:
-        reason = (
-            "Workflow terminated by runtime guard without "
-            "successful specialist completion: "
-            + state.terminal_abort_reason
-        )
-
-        if state.partial_side_effects_possible:
-            reason += (
-                ". Partial side effects are possible; current repository "
-                "state must be re-read before continuation or summary"
-            )
-
-        return (
-            True,
-            reason,
-        )
+        return False, "A runtime interruption remains unresolved; successful completion is unproven."
 
     if workflow_kind == "prompt_only":
         return (
@@ -1446,4 +1807,32 @@ def delete_session_state(
         session_directory
     )
 
+    return True
+
+
+def delete_project_session_state(session_id: str, project_id: str) -> bool:
+    # The deleted ID can differ from the caller's current session.
+    if (not session_id or not session_id[0].isalnum() or len(session_id) > 160
+            or session_id != _safe_component(session_id)):
+        return False
+    directory = get_session_state_root(session_id)
+    assert_local_tree(directory)
+    states = list(directory.glob("*.json"))
+    audit_directory = STATE_ROOT / "_audit" / _safe_component(session_id)
+    assert_local_tree(audit_directory)
+    audits = list(audit_directory.glob("*.json"))
+    if not states and not audits:
+        return False
+    for path in states:
+        state = try_load_state(session_id, path.stem)
+        if state is None or state.session_id != session_id or state.project_id != project_id:
+            return False
+    for path in audits:
+        audit = _read_json_document(path)
+        if not audit or audit.get("session_id") != session_id or audit.get("project_id") != project_id:
+            return False
+    if directory.exists():
+        delete_session_state(session_id)
+    if audit_directory.exists():
+        shutil.rmtree(audit_directory)
     return True

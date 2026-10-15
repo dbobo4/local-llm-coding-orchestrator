@@ -135,7 +135,7 @@ For routine delegated coding work:
 3. before that Agent call, emit no status prose, task restatement, plan, workflow comparison, implementation speculation, or PROMPT-side Read/Grep/Glob/List baseline inspection; do not reconsider already-clear routing,
 4. use PROMPT-side Read/Grep/Glob/List only when one concrete missing repository fact is necessary to decide routing, resolve ambiguity, or safely formulate a true requirement or constraint,
 5. synthesize only the minimal ALGORITHM delta and delegate immediately,
-6. after ALGORITHM returns, normalize the receipt once; when TEST is required, make the foreground `test-agent` tool call the next assistant action with no inter-stage narration or implementation analysis,
+6. after ALGORITHM returns, normalize the receipt once; continue remaining bounded ALGORITHM slices while recovery or implementation work remains; when all implementation slices are complete and TEST is required, make the foreground `test-agent` tool call the next assistant action with no inter-stage narration or implementation analysis,
 7. answer only after the required TEST stage reaches a terminal result.
 
 Do not spend model turns:
@@ -163,6 +163,8 @@ Specialist role files already define stable role behavior.
 
 When delegating, send only the task-specific delta needed for the current work.
 
+Omit optional `todo_id` when no existing todo represents the task; never invent an ID. The scheduler omits only an exact empty string before validation and hooks. Whitespace, non-string, and oversized IDs remain invalid.
+
 Every regular specialist delegation must explicitly select exactly `algorithm-agent` or `test-agent` and must run in the foreground (`run_in_background: false`). Never omit `subagent_type`, never use `general-purpose`, and never use a fork as a substitute for the configured specialist workflow.
 
 The orchestration hook applies a hard size ceiling to specialist prompts. If a handoff is rejected as oversized, resynthesize the existing task into a smaller delta; do not split the same restated user prompt across multiple agents or retry it unchanged.
@@ -177,6 +179,8 @@ Every `algorithm-agent` handoff must include one machine-only semantic scope car
 {"files":["path/or/<discover>"],"objectives":["stable_objective_id","another_id"]}
 </ALGORITHM_SCOPE>
 ```
+
+Ordinary initial handoffs are limited to two objective entries, three scope entries, and sixteen current canonical files. Split larger work into sequential cohesive slices; a successful slice does not prove that every user deliverable is complete. Existing guarded recovery anchors retain their original partition and inventory limit.
 
 PROMPT/root chooses the semantic objective IDs. Make them independently meaningful and granular enough that completed work can later be separated from residual work.
 Use concrete project files, `<discover>` as a whole entry, or `directory/**` subtrees. Initial subtrees may be missing or empty so ALGORITHM can create them; existing subtree enumeration is limited to 256 files and 2048 entries and refuses redirects. Other wildcards, bare directories, embedded `<discover>`, and paths outside the project are rejected.
@@ -216,6 +220,18 @@ The new `ALGORITHM_SCOPE.objectives` is only the slice delegated now. It must be
 An active recovery handoff with `residual: []` is denied even if root claims every objective completed. If all code appears done, retain a genuinely unverified original parent and perform a bounded final ALGORITHM check before its normal successful completion clears the guard. Denied carriers do not persist completion claims. Accepted completed IDs remain monotonic; a malformed saved state claiming all parents completed requires review, not reopening IDs or resetting the guard. Completing this interrupted scope does not complete any remaining user-task work or replace independent TEST.
 
 If residual work still contains several independent large objectives, PROMPT/root must split them semantically into multiple sequential foreground ALGORITHM calls. The hook does not invent this split. Do not run TEST between those residual implementation slices.
+
+Recovery denials include bounded authoritative state and, when it fits, a conservative example using only stored completed/residual labels. An example does not classify work or certify file contents. Repair the exact missing reread, partition, parent, or scope condition; do not retry equivalent invalid calls with different wording. Three equivalent failures or nine failures without progress pause the workflow with `LOCALAI_WORKFLOW_INCOMPLETE`. A valid handoff, new valid reread, or successful specialist phase resets repair attempts; duplicate reads and internal continuation prompts do not. A genuine new user submission may resume a paused workflow without clearing its recovery guard or objective partition.
+
+Root state is reinjected after session resume and internal foreground continuation. Unfinished workflows survive SessionEnd under the same session ID; explicit session deletion removes only its verified matching workflow state, preserving project memory and unrelated sessions; they must not be summarized as successful merely because the runtime returned. Independent TEST still waits for a successful final recovery slice.
+
+Each admitted ALGORITHM slice permits at most 32 distinct tool calls and 16 canonical files or direct write targets. `<discover>` is a read-only phase and must be followed by a concrete implementation/refinement slice before TEST or final completion. Creating a missing or empty `directory/**` scope remains valid, but use accountable direct writes there; opaque shell, notebook, or MCP mutation requires a concrete refinement. Generated and binary files count too. A breach preserves partial-state uncertainty and requires root reread and a smaller recovery slice; it does not roll back user files or provide an OS sandbox.
+
+Only an owned, matching native `not_started` failure can retire an accepted admission without a child receipt. Entered execution errors, missing phase evidence, and older admissions without a prior-state snapshot remain uncertain: keep the pending admission, end/resume the same session, then reread actual state before a smaller recovery slice. A never-started handoff adds no implementation proof, and repeated equivalent startup failures remain bounded.
+
+Scope checks cannot confine arbitrary shell commands or their filesystem side effects. Use trusted commands, disposable projects or backups, and OS isolation when a hard write boundary is required. Root must carry every user deliverable into the final independent TEST; the workflow cannot infer an undeclared backlog from a successful first slice.
+
+Only the accepted API tool call, registered child identity, native GOAL termination, opening status and valid material/MEMORY receipt can complete a slice. Admission and repeated reads are not execution progress. Interrupted or malformed receipts retain unfinished state; replayed receipts cannot complete later work. Stop stagnation is tracked separately from invalid Agent repair attempts and resets only on new validated reread or a uniquely committed specialist result. For oversized legacy objective IDs, a bounded `state_ref` plus `completed_indices`, `residual_indices`, and `objective_refs:[{"index":0,"child":"check_actual_state"}]` can reference the exact stored anchor IDs. Keep `ALGORITHM_SCOPE.files`, omit its `objectives` for this indexed form, and retain every existing partition, reread, parent and final-slice rule; indices never certify completion.
 
 Set `final_slice: true` only when the current delegation covers all semantic roots still listed in residual. After that ALGORITHM call succeeds, the recovery guard clears and normal TEST/finalization may continue.
 
@@ -311,7 +327,7 @@ REPORTED NOTE
 Starlette warning about httpx.
 ```
 
-After a successful ALGORITHM receipt, normalize once and, when TEST is required, make the foreground test-agent call the next assistant action. Emit no status prose, implementation analysis, or workflow narration between ALGORITHM and TEST.
+After a successful ALGORITHM receipt, normalize once. While required implementation slices remain or the recovery guard is active, delegate the next bounded ALGORITHM slice. Once implementation slices are complete and the guard is clear, make the required foreground test-agent call the next assistant action. Emit no status prose, implementation analysis, or workflow narration between ALGORITHM and TEST.
 
 ## TEST handoff
 

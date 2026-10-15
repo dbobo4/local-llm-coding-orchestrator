@@ -27,6 +27,7 @@ class GrowthRecoveryTests(fixtures.FixtureTest):
         self.python(f"""
 import project_identity as identity, workflow_state as w
 p=identity.identify_project()
+w.delete_session_state('growth-session')
 s=w.create_state('growth-session','growth-turn',p.project_id,overwrite=True)
 w.set_active_root_turn(s.session_id,s.turn_id)
 w.mark_contract_ready(s)
@@ -42,7 +43,44 @@ from dataclasses import asdict
 print(json.dumps(asdict(w.get_active_state('growth-session'))))
 """).stdout)
 
+    @staticmethod
+    def without_repair_metadata(state):
+        return {key:value for key,value in state.items() if key not in {
+            'updated_at','delegation_failures','delegation_failure_total','delegation_blocked_reason',
+            'last_successful_algorithm_objectives',
+        }}
+
     def hook(self, event, **values):
+        self.fixture_call_sequence = getattr(self, 'fixture_call_sequence', 0) + 1
+        if event == 'PreToolUse' and 'tool_call_id' not in values:
+            values['tool_call_id'] = 'api-call-' + str(self.fixture_call_sequence)
+            values['tool_use_id'] = 'synthetic-use-' + str(self.fixture_call_sequence)
+        if event == 'SubagentStart' and 'parent_tool_call_id' not in values:
+            state = self.state()
+            admission = state['pending_admission']
+            if admission is None and values.get('agent_type') == 'algorithm-agent':
+                if not state['growth_recovery_guard_active'] and len(state['algorithm_scope_objectives']) <= 2:
+                    admitted = self.delegate(state['algorithm_scope_files'] or ['<discover>'],state['algorithm_scope_objectives'],recovery=False)
+                    self.assertEqual(admitted['permissionDecision'],'allow',admitted)
+                else:
+                    # Legacy lifecycle/read-provenance fixtures seed a previously accepted scope.
+                    # Admission-race tests below always use the actual PreToolUse path.
+                    self.python("""import workflow_state as w
+s=w.get_active_state('growth-session')
+s.pending_admission=dict(call_id='legacy-fixture-call-'+str(s.growth_recovery_generation),role='algorithm_agent',files=s.algorithm_scope_files,objectives=s.algorithm_scope_objectives,generation=s.growth_recovery_generation,digest=w.scope_digest(s.algorithm_scope_files,s.algorithm_scope_objectives,s.growth_recovery_generation),phase='concrete')
+w.save_state(s)
+""")
+                admission = self.state()['pending_admission']
+            elif admission is None and not state['growth_recovery_guard_active']:
+                self.hook('PreToolUse',tool_name='agent',tool_input={'subagent_type':'test-agent','prompt':'Verify the completed synthetic slice.','run_in_background':False})
+                admission = self.state()['pending_admission']
+            if admission:
+                values['parent_tool_call_id'] = admission['call_id']
+                self.fixture_child_calls = getattr(self, 'fixture_child_calls', {})
+                self.fixture_child_calls[values['agent_id']] = admission['call_id']
+        if event == 'SubagentStop':
+            values.setdefault('parent_tool_call_id',getattr(self,'fixture_child_calls',{}).get(values.get('agent_id')))
+            values.setdefault('terminate_reason','GOAL')
         payload = dict(hook_event_name=event, session_id='growth-session', cwd=str(self.project))
         payload.update(values)
         result = subprocess.run([sys.executable, '-B', str(self.clone / 'orchestration' / 'hook_dispatcher.py')],
@@ -106,7 +144,7 @@ print(json.dumps(asdict(w.get_active_state('growth-session'))))
         self.assertEqual(bad['permissionDecision'], 'deny', bad)
         self.assertIn('empty residual', bad['permissionDecisionReason'].lower())
         self.assertIn('apply_transactional', bad['permissionDecisionReason'])
-        self.assertEqual(self.state(), before)
+        self.assertEqual(self.without_repair_metadata(self.state()), self.without_repair_metadata(before))
         accepted = self.delegate(['stockflow/apply.py'], ['apply_transactional::smoke_check'], **plan)
         self.assertEqual(accepted['permissionDecision'], 'allow', accepted)
         self.assertTrue(self.state()['growth_recovery_guard_active'])
@@ -121,12 +159,12 @@ print(json.dumps(asdict(w.get_active_state('growth-session'))))
         self.assertEqual(incomplete['decision'], 'block')
         self.assertTrue(self.state()['growth_recovery_guard_active'])
         self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='smoke-child',
-                  last_assistant_message='Synthetic implementation smoke check passed.\nMEMORY: NONE')
+                  last_assistant_message='PASS\nSynthetic implementation smoke check passed.\nMEMORY: NONE')
         self.assertFalse(self.state()['growth_recovery_guard_active'])
         self.assertEqual(self.hook('Stop')['decision'], 'block')
         self.hook('SubagentStart', agent_type='test-agent', agent_id='final-orders-test')
         self.hook('SubagentStop', agent_type='test-agent', agent_id='final-orders-test',
-                  last_assistant_message='PASS\nMEMORY: NONE')
+                  last_assistant_message='PASS\nSynthetic independent verification completed.\nMEMORY: NONE')
         self.assertTrue(self.hook('Stop')['continue'])
 
     def test_empty_residual_claim_and_another_growth_stop_cannot_close_recovery(self):
@@ -139,7 +177,7 @@ print(json.dumps(asdict(w.get_active_state('growth-session'))))
                                    completed=anchors, residual=[], final_slice=final)
             self.assertEqual(denied['permissionDecision'], 'deny', denied)
             self.assertIn('empty residual', denied['permissionDecisionReason'].lower())
-            self.assertEqual(self.state(), before)
+            self.assertEqual(self.without_repair_metadata(self.state()), self.without_repair_metadata(before))
         test_start = self.hook('SubagentStart', agent_type='test-agent', agent_id='premature-orders-test')
         self.assertFalse(test_start['continue'])
         self.assertEqual(self.hook('Stop')['decision'], 'block')
@@ -169,7 +207,7 @@ print(json.dumps(asdict(w.get_active_state('growth-session'))))
         self.assertEqual(denied['permissionDecision'], 'deny', denied)
         self.assertIn('apply_transactional', denied['permissionDecisionReason'])
         self.assertIn('missing from residual', denied['permissionDecisionReason'])
-        self.assertEqual(self.state(), before)
+        self.assertEqual(self.without_repair_metadata(self.state()), self.without_repair_metadata(before))
 
     def test_legacy_wildcards_require_every_current_file_and_concrete_absence(self):
         self.read('stockflow/core.py')
@@ -379,13 +417,13 @@ print(json.dumps(asdict(w.get_active_state('growth-session'))))
         self.reread_all()
         accepted = self.delegate(['stockflow/core.py'])
         self.assertEqual(accepted['permissionDecision'], 'allow', accepted)
+        self.hook('SubagentStart', agent_type='algorithm-agent', agent_id='algorithm-child')
+        stopped = self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='algorithm-child',
+                            last_assistant_message='PASS\nSynthetic slice complete.\nMEMORY: NONE')
+        self.assertIn('next smaller ALGORITHM slice', stopped['systemMessage'])
         alias = self.delegate(['./stockflow/core.py'])
         self.assertEqual(alias['permissionDecision'], 'deny', alias)
         self.assertIn('repeated identical', alias['permissionDecisionReason'])
-        self.hook('SubagentStart', agent_type='algorithm-agent', agent_id='algorithm-child')
-        stopped = self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='algorithm-child',
-                            last_assistant_message='Synthetic slice complete.\nMEMORY: NONE')
-        self.assertIn('next smaller ALGORITHM slice', stopped['systemMessage'])
         self.python("""
 import workflow_state as w
 s=w.get_active_state('growth-session')
@@ -395,17 +433,17 @@ assert s.growth_recovery_guard_active and not w.can_finish_turn(s)[0]
         self.assertEqual(final['permissionDecision'], 'allow', final)
         backwards = self.delegate(['stockflow/util.py'])
         self.assertEqual(backwards['permissionDecision'], 'deny')
-        self.assertIn('monotonic', backwards['permissionDecisionReason'])
+        self.assertIn('pending', backwards['permissionDecisionReason'])
         self.hook('SubagentStart', agent_type='algorithm-agent', agent_id='final-algorithm')
         self.hook('SubagentStop', agent_type='algorithm-agent', agent_id='final-algorithm',
-                  last_assistant_message='Final synthetic slice complete.\nMEMORY: NONE')
+                  last_assistant_message='PASS\nFinal synthetic slice complete.\nMEMORY: NONE')
         allowed_test = self.hook('PreToolUse', tool_name='agent', tool_input={
             'subagent_type':'test-agent','run_in_background':False,'prompt':'Verify the completed synthetic implementation.',
         })['hookSpecificOutput']
         self.assertEqual(allowed_test['permissionDecision'], 'allow', allowed_test)
         self.hook('SubagentStart', agent_type='test-agent', agent_id='final-test')
         self.assertTrue(self.state()['final_test_started'])
-        self.hook('SubagentStop', agent_type='test-agent', agent_id='final-test', last_assistant_message='PASS\nMEMORY: NONE')
+        self.hook('SubagentStop', agent_type='test-agent', agent_id='final-test', last_assistant_message='PASS\nSynthetic independent verification completed.\nMEMORY: NONE')
         self.python("""
 import workflow_state as w
 s=w.get_active_state('growth-session')

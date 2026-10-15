@@ -9,6 +9,7 @@ import stat
 import sys
 import time
 import traceback
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,10 @@ MAX_FAILURE_SUMMARY_CHARS = 3_000
 MAX_AUTO_MISUNDERSTANDING_CHARS = 1_200
 MAX_ALGORITHM_DELTA_CHARS = 3000
 MAX_TEST_DELTA_CHARS = 2500
+MAX_INITIAL_OBJECTIVES = 2
+MAX_INITIAL_SCOPE_ENTRIES = 3
+MAX_INITIAL_SCOPE_FILES = 16
+WORKFLOW_PAUSE_MARKER = "LOCALAI_WORKFLOW_INCOMPLETE:"
 
 
 def _utc_timestamp() -> str:
@@ -478,44 +483,135 @@ def _localai_v514_scope_files(
     return sorted(resolved)
 
 
-def _localai_v5141_authoritative_recovery_hint(
-    state: WorkflowState,
-) -> str:
+def _localai_v5141_authoritative_recovery_hint(state: WorkflowState, project_root: str | None = None) -> str:
     payload = {
         "generation": state.growth_recovery_generation,
-        "anchor_objectives": list(
-            state.growth_recovery_anchor_objectives
-        ),
-        "failed_files": list(
-            state.growth_recovery_failed_files
-        ),
-        "failed_objectives": list(
-            state.growth_recovery_failed_objectives
-        ),
-        "reread_files": list(
-            state.growth_recovery_reread_files
-        ),
-        "completed_objectives": list(
-            state.growth_recovery_completed_objectives
-        ),
-        "residual_objectives": list(
-            state.growth_recovery_residual_objectives
-        ),
+        "guard_active": state.growth_recovery_guard_active,
+        "reread_required": state.growth_recovery_required,
+        "anchor_count": len(state.growth_recovery_anchor_objectives),
+        "completed_objectives": state.growth_recovery_completed_objectives,
+        "residual_objectives": state.growth_recovery_residual_objectives,
+        "repair_attempts": state.delegation_failure_total,
+        "repair_blocked": state.delegation_blocked_reason,
+        "last_successful_slice": state.last_successful_algorithm_objectives,
+        "resumable_end_reason": state.resumable_end_reason,
+        "verified_absent_files": state.growth_recovery_absent_files[:3],
     }
-    return (
-        " AUTHORITATIVE_GROWTH_RECOVERY_STATE="
-        + json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+    current_files = []
+    missing_reads = []
+    if project_root and state.growth_recovery_failed_files:
+        try:
+            current_files = _localai_v514_scope_files(state.growth_recovery_failed_files, project_root)
+            missing_reads = sorted(set(current_files) - set(state.growth_recovery_reread_files))
+            payload["missing_read_count"] = len(missing_reads)
+            payload["missing_reads"] = missing_reads[:3]
+            payload["read_details_omitted"] = len(missing_reads) > 3 or len(state.growth_recovery_absent_files) > 3
+        except (OSError, ValueError):
+            payload["coverage_status"] = "UNPROVABLE; enumerate trusted actual scope before delegation"
+    residual = state.growth_recovery_residual_objectives
+    if residual:
+        payload["example_status"] = "Illustration only; not ready until complete valid reread and truthful partition"
+        observed = set(state.algorithm_scope_objectives + state.last_successful_algorithm_objectives)
+        recent_roots = {item.split("::", 1)[0] for item in state.last_successful_algorithm_objectives}
+        parents = sorted(residual, key=lambda parent: parent in recent_roots)
+        candidate = next((parent + "::" + suffix for parent in parents
+                          for suffix in ("verify_actual_state", "verify_remaining_state", "verify_final_state")
+                          if parent + "::" + suffix not in observed), None)
+        if candidate:
+            payload["example"] = {
+                "ALGORITHM_SCOPE": {"files": current_files[:1] or ["<discover>"], "objectives": [candidate]},
+                "GROWTH_RECOVERY": {"completed": state.growth_recovery_completed_objectives,
+                                    "residual": residual, "final_slice": len(residual) == 1},
+            }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) > 2400:
+        # Indexed claims refer to exact saved IDs; the same semantic validators still apply.
+        anchor = state.growth_recovery_anchor_objectives
+        completed_indices = [i for i, item in enumerate(anchor) if item in state.growth_recovery_completed_objectives]
+        residual_indices = [i for i, item in enumerate(anchor) if item in residual]
+        payload = {
+            "generation": state.growth_recovery_generation,
+            "guard_active": state.growth_recovery_guard_active,
+            "reread_required": state.growth_recovery_required,
+            "details_omitted": True,
+            "counts": {key: len(value) for key, value in payload.items() if isinstance(value, list)},
+            "anchor_count": len(anchor),
+            "state_ref": _localai_workflow_state.recovery_reference(state),
+            "completed_indices": completed_indices,
+            "residual_indices": residual_indices,
+            "next_missing_read": (missing_reads[0] if project_root and current_files and missing_reads else None),
+            "repair_attempts": state.delegation_failure_total,
+            "repair_blocked": state.delegation_blocked_reason,
+            "instruction": "Exact saved IDs are referenced by zero-based anchor indices. Keep ALGORITHM_SCOPE.files, omit its objectives and use GROWTH_RECOVERY.objective_refs with index/child; no invented completed claims. Full reread still required.",
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return " AUTHORITATIVE_GROWTH_RECOVERY_STATE=" + encoded
+
+
+def _is_explicit_child(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("agent_id")) or any(
+        _normalize_agent_type(payload.get(key)) in {"algorithm_agent", "test_agent", "subagent"}
+        for key in ("agent_type", "source_type")
     )
+
+
+def _root_workflow_state(payload: dict[str, Any], identity: ProjectIdentity) -> WorkflowState | None:
+    session_id = _get_required_string(payload, "session_id")
+    if not session_id or _is_explicit_child(payload) or _localai_workflow_state.has_registered_agents(session_id):
+        return None
+    state = get_active_state(session_id)
+    return state if state and state.project_id == identity.project_id and not state.active_agents else None
+
+
+def _workflow_context(state: WorkflowState | None, project_root: str | None = None) -> str:
+    if state is None or state.turn_closed or can_finish_turn(state)[0]:
+        return ""
+    prefix = WORKFLOW_PAUSE_MARKER if state.delegation_blocked_reason or state.stop_blocked_reason else "LOCALAI_ROOT_CONTINUATION:"
+    action = " Continue the next smaller ALGORITHM slice before TEST." if state.growth_recovery_guard_active else " Continue remaining implementation slices, then required independent TEST."
+    return prefix + " Root workflow remains incomplete; preserve its state." + action + _localai_v5141_authoritative_recovery_hint(state, project_root)
+
+
+def _delegation_repair_reason(state: WorkflowState, reason: str, *, category: str | None = None, project_root: str | None = None) -> str:
+    plain = reason.split(" AUTHORITATIVE_GROWTH_RECOVERY_STATE=", 1)[0]
+    if plain.startswith(WORKFLOW_PAUSE_MARKER):
+        plain = plain[len(WORKFLOW_PAUSE_MARKER):].lstrip()
+    if category is None:
+        category = next((name for needle, name in (
+            ("missing required <growth_recovery>", "recovery_carrier"),
+            ("missing required <algorithm_scope>", "scope_carrier"),
+            ("re-read", "reread"), ("coverage", "coverage"), ("partition", "partition"),
+            ("parent", "parent"), ("same-scope", "same_scope"), ("identical residual", "same_scope"),
+            ("hard limit", "delta"), ("initial", "initial_scope"),
+        ) if needle in plain.lower()), "metadata")
+    _localai_workflow_state.record_delegation_failure(state, category, plain)
+    prefix = WORKFLOW_PAUSE_MARKER + " " if state.delegation_blocked_reason else ""
+    action = {
+        "recovery_carrier": "Attach GROWTH_RECOVERY with the stored exact completed/residual partition and final_slice boolean.",
+        "scope_carrier": "Attach one bounded ALGORITHM_SCOPE with project files and semantic objective IDs.",
+        "reread": "Read every missing failed-scope file; independently verified missing concrete files require read_file failure evidence.",
+        "parent": "Keep each delegated parent in current residual; implemented but unchecked work is not completed.",
+    }.get(category, "Correct the stated condition using authoritative state before retrying.")
+    return (prefix + plain[:700] + f" REPAIR_CATEGORY={category} REPAIR_ATTEMPTS={state.delegation_failure_total}. NEXT_ACTION={action} "
+            "Repair the stated cause; repeating equivalent invalid handoffs is bounded."
+            + _localai_v5141_authoritative_recovery_hint(state, project_root))
+
+
+def _write_workflow_block(identity: ProjectIdentity, state: WorkflowState, reason: str) -> None:
+    _localai_workflow_state.record_stop_stagnation(state)
+    paused = bool(state.stop_blocked_reason or state.delegation_blocked_reason)
+    message = ((WORKFLOW_PAUSE_MARKER if paused else "LOCALAI_ROOT_CONTINUATION:")
+               + " " + reason[:700] + _localai_v5141_authoritative_recovery_hint(state, identity.canonical_project_root))
+    _write_json({"continue": not paused, "decision": "block", "reason": message, "systemMessage": message,
+                 "hookSpecificOutput": {"hookEventName": "Stop", "localai_workflow": {
+                     "version": 1, "session_id": state.session_id, "turn_id": state.turn_id,
+                     "progress_epoch": state.progress_epoch, "stagnation_count": state.stop_stagnation_count}}})
 
 
 def _localai_v514_prepare_algorithm(
     prompt: str,
     state: WorkflowState,
     project_root: str,
+    *, proposal: dict[str, Any],
 ) -> tuple[str | None, str | None]:
     scope, clean, error = _localai_v514_carrier(
         prompt,
@@ -527,6 +623,39 @@ def _localai_v514_prepare_algorithm(
     if error:
         return None, error
     assert scope is not None
+
+    recovery, clean, error = _localai_v514_carrier(
+        clean, pattern=_LOCALAI_V514_RECOVERY_RE, marker=_LOCALAI_V514_RECOVERY_MARKER_RE,
+        label="GROWTH_RECOVERY", required=bool(state.growth_recovery_guard_active))
+    if error:
+        return None, error
+    if recovery is not None and "state_ref" in recovery:
+        if (not state.growth_recovery_guard_active or recovery["state_ref"] != _localai_workflow_state.recovery_reference(state)
+                or "objectives" in scope or "completed" in recovery or "residual" in recovery):
+            return None, "Stale or mixed indexed recovery carrier; obtain the current bounded state reference."
+        anchor = state.growth_recovery_anchor_objectives
+        def indices(value):
+            if (not isinstance(value, list) or any(type(i) is not int or i < 0 or i >= len(anchor) for i in value)
+                    or len(set(value)) != len(value)):
+                raise ValueError("Recovery indices must be unique in-range integers, not booleans.")
+            return [anchor[i] for i in value]
+        try:
+            recovery["completed"] = indices(recovery.get("completed_indices"))
+            recovery["residual"] = indices(recovery.get("residual_indices"))
+            refs = recovery.get("objective_refs")
+            if not isinstance(refs, list) or not refs:
+                raise ValueError("Indexed recovery needs bounded delegated objective_refs.")
+            objectives = []
+            for ref in refs:
+                if (not isinstance(ref, dict) or set(ref) != {"index", "child"}
+                        or not isinstance(ref["child"], str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", ref["child"])):
+                    raise ValueError("Each objective reference needs an anchor index and a short concrete child ID.")
+                objectives.append(indices([ref["index"]])[0] + "::" + ref["child"])
+            scope["objectives"] = objectives
+        except ValueError as error:
+            return None, str(error)
+    elif recovery is not None and any(key in recovery for key in ("completed_indices", "residual_indices", "objective_refs")):
+        return None, "Indexed recovery claims require the current state_ref."
 
     files, error = _localai_v514_list(
         scope.get("files"),
@@ -558,27 +687,16 @@ def _localai_v514_prepare_algorithm(
         return None, (
             f"Cannot establish complete file coverage: {error} "
             "Use concrete project files or <discover>; saved recovery remains guarded."
-            + _localai_v5141_authoritative_recovery_hint(state)
+            + _localai_v5141_authoritative_recovery_hint(state, project_root)
         )
-
-    recovery, clean, error = _localai_v514_carrier(
-        clean,
-        pattern=_LOCALAI_V514_RECOVERY_RE,
-        marker=_LOCALAI_V514_RECOVERY_MARKER_RE,
-        label="GROWTH_RECOVERY",
-        required=bool(state.growth_recovery_guard_active),
-    )
-    if error:
-        return None, error
 
     if not state.growth_recovery_guard_active:
+        if (len(objectives) > MAX_INITIAL_OBJECTIVES or len(files) > MAX_INITIAL_SCOPE_ENTRIES
+                or len(resolved_files) > MAX_INITIAL_SCOPE_FILES):
+            return None, "Initial ALGORITHM scope exceeds 2 objective entries, 3 scope entries or 16 current files. Delegate a smaller cohesive slice."
         if recovery is not None:
             return None, "GROWTH_RECOVERY is valid only during active growth recovery."
-        _localai_workflow_state.set_algorithm_scope(
-            state,
-            files=files,
-            objectives=objectives,
-        )
+        proposal.update(files=files, objectives=objectives, recovery=False)
         return clean, None
 
     assert recovery is not None
@@ -610,7 +728,7 @@ def _localai_v514_prepare_algorithm(
         return None, (
             "GROWTH_RECOVERY.completed + residual must exactly partition "
             "the original failed semantic objective IDs."
-            + _localai_v5141_authoritative_recovery_hint(state)
+            + _localai_v5141_authoritative_recovery_hint(state, project_root)
         )
     if not set(state.growth_recovery_completed_objectives).issubset(completed_set):
         return None, "Completed growth-recovery objectives are monotonic."
@@ -627,7 +745,7 @@ def _localai_v514_prepare_algorithm(
             "Keep genuinely unverified original parents in residual and delegate a bounded "
             "parent_id::child_id check; set final_slice=true only when it covers all residual parents. "
             "Implemented but unchecked work is not completed. Already accepted completed IDs cannot be reopened."
-            + _localai_v5141_authoritative_recovery_hint(state)
+            + _localai_v5141_authoritative_recovery_hint(state, project_root)
         )
 
     if state.growth_recovery_required:
@@ -649,13 +767,13 @@ def _localai_v514_prepare_algorithm(
                     "explicit failed-scope file. Missing: "
                     + ", ".join(missing)
                     + ". Obtain valid file contents; skipped binary responses do not satisfy recovery."
-                    + _localai_v5141_authoritative_recovery_hint(state)
+                    + _localai_v5141_authoritative_recovery_hint(state, project_root)
                 )
         elif not rereads:
             return None, (
                 "GROWTH_LIMIT recovery requires at least one root read_file "
                 "of actual repository state."
-                + _localai_v5141_authoritative_recovery_hint(state)
+                + _localai_v5141_authoritative_recovery_hint(state, project_root)
             )
 
         failed_roots = {
@@ -692,14 +810,9 @@ def _localai_v514_prepare_algorithm(
             "all currently residual objectives."
         )
 
-    _localai_workflow_state.set_growth_recovery_plan(
-        state,
-        completed=completed,
-        residual=residual,
-        delegate_files=files,
-        delegate_objectives=objectives,
-        final_slice=final_slice,
-    )
+    plan = dict(completed=completed, residual=residual, delegate_files=files,
+                delegate_objectives=objectives, final_slice=final_slice)
+    proposal.update(plan, recovery=True)
     return clean, None
 
 
@@ -715,7 +828,7 @@ def _localai_v514_track_reread(
     if _localai_workflow_state.has_registered_agents(session_id):
         return
     state = get_active_state(session_id)
-    if state is None or not state.growth_recovery_required:
+    if state is None or state.active_agents or not state.growth_recovery_required:
         return
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -738,6 +851,7 @@ def _localai_v514_track_reread(
     _localai_workflow_state.record_growth_recovery_reread(
         state,
         path.as_posix(),
+        missing=payload.get("hook_event_name") == "PostToolUseFailure",
     )
 
 
@@ -827,7 +941,7 @@ def _ensure_active_state(
     )
 
     if state is not None:
-        return state
+        return state if state.project_id == identity.project_id else None
 
     observed_turn_id = _get_required_string(
         payload,
@@ -852,36 +966,6 @@ def _ensure_active_state(
     return state
 
 
-def _get_subagent_state(
-    payload: dict[str, Any],
-    identity: ProjectIdentity,
-) -> WorkflowState | None:
-    session_id = _get_required_string(
-        payload,
-        "session_id",
-    )
-
-    if session_id is None:
-        return None
-
-    agent_id = _get_required_string(
-        payload,
-        "agent_id",
-    )
-
-    if agent_id is not None:
-        state = get_agent_state(
-            session_id,
-            agent_id,
-        )
-
-        if state is not None:
-            return state
-
-    return _ensure_active_state(
-        payload,
-        identity,
-    )
 
 
 def _build_agent_memory_context(
@@ -1002,63 +1086,11 @@ def _has_specialist_memory_decision(
     )
 
 
-def _require_specialist_memory_decision(
-    payload: dict[str, Any],
-    message: str | None,
-    agent_label: str,
-) -> bool:
-    if _has_specialist_memory_decision(
-        message
-    ):
-        return True
 
-    stop_hook_active = bool(
-        payload.get(
-            "stop_hook_active"
-        )
-    )
-
-    if stop_hook_active:
-        # One protocol retry already occurred. Fail open rather than
-        # trapping the workflow in an infinite Stop loop.
-        return True
-
-    _write_json(
-        {
-            "decision": "block",
-            "reason": (
-                f"{agent_label} must make an explicit durable-memory "
-                "decision before stopping. If durable reusable knowledge "
-                "was established, append exactly one valid "
-                "<ORCHESTRATION_MEMORY> operation. Otherwise add exactly "
-                "`MEMORY: NONE` to the compact receipt. Do not add any "
-                "other narrative."
-            ),
-        }
-    )
-
-    return False
-
-def _extract_test_status(
-    message: str | None,
-) -> str | None:
-    normalized = _normalize_text(
-        message
-    )
-
-    if not normalized:
-        return None
-
-    match = re.search(
-        r"(?im)^\s*(?:status\s*:\s*)?"
-        r"(PASS|FAIL|BLOCKED)\b",
-        normalized,
-    )
-
-    if match is None:
-        return None
-
-    return match.group(1).upper()
+def _extract_test_status(message: str | None) -> str | None:
+    normalized = _normalize_text(message)
+    match = re.match(r"^(PASS|FAIL|BLOCKED)(?:\s|$)", normalized) if normalized else None
+    return match.group(1) if match else None
 
 
 def _failure_summary(
@@ -1107,6 +1139,18 @@ def _handle_session_start(
     payload: dict[str, Any],
     identity: ProjectIdentity,
 ) -> None:
+    session_id = _get_required_string(payload, "session_id")
+    if _is_explicit_child(payload):
+        _write_json({"continue": True})
+        return
+    if session_id and payload.get("source") == "resume":
+        state = get_active_state(session_id)
+        if state and state.project_id == identity.project_id:
+            _localai_workflow_state.abandon_specialists(state)
+            _localai_workflow_state.clear_registered_agents(session_id)
+    if session_id and _localai_workflow_state.has_registered_agents(session_id):
+        _write_json({"continue": True})
+        return
     initialize_memory_structure(
         identity
     )
@@ -1117,6 +1161,8 @@ def _handle_session_start(
         include_cross_project=True,
     )
 
+    continuation = _workflow_context(_root_workflow_state(payload, identity), identity.canonical_project_root)
+    context = "\n".join(part for part in (context, continuation) if part)
     if not context:
         _write_json(
             {
@@ -1141,9 +1187,26 @@ def _handle_session_end(
         "session_id",
     )
 
-    if session_id is None:
+    if session_id is None or _is_explicit_child(payload):
+        _write_json({"continue": True})
         return
 
+    state = get_active_state(session_id)
+    identity = _project_identity(payload)
+    if state is not None and state.project_id != identity.project_id:
+        _write_json({"continue": True})
+        return
+    terminal_audit = bool(state and state.turn_closed and not state.algorithm_selected
+                          and state.closure_outcome in {"verification_fail", "verification_blocked"})
+    if state is not None and (not state.turn_closed or (state.closure_outcome != "success" and not terminal_audit)):
+        _localai_workflow_state.abandon_specialists(state)
+        _localai_workflow_state.clear_registered_agents(session_id)
+        state.resumable_end_reason = "Session ended before root workflow closure; retained for same-ID resumable review."
+        _localai_workflow_state.save_state(state)
+        _write_json({"continue": True, "systemMessage": WORKFLOW_PAUSE_MARKER + " " + state.resumable_end_reason})
+        return
+    if state is not None:
+        _localai_workflow_state.archive_session_outcome(state)
     delete_session_state(
         session_id
     )
@@ -1153,6 +1216,18 @@ def _handle_session_end(
             "continue": True,
         }
     )
+
+
+def _handle_session_delete(payload: dict[str, Any]) -> None:
+    target = payload.get("deleted_session_id")
+    deleted = False
+    if not _is_explicit_child(payload) and isinstance(target, str):
+        identity = _project_identity(payload)
+        deleted = _localai_workflow_state.delete_project_session_state(target, identity.project_id)
+    _write_json({"continue": True, "systemMessage": (
+        "Deleted session workflow removed." if deleted else
+        "Session workflow cleanup skipped: missing or unverified target ownership; caller state preserved."
+    )})
 
 
 def _handle_user_prompt_submit(
@@ -1171,16 +1246,29 @@ def _handle_user_prompt_submit(
     if session_id is None:
         return
 
-    # Qwen Code emits an empty UserPromptSubmit event when execution
-    # continues after a foreground subagent. That is not a new user turn.
-    if not _user_prompt_text(
-        payload
-    ):
-        _write_json(
-            {
-                "continue": True,
-            }
-        )
+    if _is_explicit_child(payload) or _localai_workflow_state.has_registered_agents(session_id):
+        _write_json({"continue": True})
+        return
+    active_state = get_active_state(session_id)
+    if active_state and active_state.project_id != identity.project_id:
+        _write_json({"continue": True})
+        return
+    submitted = payload.get("submitted_prompt")
+    if active_state and isinstance(submitted, str) and submitted.strip():
+        _localai_workflow_state.reset_delegation_repairs(active_state, persist=False)
+        if (active_state.turn_closed and active_state.algorithm_selected and active_state.algorithm_completed
+                and active_state.closure_outcome == "verification_blocked"):
+            active_state.turn_closed = False
+            active_state.final_test_started = False
+            active_state.final_test_completed = False
+            active_state.verification_status = "pending"
+            active_state.closure_outcome = "interrupted"
+        active_state.stop_stagnation_count = 0
+        active_state.stop_blocked_reason = None
+        _localai_workflow_state.save_state(active_state)
+    if not _user_prompt_text(payload):
+        context = _workflow_context(active_state, identity.canonical_project_root)
+        _write_json(_additional_context_output("UserPromptSubmit", context) if context else {"continue": True})
         return
 
     observed_turn_id = _get_required_string(
@@ -1203,17 +1291,14 @@ def _handle_user_prompt_submit(
                 payload
             )
 
-    start_or_resume_user_turn(
+    state, _ = start_or_resume_user_turn(
         session_id=session_id,
         observed_turn_id=observed_turn_id,
         project_id=identity.project_id,
     )
 
-    _write_json(
-        {
-            "continue": True,
-        }
-    )
+    context = _workflow_context(state, identity.canonical_project_root)
+    _write_json(_additional_context_output("UserPromptSubmit", context) if context else {"continue": True})
 
 
 def _register_subagent(
@@ -1234,8 +1319,13 @@ def _register_subagent(
         session_id is None
         or agent_id is None
     ):
-        return
+        raise _localai_workflow_state.WorkflowStateError("Specialist start requires an explicit child identity.")
 
+    role = _normalize_agent_type(payload.get("agent_type"))
+    parent_call_id = _get_required_string(payload, "parent_tool_call_id")
+    if not parent_call_id:
+        raise _localai_workflow_state.WorkflowStateError("Specialist start requires its accepted parent tool call ID.")
+    _localai_workflow_state.bind_specialist(state, agent_id, role, parent_call_id)
     register_agent_root_turn(
         session_id=session_id,
         agent_id=agent_id,
@@ -1258,9 +1348,7 @@ def _handle_algorithm_start(
             state
         )
 
-    mark_algorithm_started(
-        state
-    )
+
 
     context = _build_agent_memory_context(
         identity,
@@ -1283,15 +1371,28 @@ def _handle_algorithm_start(
     )
 
 
+def _test_admission_error(state: WorkflowState) -> str | None:
+    if any(key.startswith("agent_not_started_algorithm_agent:") for key in state.delegation_failures):
+        return "A required ALGORITHM admission did not execute; repair that bounded implementation handoff before TEST."
+    if state.scope_requires_refinement:
+        return "Read-only discovery requires a concrete implementation/refinement ALGORITHM slice before TEST; no GROWTH_RECOVERY carrier is needed unless recovery is actually active."
+    if state.growth_recovery_guard_active:
+        return "GROWTH_LIMIT recovery still has residual ALGORITHM work; TEST must wait for successful final_slice completion."
+    if state.algorithm_selected and not state.algorithm_completed:
+        return "Implementation is incomplete; finish the admitted or next bounded ALGORITHM slice before independent TEST."
+    return None
+
+
 def _handle_test_start(
     payload: dict[str, Any],
     identity: ProjectIdentity,
     state: WorkflowState,
 ) -> None:
-    if state.growth_recovery_guard_active:
+    reason = _test_admission_error(state)
+    if reason:
         _write_json({
             "continue": False,
-            "stopReason": "GROWTH_LIMIT recovery still has residual ALGORITHM work; TEST must wait for successful final_slice completion.",
+            "stopReason": reason,
         })
         return
     _register_subagent(
@@ -1304,9 +1405,7 @@ def _handle_test_start(
             state
         )
 
-    mark_final_test_started(
-        state
-    )
+
 
     if state.verification_after_implementation:
         if state.algorithm_completed:
@@ -1355,18 +1454,10 @@ def _handle_subagent_start(
     payload: dict[str, Any],
     identity: ProjectIdentity,
 ) -> None:
-    state = _ensure_active_state(
-        payload,
-        identity,
-    )
-
-    if state is None:
-        _write_json(
-            {
-                "continue": True,
-            }
-        )
-        return
+    session_id = _get_required_string(payload, "session_id")
+    state = get_active_state(session_id) if session_id else None
+    if state is None or state.project_id != identity.project_id:
+        raise _localai_workflow_state.WorkflowStateError("Specialist start has no owned accepted workflow.")
 
     agent_type = _normalize_agent_type(
         payload.get(
@@ -1422,120 +1513,8 @@ def _unregister_subagent(
     )
 
 
-def _is_growth_limit_stop(
-    payload: dict[str, Any],
-) -> bool:
-    # LOCALAI_SPECIALIST_GROWTH_TERMINATION_V5_5
-    terminate_reason = payload.get(
-        "terminate_reason"
-    )
-
-    return (
-        isinstance(
-            terminate_reason,
-            str,
-        )
-        and terminate_reason.strip().upper()
-        == "GROWTH_LIMIT"
-    )
 
 
-def _handle_algorithm_stop(
-    payload: dict[str, Any],
-    identity: ProjectIdentity,
-    state: WorkflowState,
-) -> None:
-    if _is_growth_limit_stop(
-        payload
-    ):
-        _localai_workflow_state.mark_growth_recovery_required(
-            state
-        )
-
-        _unregister_subagent(
-            payload
-        )
-
-        _write_json(
-            {
-                "continue": True,
-                "systemMessage": (
-                    "Specialist stopped because the per-turn context growth "
-                    "limit was reached. GROWTH_RECOVERY_REQUIRED=YES. "
-                    "PARTIAL_SIDE_EFFECTS_POSSIBLE=YES. Re-read actual failed-scope "
-                    "files, classify completed versus residual semantic objectives, "
-                    "and delegate only a strictly smaller residual ALGORITHM slice. "
-                    "Never retry the same full scope, even with different wording."
-                    + _localai_v5141_authoritative_recovery_hint(state)
-                ),
-            }
-        )
-        return
-
-    raw_message = payload.get(
-        "last_assistant_message"
-    )
-
-    message = (
-        raw_message
-        if isinstance(
-            raw_message,
-            str,
-        )
-        else None
-    )
-
-    if not _require_specialist_memory_decision(
-        payload,
-        message,
-        "ALGORITHM_AGENT",
-    ):
-        return
-
-    clean_message = (
-        _process_subagent_message(
-            identity,
-            "algorithm_agent",
-            message,
-        )
-    )
-
-    mark_algorithm_completed(
-        state
-    )
-
-    _localai_workflow_state.mark_growth_recovery_algorithm_success(
-        state
-    )
-
-    _unregister_subagent(
-        payload
-    )
-
-    response = {
-        "continue": True,
-    }
-
-    if state.growth_recovery_guard_active:
-        response["systemMessage"] = (
-            "Residual GROWTH_LIMIT recovery remains active. Delegate the next smaller ALGORITHM slice; "
-            "TEST must wait for successful final_slice completion."
-            + _localai_v5141_authoritative_recovery_hint(state)
-        )
-    elif (
-        state.test_selected
-        and not state.final_test_completed
-    ):
-        response["systemMessage"] = (
-            "Implementation stage complete. Independent TEST_AGENT "
-            "verification is required next. Delegate test-agent now "
-            "with a concise verification delta; do not run parent-side "
-            "shell verification first."
-        )
-
-    _write_json(
-        response
-    )
 
 
 def _handle_missing_test_status(
@@ -1591,211 +1570,178 @@ def _handle_missing_test_status(
     )
 
 
-def _handle_test_stop(
-    payload: dict[str, Any],
-    identity: ProjectIdentity,
-    state: WorkflowState,
-) -> None:
-    if _is_growth_limit_stop(
-        payload
-    ):
-        mark_terminal_abort(
-            state,
-            "specialist_growth_limit",
-            partial_side_effects_possible=True,
-        )
 
-        _unregister_subagent(
-            payload
-        )
 
-        _write_json(
-            {
-                "continue": True,
-                "systemMessage": (
-                    "Specialist stopped because the per-turn context growth "
-                    "limit was reached. PARTIAL_SIDE_EFFECTS_POSSIBLE=YES. "
-                    "Do not assume the workspace is unchanged; re-read the "
-                    "current files and state before continuing or summarizing."
-                ),
-            }
-        )
+def _handle_subagent_stop(payload: dict[str, Any], identity: ProjectIdentity) -> None:
+    session_id = _get_required_string(payload, "session_id")
+    agent_id = _get_required_string(payload, "agent_id")
+    state = get_active_state(session_id) if session_id else None
+    role = _normalize_agent_type(payload.get("agent_type"))
+    if state is None or state.project_id != identity.project_id:
+        raise _localai_workflow_state.WorkflowStateError("Specialist receipt has no owned root workflow.")
+    parent_call_id = _get_required_string(payload, "parent_tool_call_id")
+    if parent_call_id and parent_call_id in state.processed_stops:
+        _write_json({"continue": True})
         return
-
-    raw_message = payload.get(
-        "last_assistant_message"
-    )
-
-    message = (
-        raw_message
-        if isinstance(
-            raw_message,
-            str,
-        )
-        else None
-    )
-
-    status_preview = strip_memory_blocks(
-        message
-    )
-
-    status = _extract_test_status(
-        status_preview
-    )
-
-    if status is None:
-        _handle_missing_test_status(
-            payload,
-            identity,
-            state,
-            status_preview,
-        )
+    binding = state.active_agents.get(agent_id or "")
+    if (not parent_call_id or not binding or binding.get("call_id") != parent_call_id or binding.get("role") != role
+            or binding.get("generation") != state.growth_recovery_generation):
+        _write_json({"continue": True, "systemMessage": "LOCALAI_ROOT_CONTINUATION: Unregistered or stale specialist receipt was not credited."})
         return
-
-    if not _require_specialist_memory_decision(
-        payload,
-        message,
-        "TEST_AGENT",
-    ):
+    message = payload.get("last_assistant_message")
+    message = message if isinstance(message, str) else None
+    clean = strip_memory_blocks(message)
+    clean = re.sub(r"(?mi)^\s*MEMORY:\s*NONE\s*$", "", clean).strip()
+    pattern = r"^(PASS|FAIL)(?:\s|$)" if role == "algorithm_agent" else r"^(PASS|FAIL|BLOCKED)(?:\s|$)"
+    status = re.match(pattern, clean)
+    mode = payload.get("terminate_reason")
+    if role == "algorithm_agent" and not binding.get("interruption"):
+        binding["interruption"] = _slice_inventory_error(binding, identity.canonical_project_root)
+    valid = (mode == "GOAL" and status is not None and len(clean.split()) > 1 and _has_specialist_memory_decision(message)
+             and not binding.get("interruption"))
+    if role == "test_agent" and clean.splitlines()[:1] not in [["PASS"], ["FAIL"], ["BLOCKED"]]:
+        valid = False
+    if mode == "GOAL" and not valid and not binding.get("interruption") and not payload.get("stop_hook_active"):
+        _write_json({"decision": "block", "reason": "Return a valid opening PASS/FAIL status (TEST may BLOCKED), material receipt, and explicit MEMORY decision. This is the one protocol correction."})
         return
-
-    clean_message = (
-        _process_subagent_message(
-            identity,
-            "test_agent",
-            message,
-        )
-    )
-
-    if status == "PASS":
-        mark_verification_pass(
-            state
-        )
-
-        _unregister_subagent(
-            payload
-        )
-
-        _write_json(
-            {
-                "continue": True,
-            }
-        )
-        return
-
-    if status == "BLOCKED":
-        mark_verification_blocked(
-            state,
-            _failure_summary(
-                clean_message
-            ),
-        )
-
-        _unregister_subagent(
-            payload
-        )
-
-        _write_json(
-            {
-                "continue": True,
-            }
-        )
-        return
-
-    summary = _failure_summary(
-        clean_message
-    )
-
-    fingerprint, count, threshold_reached = (
-        record_failure(
-            state,
-            failure_type=(
-                "test_agent_verification"
-            ),
-            summary=summary,
-        )
-    )
-
-    if state.verification_after_implementation:
-        automatic_fact = (
-            "Independent verification of repository changes "
-            "failed. "
-            f"Failure fingerprint={fingerprint}; "
-            f"equivalent occurrence count={count}. "
-            "Failure evidence: "
-            + _truncate(
-                summary,
-                800,
-            )
-        )
-
-        if threshold_reached:
-            automatic_fact += (
-                " The equivalent-failure anti-loop threshold "
-                "was reached; the next correction must use a "
-                "materially different strategy."
-            )
-
-        _record_automatic_misunderstanding(
-            identity,
-            automatic_fact,
-        )
-
-    _unregister_subagent(
-        payload
-    )
-
-    _write_json(
-        {
-            "continue": True,
-        }
-    )
+    outcome = status.group(1) if valid else (binding.get("interruption") or (mode if mode != "GOAL" else None) or "INVALID_RECEIPT")
+    if valid:
+        clean = _process_subagent_message(identity, role, message)
+        binding["receipt_summary"] = _failure_summary(clean) if role == "test_agent" else clean[:3000]
+    _localai_workflow_state.commit_specialist_stop(state, agent_id, role, outcome)
+    if valid and role == "test_agent" and outcome == "FAIL" and state.verification_after_implementation:
+        fingerprint = state.last_failure_fingerprint
+        count = state.failure_fingerprints[fingerprint]
+        fact = ("Independent verification of repository changes failed. "
+                f"Failure fingerprint={fingerprint}; equivalent occurrence count={count}. Failure evidence: "
+                + _truncate(state.last_failure_summary or "", 800))
+        if count >= _localai_workflow_state.MAX_EQUIVALENT_FAILURES:
+            fact += " The equivalent-failure anti-loop threshold was reached; the next correction must use a materially different strategy."
+        _record_automatic_misunderstanding(identity, fact)
+    _unregister_subagent(payload)
+    pending = not can_finish_turn(state)[0]
+    context = _workflow_context(state, identity.canonical_project_root) if pending else ""
+    _write_json({"continue": True, **({"systemMessage": context} if context else {})})
 
 
-def _handle_subagent_stop(
-    payload: dict[str, Any],
-    identity: ProjectIdentity,
-) -> None:
-    state = _get_subagent_state(
-        payload,
-        identity,
-    )
+def _slice_inventory_error(binding: dict[str, Any], project_root: str) -> str | None:
+    try:
+        files = _localai_v514_scope_files(binding["files"], project_root, require_coverage=False)
+        if len(files) > _localai_workflow_state.MAX_SLICE_FILES:
+            return "SCOPE_FILE_LIMIT"
+    except (OSError, ValueError):
+        return "SCOPE_INVENTORY_UNPROVABLE"
+    return None
 
-    if state is None:
-        _write_json(
-            {
-                "continue": True,
-            }
-        )
-        return
 
-    agent_type = _normalize_agent_type(
-        payload.get(
-            "agent_type"
-        )
-    )
+def _slice_tool_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not _is_explicit_child(payload):
+        return None
+    identity = _project_identity(payload)
+    session_id = _get_required_string(payload, "session_id")
+    state = get_active_state(session_id) if session_id else None
+    agent_id = _get_required_string(payload, "agent_id")
+    binding = state.active_agents.get(agent_id or "") if state else None
+    if (not state or state.project_id != identity.project_id or not binding
+            or binding["role"] != _normalize_agent_type(payload.get("agent_type"))):
+        raise _localai_workflow_state.WorkflowStateError("Tool event has no authoritative active child ownership.")
+    if binding["role"] != "algorithm_agent":
+        return None
+    event = payload["hook_event_name"]
+    name = str(payload.get("tool_name", "")).lower()
+    reason = binding.get("interruption")
+    if event == "PreToolUse" and not reason:
+        call_id = _get_required_string(payload, "tool_call_id")
+        request_digest = hashlib.sha256(json.dumps([name, payload.get("tool_input")],sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+        if not call_id:
+            reason = "TOOL_CALL_ID_MISSING"
+        elif call_id in binding["tools"] and binding["tools"][call_id] != request_digest:
+            reason = "TOOL_CALL_ID_CONFLICT"
+        elif call_id not in binding["tools"]:
+            if len(binding["tools"]) >= _localai_workflow_state.MAX_SLICE_TOOLS:
+                reason = "SLICE_TOOL_LIMIT"
+            else:
+                binding["tools"][call_id] = request_digest
+        read_only = {"read_file", "read_many_files", "glob", "grep_search", "list_directory", "tool_search"}
+        if name == "agent":
+            reason = "NESTED_AGENT_DENIED"
+        if binding["phase"] == "discover" and name not in read_only:
+            reason = "DISCOVERY_READ_ONLY"
+        if binding["phase"] == "creation" and name not in read_only | {"write_file", "edit"}:
+            reason = "CREATION_REQUIRES_ACCOUNTABLE_WRITE"
+        if name in {"write_file", "edit"}:
+            tool_input = payload.get("tool_input")
+            try:
+                required = ("file_path", "content") if name == "write_file" else ("file_path", "old_string", "new_string")
+                if not isinstance(tool_input, dict) or any(not isinstance(tool_input.get(key), str) for key in required):
+                    raise ValueError("Incomplete or malformed direct mutation input.")
+                value = tool_input["file_path"]
+                if not value.strip():
+                    raise ValueError("Missing direct write target.")
+                root = Path(identity.canonical_project_root).absolute()
+                target = _localai_v514_project_path(root, value)
+                allowed = any(item != "<discover>" and (
+                    target.is_relative_to(_localai_v514_project_path(root, item[:-3])) if item.endswith("/**")
+                    else target == _localai_v514_project_path(root, item)) for item in binding["files"])
+                if not allowed:
+                    raise ValueError("Write target is outside admitted scope.")
+                canonical = target.as_posix().lower()
+                inventory = set(_localai_v514_scope_files(binding["files"], identity.canonical_project_root, require_coverage=False))
+                if len(inventory | set(binding["write_targets"]) | {canonical}) > _localai_workflow_state.MAX_SLICE_FILES:
+                    reason = "SLICE_WRITE_TARGET_LIMIT"
+                if canonical not in binding["write_targets"]:
+                    if len(binding["write_targets"]) >= _localai_workflow_state.MAX_SLICE_FILES:
+                        reason = "SLICE_WRITE_TARGET_LIMIT"
+                    else:
+                        binding["write_targets"].append(canonical)
+            except (OSError, ValueError):
+                reason = "WRITE_TARGET_UNPROVABLE"
+    if event != "PreToolUse" and not reason:
+        reason = _slice_inventory_error(binding, identity.canonical_project_root)
+    binding["interruption"] = reason
+    _localai_workflow_state.save_state(state)
+    if event == "PreToolUse":
+        return {"continue": True, "hookSpecificOutput": {"hookEventName": event,
+                "permissionDecision": "deny" if reason else "allow",
+                "permissionDecisionReason": ("Slice interrupted: " + reason + "; return actual partial-state evidence before a smaller root recovery slice.") if reason else "Bounded owned slice tool admitted."}}
+    return {"continue": True}
 
-    if agent_type == "algorithm_agent":
-        _handle_algorithm_stop(
-            payload,
-            identity,
-            state,
-        )
-        return
 
-    if agent_type == "test_agent":
-        _handle_test_stop(
-            payload,
-            identity,
-            state,
-        )
-        return
-
-    _write_json(
-        {
-            "continue": True,
-        }
-    )
+def _root_agent_failure(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if (str(payload.get("tool_name", "")).lower() != "agent" or _is_explicit_child(payload)):
+        return None
+    identity = _project_identity(payload)
+    state = _root_workflow_state(payload, identity)
+    call_id = _get_required_string(payload, "tool_call_id")
+    if not state or not call_id or call_id in state.processed_stops:
+        return None
+    admission = state.pending_admission
+    if (not admission or admission["call_id"] != call_id
+            or admission["generation"] != state.growth_recovery_generation):
+        return None
+    args = payload.get("tool_input")
+    if args != admission["tool_input"]:
+        return None
+    if admission.get("interruption"):
+        return _additional_context_output("PostToolUseFailure", WORKFLOW_PAUSE_MARKER
+            + " Failed-start phase remains unproven; retain pending state and end/resume for actual-state recovery."
+            + _localai_v5141_authoritative_recovery_hint(state, identity.canonical_project_root))
+    role = admission["role"]
+    restored = payload.get("execution_status") == "not_started" and _localai_workflow_state.retire_not_started_admission(state)
+    if not restored:
+        admission["interruption"] = "START_PHASE_UNPROVEN"
+        state.partial_side_effects_possible = True
+        if role == "algorithm_agent":
+            state.algorithm_completed = False
+        else:
+            state.final_test_completed = False
+            state.verification_status = "pending"
+    reason = _delegation_repair_reason(state, "Agent pre-start failure: " + str(payload.get("error", "Unknown failure"))[:700],
+        category="agent_not_started_" + role if restored else "agent_start_unproven",
+        project_root=identity.canonical_project_root)
+    if not restored:
+        reason = WORKFLOW_PAUSE_MARKER + " Execution phase is unproven; no safe retirement was inferred. End/resume for actual-state reread. " + reason
+    return _additional_context_output("PostToolUseFailure", reason)
 
 
 def _handle_failed_implementation_workflow(
@@ -1862,12 +1808,7 @@ def _handle_failed_implementation_workflow(
             )
         )
 
-    _write_json(
-        {
-            "decision": "block",
-            "reason": reason,
-        }
-    )
+    _write_workflow_block(identity, state, reason)
 
 
 def _handle_stop(
@@ -1887,6 +1828,10 @@ def _handle_stop(
         )
         return
 
+    if state.delegation_blocked_reason:
+        _write_workflow_block(identity, state, "Repair remains paused; await a genuine user submission or new valid evidence.")
+        return
+
     if requires_fix_cycle(
         state
     ):
@@ -1902,6 +1847,7 @@ def _handle_stop(
 
     if can_finish:
 
+        state.closure_outcome = "success" if state.verification_status not in {"fail", "blocked"} else "verification_" + state.verification_status
         mark_turn_closed(
             state
         )
@@ -1913,33 +1859,26 @@ def _handle_stop(
         )
         return
 
-    increment_stop_block_count(
-        state
-    )
-
-    continuation_reason = (
-        reason
-        + " Complete only the missing phase of the workflow "
-        "that PROMPT_AGENT already selected. Do not add "
-        "unnecessary agents. Keep handoffs concise and use "
-        "focused validation so the task finishes with minimal "
-        "extra latency and token use."
-    )
-
-    _write_json(
-        {
-            "decision": "block",
-            "reason": continuation_reason,
-        }
-    )
-
-
+    _write_workflow_block(identity, state, reason)
 
 
 def _handle_prompt_memory_pre_tool_use(
     payload: dict[str, Any],
     identity: ProjectIdentity,
 ) -> None:
+    def write_output(output: dict[str, Any]) -> None:
+        decision = output.get("hookSpecificOutput", {})
+        if decision.get("permissionDecision") == "deny":
+            state = _root_workflow_state(payload, identity)
+            if state is None and not _is_explicit_child(payload):
+                session_id = _get_required_string(payload, "session_id")
+                if session_id and not _localai_workflow_state.has_registered_agents(session_id):
+                    state = _ensure_active_state(payload, identity)
+            if state is not None and state.project_id == identity.project_id:
+                reason = decision.get("permissionDecisionReason", "Invalid delegation.")
+                decision["permissionDecisionReason"] = _delegation_repair_reason(state, reason, project_root=identity.canonical_project_root)
+        _write_json(output)
+
     # Enforce specialist routing, bounded deltas, PROMPT-memory transport,
     # and foreground execution at the Agent tool boundary.
     tool_name = str(
@@ -1951,7 +1890,7 @@ def _handle_prompt_memory_pre_tool_use(
         "agent",
         "task",
     }:
-        _write_json(
+        write_output(
             {
                 "continue": True,
             }
@@ -1966,7 +1905,7 @@ def _handle_prompt_memory_pre_tool_use(
         tool_input,
         dict,
     ):
-        _write_json(
+        write_output(
             {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -1988,7 +1927,7 @@ def _handle_prompt_memory_pre_tool_use(
         prompt,
         str,
     ):
-        _write_json(
+        write_output(
             {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -2014,7 +1953,7 @@ def _handle_prompt_memory_pre_tool_use(
     }
 
     if agent_type not in canonical_type_by_role:
-        _write_json(
+        write_output(
             {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -2030,13 +1969,32 @@ def _handle_prompt_memory_pre_tool_use(
             }
         )
         return
+    state = _ensure_active_state(payload, identity)
+    call_id = _get_required_string(payload, "tool_call_id")
+    if state is None or state.project_id != identity.project_id or not call_id or _is_explicit_child(payload):
+        raise _localai_workflow_state.WorkflowStateError("Root Agent admission requires owned workflow state and an API tool call ID.")
+    request_digest = hashlib.sha256(json.dumps(tool_input, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if state.active_agents:
+        raise _localai_workflow_state.WorkflowStateError("A specialist execution is already active; its immutable scope cannot be replaced.")
+    if state.pending_admission:
+        admission = state.pending_admission
+        if admission.get("interruption"):
+            raise _localai_workflow_state.WorkflowStateError("Failed-start uncertainty remains unresolved; end/resume this workflow and re-read actual state.")
+        if admission["call_id"] == call_id and admission["request_digest"] == request_digest:
+            _write_json({"continue": True, "hookSpecificOutput": {"hookEventName": "PreToolUse",
+                         "permissionDecision": "allow", "tool_input": admission["tool_input"]}})
+            return
+        raise _localai_workflow_state.WorkflowStateError("A different specialist admission is pending; resolve it before changing scope.")
+    if call_id in state.processed_stops:
+        raise _localai_workflow_state.WorkflowStateError("This Agent API call was already consumed.")
     if agent_type == "test_agent":
         session_id = _get_required_string(payload, "session_id")
         state = get_active_state(session_id) if session_id else None
-        if state is not None and state.growth_recovery_guard_active:
-            _write_json({"continue": True, "hookSpecificOutput": {
+        reason = _test_admission_error(state) if state else None
+        if reason:
+            write_output({"continue": True, "hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                "permissionDecisionReason": "GROWTH_LIMIT recovery still has residual ALGORITHM work; TEST must wait for successful final_slice completion.",
+                "permissionDecisionReason": reason,
             }})
             return
 
@@ -2060,7 +2018,7 @@ def _handle_prompt_memory_pre_tool_use(
 
     if workflow_marker_pattern.search(prompt) is not None:
         if len(workflow_matches) != 1:
-            _write_json(
+            write_output(
                 {
                     "continue": True,
                     "hookSpecificOutput": {
@@ -2092,7 +2050,7 @@ def _handle_prompt_memory_pre_tool_use(
         )
 
         if state is None or state.project_id != identity.project_id:
-            _write_json(
+            write_output(
                 {
                     "continue": True,
                     "hookSpecificOutput": {
@@ -2108,27 +2066,21 @@ def _handle_prompt_memory_pre_tool_use(
             )
             return
 
-        if state.implementation_verification_required is None:
-            select_implementation_workflow(
-                state,
-                require_test=(
-                    workflow_choice
-                    != "ALGORITHM_ONLY"
-                ),
-            )
-        elif workflow_choice == "ALGORITHM_TEST":
-            select_implementation_workflow(
-                state,
-                require_test=True,
-            )
+        if state.delegation_blocked_reason or state.stop_blocked_reason:
+            write_output({"continue": True, "hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": _workflow_context(state, identity.canonical_project_root)}})
+            return
 
+        scope_proposal: dict[str, Any] = {}
         prepared_prompt, scope_error = _localai_v514_prepare_algorithm(
             prompt,
             state,
             identity.canonical_project_root,
+            proposal=scope_proposal,
         )
         if scope_error is not None:
-            _write_json(
+            write_output(
                 {
                     "continue": True,
                     "hookSpecificOutput": {
@@ -2143,7 +2095,7 @@ def _handle_prompt_memory_pre_tool_use(
         prompt = prepared_prompt
 
     elif workflow_choice is not None:
-        _write_json(
+        write_output(
             {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -2170,7 +2122,7 @@ def _handle_prompt_memory_pre_tool_use(
     )
 
     if suspicious_workflow is not None:
-        _write_json(
+        write_output(
             {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -2291,7 +2243,7 @@ def _handle_prompt_memory_pre_tool_use(
     )
 
     if len(clean_prompt) > max_chars:
-        _write_json(
+        write_output(
             {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -2308,6 +2260,20 @@ def _handle_prompt_memory_pre_tool_use(
         )
         return
 
+    prior_state = _localai_workflow_state.capture_admission_state(state)
+    if agent_type == "algorithm_agent":
+        if state.implementation_verification_required is None or workflow_choice == "ALGORITHM_TEST":
+            # Routing and scope are committed together with the immutable admission.
+            state.algorithm_selected = True
+            state.implementation_verification_required = bool(state.test_selected or workflow_choice != "ALGORITHM_ONLY")
+            state.test_selected = state.implementation_verification_required
+            state.verification_after_implementation = state.test_selected
+        recovery_plan = scope_proposal.pop("recovery")
+        if recovery_plan:
+            _localai_workflow_state.set_growth_recovery_plan(state, **scope_proposal, persist=False)
+        else:
+            _localai_workflow_state.set_algorithm_scope(state, **scope_proposal, persist=False)
+        _localai_workflow_state.reset_delegation_repairs(state, persist=False)
     updated_input = dict(
         tool_input
     )
@@ -2322,7 +2288,19 @@ def _handle_prompt_memory_pre_tool_use(
     )
     updated_input["run_in_background"] = False
 
-    _write_json(
+    files = list(state.algorithm_scope_files)
+    phase = "discover" if files == ["<discover>"] else "concrete"
+    if any(item.endswith("/**") and not _localai_v514_scope_files([item], identity.canonical_project_root, require_coverage=False) for item in files):
+        phase = "creation"
+    state.pending_admission = dict(call_id=call_id, role=agent_type, files=files,
+        objectives=list(state.algorithm_scope_objectives), generation=state.growth_recovery_generation,
+        digest=_localai_workflow_state.scope_digest(files, state.algorithm_scope_objectives, state.growth_recovery_generation),
+        request_digest=request_digest, tool_input=updated_input, phase=phase, prior_state=prior_state)
+    if agent_type == "test_agent":
+        state.test_selected = True
+    _localai_workflow_state.save_state(state)
+
+    write_output(
         {
             "continue": True,
             "hookSpecificOutput": {
@@ -2350,7 +2328,7 @@ def _localai_v5141_is_valid_read_evidence(
 ) -> bool:
     if str(payload.get("tool_name") or "").strip().lower() != "read_file":
         return False
-    if payload.get('agent_id'):
+    if _is_explicit_child(payload):
         return False
     tool_input = payload.get('tool_input')
     file_path = tool_input.get('file_path') if isinstance(tool_input, dict) else None
@@ -2516,6 +2494,10 @@ def _dispatch(
         )
         return
 
+    if event_name == "SessionDelete":
+        _handle_session_delete(payload)
+        return
+
     identity = _project_identity(
         payload
     )
@@ -2535,6 +2517,10 @@ def _dispatch(
         return
 
     if event_name == "PreToolUse":
+        slice_output = _slice_tool_event(payload)
+        if slice_output is not None:
+            _write_json(slice_output)
+            return
         _handle_prompt_memory_pre_tool_use(
             payload,
             identity,
@@ -2577,34 +2563,75 @@ def main() -> None:
             or "unknown"
         ).strip()
 
-        _localai_v514_trace(
-            payload
-        )
-
-        if event_name in {
-            "PostToolUse",
-            "PostToolUseFailure",
-        }:
-            _localai_v5141_record_read_evidence(
+        lock_id = payload.get("deleted_session_id") if event_name == "SessionDelete" else payload.get("session_id")
+        lock = _localai_workflow_state.session_transition_lock(lock_id) if isinstance(lock_id, str) and lock_id else nullcontext()
+        with lock:
+            _localai_v514_trace(
                 payload
             )
-            _write_json(
-                {"continue": True}
+
+            if event_name in {
+                "PostToolUse",
+                "PostToolUseFailure",
+            }:
+                if event_name == "PostToolUseFailure":
+                    failure_output = _root_agent_failure(payload)
+                    if failure_output is not None:
+                        _write_json(failure_output)
+                        return
+                slice_output = _slice_tool_event(payload)
+                if slice_output is not None:
+                    _write_json(slice_output)
+                    return
+                error = payload.get("error")
+                if (event_name == "PostToolUseFailure" and str(payload.get("tool_name", "")).lower() == "agent"
+                        and isinstance(error, str) and error.startswith("LOCALAI_AGENT_PARAMETER_ERROR:")):
+                    identity = _project_identity(payload)
+                    state = _root_workflow_state(payload, identity)
+                    if state is None and not _is_explicit_child(payload):
+                        state = _ensure_active_state(payload, identity)
+                    if (state and state.project_id == identity.project_id and not _is_explicit_child(payload)
+                            and not _localai_workflow_state.has_registered_agents(state.session_id)):
+                        reason = _delegation_repair_reason(state, error, category="tool_parameters", project_root=identity.canonical_project_root)
+                        _write_json(_additional_context_output("PostToolUseFailure", reason))
+                        return
+                _localai_v5141_record_read_evidence(
+                    payload
+                )
+                _write_json(
+                    {"continue": True}
+                )
+                return
+
+            _dispatch(
+                payload
             )
+
+    except (RuntimeError, OSError) as error:
+        # Workflow and local-path safety failures must never authorize execution.
+        try:
+            _log_error(event_name, error)
+        except Exception:
+            pass
+        reason = WORKFLOW_PAUSE_MARKER + " Workflow state is unresolved or unsafe; existing evidence was preserved. " + str(error)[:300]
+        if event_name == "PreToolUse":
+            _write_json({"continue": True, "hookSpecificOutput": {"hookEventName": event_name,
+                         "permissionDecision": "deny", "permissionDecisionReason": reason}})
+        else:
+            _write_json({"continue": False, "decision": "block", "reason": reason, "systemMessage": reason})
+    except Exception as error:
+        try:
+            _log_error(event_name, error)
+        except Exception:
+            pass
+
+        if event_name == "PreToolUse":
+            _write_json({"continue": True, "hookSpecificOutput": {"hookEventName": event_name,
+                         "permissionDecision": "deny", "permissionDecisionReason": WORKFLOW_PAUSE_MARKER
+                         + " Tool admission failed safely; no execution permission was granted."}})
             return
 
-        _dispatch(
-            payload
-        )
-
-    except Exception as error:
-        _log_error(
-            event_name,
-            error,
-        )
-
         if event_name in {
-            "PreToolUse",
             "PostToolUse",
             "PostToolUseFailure",
         }:
@@ -2615,17 +2642,16 @@ def main() -> None:
             )
 
         elif event_name in {
+            "SubagentStart",
             "SubagentStop",
             "Stop",
         }:
             _write_json(
                 {
-                    "continue": True,
+                    "continue": False,
+                    "decision": "block",
                     "systemMessage": (
-                        "Qwen orchestration hook encountered "
-                        "an internal error and failed open. "
-                        "Orchestration reliability for this "
-                        "event is reduced; inspect "
+                        "LOCALAI_WORKFLOW_INCOMPLETE: Workflow transition failed; no completion was credited. Inspect "
                         f"{ERROR_LOG_PATH}."
                     ),
                 }

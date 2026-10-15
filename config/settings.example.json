@@ -163,6 +163,22 @@
         ]
       }
     ],
+    "SessionDelete": [
+      {
+        "matcher": "*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      }
+    ],
     "SubagentStop": [
       {
         "matcher": "*",
@@ -223,6 +239,20 @@
             "shell": "powershell"
           }
         ]
+      },
+      {
+        "matcher": "^(?!agent$).*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -239,11 +269,53 @@
             "shell": "powershell"
           }
         ]
+      },
+      {
+        "matcher": "^(?!read_file$).*",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
       {
         "matcher": "read_file",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      },
+      {
+        "matcher": "^agent$",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<CLONE_ROOT>\\orchestration\\hook_dispatcher.py\"",
+            "name": "qwen-orchestration-dispatcher",
+            "description": "Qwen Codex-style orchestration lifecycle dispatcher",
+            "timeout": 10000,
+            "shell": "powershell"
+          }
+        ]
+      },
+      {
+        "matcher": "^(?!(?:read_file|agent)$).*",
         "sequential": true,
         "hooks": [
           {

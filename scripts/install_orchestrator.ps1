@@ -176,7 +176,7 @@ $dispatcherCommand = "python '" + $dispatcherPath.Replace("'", "''") + "'"
 $maintenanceCommand = "python '" + $maintenancePath.Replace("'", "''") + "'"
 $stopServerCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '" + $stopServerPath.Replace("'", "''") + "' -Action Stop -IfIdle"
 
-foreach ($eventName in @("SubagentStart","UserPromptSubmit","SessionStart","SessionEnd","SubagentStop","Stop","PostToolUse","PostToolUseFailure")) {
+foreach ($eventName in @("SubagentStart","UserPromptSubmit","SessionStart","SessionEnd","SessionDelete","SubagentStop","Stop","PreToolUse","PostToolUse","PostToolUseFailure")) {
     foreach ($eventGroup in $template.hooks.$eventName) {
         foreach ($hook in $eventGroup.hooks) {
             if ($hook.name -eq "qwen-orchestration-dispatcher") {
@@ -592,6 +592,21 @@ foreach ($eventName in @("PostToolUse","PostToolUseFailure")) {
             "$eventName read_file orchestration dispatcher hook."
         )
     }
+}
+
+foreach ($binding in @(@("PreToolUse", "^(?!agent$).*"), @("PostToolUseFailure", "^agent$"), @("SessionDelete", "*"))) {
+    $count = 0
+    foreach ($eventGroup in @($verify.hooks.($binding[0]))) {
+        foreach ($hook in @($eventGroup.hooks)) {
+            if ($eventGroup.matcher -eq $binding[1] -and $hook.name -eq "qwen-orchestration-dispatcher") {
+                if ($binding[0] -eq "PreToolUse" -and $hook.command -cne $dispatcherCommand) {
+                    throw "Installation verification failed: PreToolUse dispatcher command is not the canonical source command."
+                }
+                $count++
+            }
+        }
+    }
+    if ($count -ne 1) { throw "Installation verification failed: $($binding[0]) $($binding[1]) dispatcher hook." }
 }
 
 
